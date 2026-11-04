@@ -322,6 +322,18 @@ impl Qwen35MtpBlock {
         trunk_final_norm_weight: &Array,
         trunk_lm_head: &ResolvedLinear,
     ) -> Result<(Array, Array)> {
+        let cur = self.body(embeds, h_pre, cache, causal)?;
+        self.head(cur, trunk_final_norm_weight, trunk_lm_head)
+    }
+
+    /// Steps 1-4 of [`Self::forward`]: the block's output for every row, `[B, T, hidden]`.
+    fn body(
+        &self,
+        embeds: &Array,
+        h_pre: &Array,
+        cache: &mut NativeKvCache,
+        causal: bool,
+    ) -> Result<Array> {
         // ── shape sanity ─────────────────────────────────────────────────
         let e_shape = embeds.shape();
         let h_shape = h_pre.shape();
@@ -410,6 +422,38 @@ impl Qwen35MtpBlock {
         cur = mlx_rs::ops::add(&mlp_out, &res_ffn)
             .context("Qwen35MtpBlock: residual add (ffn) failed")?;
 
+        let _ = hidden; // dims sanity check above already locked it
+        Ok(cur)
+    }
+
+    /// The head of [`Self::forward`] on the block's output `cur`: the head norm, the lm_head, and
+    /// the hidden the next chained draft reads.
+    fn head(
+        &self,
+        cur: Array,
+        trunk_final_norm_weight: &Array,
+        trunk_lm_head: &ResolvedLinear,
+    ) -> Result<(Array, Array)> {
+        let eps = self.dims.rms_norm_eps;
+        let dbg = std::env::var("LUMEN_MTP_DEBUG")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let stat = |tag: &str, a: &Array| {
+            if !dbg {
+                return;
+            }
+            let f = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            let amax = mlx_rs::ops::abs(&f).unwrap().max(None).unwrap();
+            let amean = mlx_rs::ops::abs(&f).unwrap().mean(None).unwrap();
+            amax.eval().ok();
+            amean.eval().ok();
+            eprintln!(
+                "[mtp.block] {tag:<16} shape={:?} |max|={:.4} |mean|={:.4}",
+                a.shape(),
+                amax.as_slice::<f32>()[0],
+                amean.as_slice::<f32>()[0]
+            );
+        };
         // ── (5) stash new_h_pre BEFORE head norm ─────────────────────────
         // The AR draft loop pairs this with the next sampled token id.
         let new_h_pre = cur.clone();
@@ -440,8 +484,36 @@ impl Qwen35MtpBlock {
             new_h_pre
         };
 
-        let _ = hidden; // dims sanity check above already locked it
         Ok((logits, chained_hidden))
+    }
+
+    /// [`Self::forward`] with the head on the last row only: `T` pairs enter the block's cache
+    /// (a fold of the trunk's history), and the logits and chained hidden of the last row come
+    /// back, `[B, 1, ...]`. `head = false` skips the head (a prompt fold reads no logits).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_last(
+        &self,
+        embeds: &Array,
+        h_pre: &Array,
+        cache: &mut NativeKvCache,
+        causal: bool,
+        trunk_final_norm_weight: &Array,
+        trunk_lm_head: &ResolvedLinear,
+        head: bool,
+    ) -> Result<Option<(Array, Array)>> {
+        let cur = self.body(embeds, h_pre, cache, causal)?;
+        if !head {
+            return Ok(None);
+        }
+        let t = cur.shape()[1];
+        let last = if t > 1 {
+            cur.take_axis(Array::from_slice(&[t - 1], &[1]), 1)
+                .context("Qwen35MtpBlock: last row")?
+        } else {
+            cur
+        };
+        self.head(last, trunk_final_norm_weight, trunk_lm_head)
+            .map(Some)
     }
 
     /// Self-attention with the block's own KV cache. Same structure as the

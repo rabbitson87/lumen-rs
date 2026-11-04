@@ -14,10 +14,10 @@ mod imp {
 
     use crate::config_serde::deserialize_token_ids;
     use crate::kv_disk::{DiskKvStore, KvManifest};
-    use crate::native_cache::{NativeKvCache, NativePromptCache, SharedPrefixKv};
+    use crate::native_cache::{NativePromptCache, SharedPrefixKv};
     use crate::native_runtime::{FineTimings, take_fine_timings};
     use crate::native_snapshot::{PromptCacheSnapshot, RollbackPoint};
-    use crate::qwen3_5_moe::{MtpStepOutput, NativeQwen3_5MoeModel};
+    use crate::qwen3_5_moe::{MtpHistory, MtpMark, MtpStepOutput, NativeQwen3_5MoeModel};
     use crate::qwen3_5_mtp::Qwen35MtpBlock;
     use std::collections::HashMap;
 
@@ -46,17 +46,12 @@ mod imp {
     struct NativeSeqState {
         cache: NativePromptCache,
         position: usize,
-        /// MTP block's own KV cache (one full-attention layer; see
-        /// `qwen3_5_mtp::Qwen35MtpBlock`). Cleared at the start of every
-        /// `mtp_step` call (fresh K-step extrapolation). Idle / unused when
-        /// MTP is not enabled.
-        mtp_kv: NativeKvCache,
-        /// 1-forward MTP carry (`LUMEN_MTP_ONE_FORWARD`): the trunk hidden that
-        /// predecessor-seeds the next cycle's drafter. `None` at seq creation
-        /// (forces a bootstrap Step-A on the first `mtp_step`); thereafter holds
-        /// `verify_hidden[n_accepted]` from the prior cycle. Idle on the
-        /// 2-forward path (which always returns `None`).
-        mtp_carried: Option<mlx_rs::Array>,
+        /// What the MTP head has seen of this seq (its own attention cache and
+        /// the trunk rows waiting to enter it): primed by prefill and extend,
+        /// grown by every MTP cycle. Empty when MTP is not enabled.
+        mtp: MtpHistory,
+        /// The head history at the rollback point, returned to with it.
+        mtp_mark: Option<MtpMark>,
         /// Prompt token ids this seq was prefilled with. Used by the batched
         /// scheduler's shared-prefix dedup (Phase 4) to compute the longest
         /// common prompt prefix across the active batch. Empty for seqs created
@@ -752,8 +747,45 @@ mod imp {
         last_only: bool,
         label: &str,
         vision: Option<(&[[i32; 3]], &[(usize, usize)], &[Array])>,
+        mut prime: Option<&mut MtpHistory>,
     ) -> Result<Array> {
         let n = tokens.len();
+        // One chunk's forward from `start`; with `prime`, its trunk hidden also enters the MTP
+        // head's history (`mtp_fold_prompt`).
+        let mut chunk_forward = |toks: &[u32],
+                                 cache: &mut NativePromptCache,
+                                 lo: bool,
+                                 start: usize|
+         -> Result<Array> {
+            let primes = prime.is_some() && model.mtp_primes();
+            let pos = cache.full_attn_offset();
+            if primes {
+                model.capture_prompt_rows(true);
+            }
+            let out = match vision {
+                Some((positions, runs, soft)) => model.forward_chunk_with_images(
+                    toks,
+                    cache,
+                    lo,
+                    &positions[start..start + toks.len()],
+                    start,
+                    runs,
+                    soft,
+                ),
+                None => model.forward_with_opts(toks, cache, lo),
+            };
+            if primes {
+                model.capture_prompt_rows(false);
+            }
+            let out = out?;
+            if primes
+                && let (Some(history), Some(rows)) =
+                    (prime.as_deref_mut(), model.take_prompt_rows())
+            {
+                model.mtp_fold_prompt(history, rows, toks, pos)?;
+            }
+            Ok(out)
+        };
         // ── Always-chunk invariant: bound full-attn scores per chunk ──
         // Qwen3.x is hybrid: linear-attn layers are O(seq) (cheap), but the
         // full-attention layers (every `full_attention_interval`) form a
@@ -788,12 +820,8 @@ mod imp {
             d.chunk
         };
         if n <= chunk {
-            return match vision {
-                Some((positions, runs, soft)) => model
-                    .forward_chunk_with_images(tokens, cache, last_only, positions, 0, runs, soft),
-                None => model.forward_with_opts(tokens, cache, last_only),
-            }
-            .with_context(|| format!("{label}: forward ({n} tokens)"));
+            return chunk_forward(tokens, cache, last_only, 0)
+                .with_context(|| format!("{label}: forward ({n} tokens)"));
         }
         let n_chunks = n.div_ceil(chunk);
         let report = std::env::var("LUMEN_QWEN35_PREFILL_CHUNK_LOG")
@@ -810,19 +838,7 @@ mod imp {
             // discarded. The final chunk honours the caller's `last_only`.
             let lo = if is_last { last_only } else { true };
             let t0 = report.then(std::time::Instant::now);
-            let out = match vision {
-                Some((positions, runs, soft)) => model.forward_chunk_with_images(
-                    &tokens[start..end],
-                    cache,
-                    lo,
-                    &positions[start..end],
-                    start,
-                    runs,
-                    soft,
-                ),
-                None => model.forward_with_opts(&tokens[start..end], cache, lo),
-            }
-            .with_context(|| {
+            let out = chunk_forward(&tokens[start..end], cache, lo, start).with_context(|| {
                 format!(
                     "{label}: chunk {}/{} ({} tokens)",
                     idx + 1,
@@ -1030,6 +1046,7 @@ mod imp {
                 .as_ref()
                 .map(|(p, r, s)| (p.as_slice(), r.as_slice(), s.as_slice()));
 
+            let mut mtp = MtpHistory::new();
             let logits = forward_chunked(
                 model,
                 tokens,
@@ -1037,6 +1054,7 @@ mod imp {
                 last_only,
                 "native-prefill",
                 vision_ref,
+                Some(&mut mtp),
             )
             .with_context(|| format!("native mlx-rs runner: prefill forward (seq_id={seq_id})"))?;
             if timing_on {
@@ -1083,8 +1101,8 @@ mod imp {
                 NativeSeqState {
                     cache,
                     position,
-                    mtp_kv: NativeKvCache::new(),
-                    mtp_carried: None,
+                    mtp,
+                    mtp_mark: None,
                     prompt: tokens.to_vec(),
                     mrope_delta,
                     rollback: None,
@@ -1164,8 +1182,8 @@ mod imp {
                 NativeSeqState {
                     cache,
                     position,
-                    mtp_kv: NativeKvCache::new(),
-                    mtp_carried: None,
+                    mtp: MtpHistory::new(),
+                    mtp_mark: None,
                     prompt: tokens.to_vec(),
                     mrope_delta: 0,
                     rollback: None,
@@ -1744,16 +1762,20 @@ mod imp {
             let state = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: extend on unknown seq_id {seq_id}")
             })?;
-            let logits =
-                forward_chunked(model, tokens, &mut state.cache, true, "native-extend", None)
-                    .with_context(|| {
-                        format!("native mlx-rs runner: extend forward (seq_id={seq_id})")
-                    })?;
+            // The head history continues where the seq's last MTP cycle or prefill left it; a
+            // history that does not end here restarts (`MtpHistory`).
+            let logits = forward_chunked(
+                model,
+                tokens,
+                &mut state.cache,
+                true,
+                "native-extend",
+                None,
+                Some(&mut state.mtp),
+            )
+            .with_context(|| format!("native mlx-rs runner: extend forward (seq_id={seq_id})"))?;
             let next_tok = model.argmax_last_token(&logits)?;
             state.position += tokens.len();
-            // The MTP carry is the trunk hidden of a cycle that ended before these tokens; the
-            // next cycle must bootstrap from where the sequence is now.
-            state.mtp_carried = None;
             Ok((next_tok, state.position))
         }
 
@@ -1800,13 +1822,12 @@ mod imp {
             let state = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: mtp_step on unknown seq_id {seq_id}")
             })?;
-            let mut out = model
+            let out = model
                 .mtp_step(
                     &mut state.cache,
-                    &mut state.mtp_kv,
+                    &mut state.mtp,
                     committed_token,
                     n_draft,
-                    state.mtp_carried.take(),
                     sampling,
                 )
                 .with_context(|| {
@@ -1815,9 +1836,6 @@ mod imp {
             // Position advances by the number of committed tokens — same
             // semantics as a series of `decode_step` calls.
             state.position += out.committed.len();
-            // Stash the 1-forward carry for the next cycle (None on 2-forward).
-            // Moved out of the returned struct — the upper decode loop ignores it.
-            state.mtp_carried = out.carried_hidden.take();
             Ok(out)
         }
 
@@ -1960,6 +1978,7 @@ mod imp {
                 anyhow!("native mlx-rs runner: mark_rollback — unknown seq_id {seq_id}")
             })?;
             seq.rollback = Some(RollbackPoint::capture(&seq.cache, seq.position)?);
+            seq.mtp_mark = Some(seq.mtp.mark());
             Ok(())
         }
 
@@ -1974,9 +1993,11 @@ mod imp {
             })?;
             point.restore_into(&mut seq.cache)?;
             seq.position = point.position();
-            // The MTP carry is the trunk hidden at the position just left; a
-            // fresh bootstrap is the only correct seed from here.
-            seq.mtp_carried = None;
+            // The head history goes back with the trunk: what it held at the mark.
+            match &seq.mtp_mark {
+                Some(mark) => seq.mtp.restore(mark)?,
+                None => seq.mtp.clear(),
+            }
             Ok(seq.position)
         }
 
@@ -2136,8 +2157,8 @@ mod imp {
                     NativeSeqState {
                         cache,
                         position: at,
-                        mtp_kv: NativeKvCache::new(),
-                        mtp_carried: None,
+                        mtp: MtpHistory::new(),
+                        mtp_mark: None,
                         prompt: Vec::new(),
                         mrope_delta: 0,
                         rollback: Some(rollback),
@@ -2288,8 +2309,8 @@ mod imp {
                 NativeSeqState {
                     cache: fresh,
                     position,
-                    mtp_kv: NativeKvCache::new(),
-                    mtp_carried: None,
+                    mtp: MtpHistory::new(),
+                    mtp_mark: None,
                     prompt: Vec::new(),
                     // Snapshots are only taken on text prefixes (image requests
                     // bypass the prefix cache), so there is no shift to carry.

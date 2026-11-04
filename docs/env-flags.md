@@ -36,6 +36,7 @@ value → on.
 | `LUMEN_MOE_OVERLAP` | off | Optimization | `lumen_mlx::offload::overlap` |
 | `LUMEN_MOE_PROBE_LAYER_SYNC` | off | Diagnostic | `lumen_mlx::native_moe::imp::moe_layer_sync_probe` |
 | `LUMEN_MOE_TRACE` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace` |
+| `LUMEN_MTP_HISTORY` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_history` |
 | `LUMEN_NATIVE_ACT_BF16` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::act_bf16` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
@@ -425,6 +426,19 @@ Write a binary trace of the expert pool's layer calls (expert ids in request ord
  per-call timestamps) to the path in this variable, for replaying a workload against other
  eviction policies offline. Any value but `0` is the output path. Never changes the output
  or what is resident; costs one `Option` check per layer call when off.
+
+### `LUMEN_MTP_HISTORY`
+
+*Optimization, default on.*
+
+Keep the MTP head's own attention cache across draft cycles and prime it with the
+ prompt ([`MtpHistory`]): every committed pair (trunk hidden, next token) enters it,
+ as MTPLX and oMLX run the head. With it off the cache is emptied every cycle and the
+ head attends to the current cycle's drafts only.
+
+ Output-identical: the head only proposes drafts, the trunk's verify decides every
+ token. MTPLX measured depth-1 acceptance 0.90 with the history against 0.26 without
+ on code; numbers for this repo in the commit that added it.
 
 ### `LUMEN_NATIVE_ACT_BF16`
 

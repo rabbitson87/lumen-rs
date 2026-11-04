@@ -98,6 +98,22 @@ mod imp {
     }
 
     lumen_flags::flag! {
+        /// Keep the MTP head's own attention cache across draft cycles and prime it with the
+        /// prompt ([`MtpHistory`]): every committed pair (trunk hidden, next token) enters it,
+        /// as MTPLX and oMLX run the head. With it off the cache is emptied every cycle and the
+        /// head attends to the current cycle's drafts only.
+        ///
+        /// Output-identical: the head only proposes drafts, the trunk's verify decides every
+        /// token. MTPLX measured depth-1 acceptance 0.90 with the history against 0.26 without
+        /// on code; numbers for this repo in the commit that added it.
+        pub(crate) mtp_history {
+            env: "LUMEN_MTP_HISTORY",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
+    lumen_flags::flag! {
         /// Store the full-attention KV cache in bf16 rather than f32.
         ///
         /// Task 007 measured the cache at ~67 KB per allocated slot on
@@ -1933,13 +1949,115 @@ mod imp {
         pub committed: Vec<u32>,
         pub n_attempted: usize,
         pub n_accepted: usize,
-        /// 1-forward path only: the trunk pre-final-norm hidden at verify
-        /// position `n_accepted` (`[1, 1, hidden]`), i.e. the predecessor
-        /// hidden of the correction token. The caller (runner) threads this
-        /// back into the next `mtp_step` as `carried_hidden` so the drafter
-        /// can seed without a separate Step-A forward. `None` on the 2-forward
-        /// path (which re-seeds via Step A every cycle).
-        pub carried_hidden: Option<Array>,
+    }
+
+    /// What the MTP head has seen of one sequence. Its attention cache holds one entry per
+    /// committed pair (trunk hidden `h_j`, token `x_{j+1}`) for `j` in `start .. start +
+    /// kv.offset()`; `pending` holds the trunk hidden rows after those, whose pairs enter with
+    /// the next fold. The 1-forward cycle folds them together with its lead token (the fold's
+    /// last row is the first draft), drafts the rest on a tail it then cuts off, and leaves the
+    /// verify's accepted rows pending; a prefill folds its prompt chunk by chunk.
+    ///
+    /// Positions only have to line up: a fold that does not continue the cache restarts it
+    /// there, which costs acceptance and nothing else.
+    #[derive(Default)]
+    pub struct MtpHistory {
+        pub(crate) kv: NativeKvCache,
+        start: usize,
+        pending: Option<MtpPending>,
+    }
+
+    /// Trunk hidden rows of positions `pos .. pos + n` (`rows`, `[1, n, hidden]`) and the tokens
+    /// at `pos + 1 .. pos + n`: the next token of every row but the last, which is the next lead.
+    #[derive(Clone)]
+    pub(crate) struct MtpPending {
+        rows: Array,
+        tokens: Vec<u32>,
+        pos: usize,
+    }
+
+    impl MtpPending {
+        /// The position of the token after the last row.
+        fn end(&self) -> usize {
+            self.pos + self.tokens.len() + 1
+        }
+
+        /// The last row alone.
+        fn last(self) -> Result<Self> {
+            let n = self.tokens.len() as i32;
+            let rows = if n > 0 {
+                self.rows
+                    .take_axis(Array::from_slice(&[n], &[1]), 1)
+                    .context("mtp history: last pending row")?
+            } else {
+                self.rows
+            };
+            Ok(Self {
+                rows,
+                tokens: Vec::new(),
+                pos: self.pos + n as usize,
+            })
+        }
+    }
+
+    /// Where an [`MtpHistory`] stood, to return to with a sequence's rollback point.
+    #[derive(Clone)]
+    pub(crate) struct MtpMark {
+        start: usize,
+        folded: usize,
+        pending: Option<MtpPending>,
+    }
+
+    impl MtpHistory {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// The position whose pair the cache takes next.
+        fn frontier(&self) -> usize {
+            self.start + self.kv.offset()
+        }
+
+        pub(crate) fn clear(&mut self) {
+            self.kv.clear();
+            self.start = 0;
+            self.pending = None;
+        }
+
+        /// Make the pair of position `pos` the cache's next entry, emptying it if it is not.
+        fn restart_at(&mut self, pos: usize) {
+            if self.frontier() != pos || self.kv.offset() == 0 {
+                self.kv.clear();
+                self.start = pos;
+            }
+        }
+
+        /// The pending rows whose last is the predecessor of the token at `next`, with the cache
+        /// made to continue at their first; `None` if what is pending does not end there.
+        fn take_pending_for(&mut self, next: usize) -> Option<MtpPending> {
+            let pending = self.pending.take().filter(|p| p.end() == next)?;
+            self.restart_at(pending.pos);
+            Some(pending)
+        }
+
+        pub(crate) fn mark(&self) -> MtpMark {
+            MtpMark {
+                start: self.start,
+                folded: self.kv.offset(),
+                pending: self.pending.clone(),
+            }
+        }
+
+        /// Back to `mark`: the cache keeps what it held then, if it still holds it.
+        pub(crate) fn restore(&mut self, mark: &MtpMark) -> Result<()> {
+            if self.start != mark.start || self.kv.offset() < mark.folded {
+                self.clear();
+                return Ok(());
+            }
+            self.kv.truncate_to(mark.folded)?;
+            self.pending = mark.pending.clone();
+            Ok(())
+        }
     }
 
     pub struct NativeQwen3_5MoeModel {
@@ -4533,8 +4651,8 @@ mod imp {
             self.embed_lookup_ids(&Array::from_slice(&[token_id as i32], &[1]))
         }
 
-        /// [`Self::embed_lookup_single`] of a `[1]` int32 token array, which may still be
-        /// unevaluated (the drafter's own argmax).
+        /// [`Self::embed_lookup_single`] of a `[n]` int32 token array, `[1, n, hidden]`; it may
+        /// still be unevaluated (the drafter's own argmax).
         fn embed_lookup_ids(&self, ids_arr: &Array) -> Result<Array> {
             let raw = quantized_embedding_lookup_with_mode(
                 &self.embed_weight,
@@ -4548,8 +4666,8 @@ mod imp {
             .context("mtp_step: embed_lookup_single failed")?;
             let f32 = Self::to_f32(raw, "mtp_step.embed")?;
             let hidden = self.text_config().hidden_size as i32;
-            mlx_rs::ops::reshape(&f32, &[1, 1, hidden])
-                .context("mtp_step: embed reshape [1, 1, hidden] failed")
+            mlx_rs::ops::reshape(&f32, &[1, ids_arr.size() as i32, hidden])
+                .context("mtp_step: embed reshape [1, n, hidden] failed")
         }
 
         /// Pull one position's logit row from a `[1, L, vocab]` array into a
@@ -4609,10 +4727,9 @@ mod imp {
         pub fn mtp_step(
             &self,
             trunk_cache: &mut NativePromptCache,
-            mtp_kv: &mut NativeKvCache,
+            history: &mut MtpHistory,
             committed_token: u32,
             n_draft: usize,
-            carried_hidden: Option<Array>,
             sampling: &SamplingConfig,
         ) -> Result<MtpStepOutput> {
             if n_draft == 0 {
@@ -4663,10 +4780,9 @@ mod imp {
             if one_forward {
                 return self.mtp_step_one_forward(
                     trunk_cache,
-                    mtp_kv,
+                    history,
                     committed_token,
                     n_draft,
-                    carried_hidden,
                     &cfg,
                 );
             }
@@ -4682,11 +4798,11 @@ mod imp {
             let sampling = cfg.temperature > 0.0;
             let mut rng = Xorshift64::new(cfg.seed.wrapping_add(m_pre as u64).wrapping_add(0xA5));
 
-            // Reset the MTP block's own KV cache — every mtp_step is a fresh
-            // K-step extrapolation. Cross-call attention context lives in the
-            // TRUNK cache; the drafter only needs intra-step (draft-token)
-            // attention which is what `mtp_kv` carries.
-            mtp_kv.clear();
+            // Reset the MTP block's own KV cache — every 2-forward mtp_step is a
+            // fresh K-step extrapolation (the head history is the 1-forward
+            // cycle's). Cross-call attention context lives in the TRUNK cache.
+            history.clear();
+            let mtp_kv = &mut history.kv;
 
             // === Step A: trunk decode `committed_token` + capture last hidden ===
             self.set_mtp_capture_enabled(true);
@@ -4697,21 +4813,7 @@ mod imp {
             let trunk_h = self
                 .take_captured_h()
                 .ok_or_else(|| anyhow!("mtp_step: Step A failed to capture trunk last hidden"))?;
-            // The MTP head was trained to consume the POST-final-norm trunk
-            // hidden (MTPLX reference defaults hidden_variant="post_norm":
-            // hidden = inner.norm(hidden_states)). The capture stashes the
-            // PRE-final-norm residual, so apply the trunk final norm here to
-            // match the head's training distribution. Gated for A/B.
-            let trunk_h = if std::env::var("LUMEN_MTP_POSTNORM_H")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
-                let eps = self.text_config().rms_norm_eps;
-                rms_norm(&trunk_h, &self.final_norm_weight, eps)
-                    .context("mtp_step: post-final-norm trunk_h")?
-            } else {
-                trunk_h
-            };
+            // The capture is already the trunk hidden the head reads (`TrunkHidden`).
             // `next_token` is the trunk's guaranteed token. Greedy: argmax.
             // Sampling: a genuine sample from the trunk distribution, so the
             // committed stream is a valid sample at temperature T.
@@ -4932,8 +5034,90 @@ mod imp {
                 committed,
                 n_attempted: n_draft,
                 n_accepted,
-                carried_hidden: None,
             })
+        }
+
+        /// Fold a prefill chunk into the MTP head's history: `rows` the trunk hidden the head
+        /// reads at the chunk's positions `pos .. pos + tokens.len()` (the forward's capture),
+        /// `tokens` the chunk. Every pair whose next token the chunk holds enters the head
+        /// cache; the chunk's last row stays pending for the token after it. A no-op without an
+        /// MTP head or with `mtp_history` off.
+        pub(crate) fn mtp_fold_prompt(
+            &self,
+            history: &mut MtpHistory,
+            rows: Array,
+            tokens: &[u32],
+            pos: usize,
+        ) -> Result<()> {
+            let Some(block) = self.mtp.as_ref() else {
+                return Ok(());
+            };
+            if !mtp_history::get() || tokens.is_empty() {
+                return Ok(());
+            }
+            let (rows, next_tokens) = match history.take_pending_for(pos) {
+                Some(p) => {
+                    let rows = mlx_rs::ops::concatenate_axis(&[&p.rows, &rows], 1)
+                        .context("mtp prime: join the pending rows")?;
+                    let mut next = p.tokens;
+                    next.extend_from_slice(tokens);
+                    (rows, next)
+                }
+                None => {
+                    history.restart_at(pos);
+                    (rows, tokens[1..].to_vec())
+                }
+            };
+            let first = history.frontier();
+            let n = next_tokens.len() as i32;
+            if n > 0 {
+                let fold_idx: Vec<i32> = (0..n).collect();
+                let fold_rows = rows
+                    .take_axis(Array::from_slice(&fold_idx, &[n]), 1)
+                    .context("mtp prime: rows to fold")?;
+                let ids: Vec<i32> = next_tokens.iter().map(|&x| x as i32).collect();
+                let embeds = self.embed_lookup_ids(&Array::from_slice(&ids, &[n]))?;
+                block
+                    .forward_last(
+                        &embeds,
+                        &fold_rows,
+                        &mut history.kv,
+                        /* causal */ n > 1,
+                        &self.final_norm_weight,
+                        &self.trunk_lm_head_view(),
+                        /* head */ false,
+                    )
+                    .context("mtp prime: fold forward")?;
+                // Materialized per chunk, so a long prompt holds one chunk's rows.
+                if let (Some(k), Some(v)) = (history.kv.keys(), history.kv.values()) {
+                    mlx_rs::transforms::async_eval([k, v]).context("mtp prime: evaluate")?;
+                }
+            }
+            let last = rows
+                .take_axis(Array::from_slice(&[n], &[1]), 1)
+                .context("mtp prime: last row")?;
+            history.pending = Some(MtpPending {
+                rows: last,
+                tokens: Vec::new(),
+                pos: first + n as usize,
+            });
+            Ok(())
+        }
+
+        /// Whether a prefill should capture its hidden for [`Self::mtp_fold_prompt`].
+        pub(crate) fn mtp_primes(&self) -> bool {
+            self.mtp.is_some() && mtp_history::get()
+        }
+
+        /// Capture the trunk hidden the MTP head reads on the forwards that follow (`on`), or
+        /// stop.
+        pub(crate) fn capture_prompt_rows(&self, on: bool) {
+            self.set_mtp_capture_enabled(on);
+        }
+
+        /// The rows the last forward captured, taken.
+        pub(crate) fn take_prompt_rows(&self) -> Option<Array> {
+            self.take_captured_h()
         }
 
         /// One MTP speculative step, MTPLX-style **single trunk forward** per
@@ -4961,10 +5145,9 @@ mod imp {
         fn mtp_step_one_forward(
             &self,
             trunk_cache: &mut NativePromptCache,
-            mtp_kv: &mut NativeKvCache,
+            history: &mut MtpHistory,
             committed_token: u32,
             n_draft: usize,
-            carried_hidden: Option<Array>,
             cfg: &SamplingConfig,
         ) -> Result<MtpStepOutput> {
             let block = self
@@ -4978,9 +5161,9 @@ mod imp {
             let mut rng =
                 Xorshift64::new(cfg.seed.wrapping_add(entry_off as u64).wrapping_add(0xA5));
 
-            // Fresh K-step extrapolation each cycle — cross-cycle context lives
-            // in the trunk cache; the drafter only needs intra-step attention.
-            mtp_kv.clear();
+            // The head keeps its history across cycles (`mtp_history`); without
+            // it each cycle drafts from an empty head cache.
+            let keep_history = mtp_history::get();
 
             // Per-stage timing (LUMEN_MTP_STAGE_TIMING=1) — localizes the K>1
             // overhead (drafter head-fwds vs verify forward vs SSM rollback) so
@@ -5007,9 +5190,14 @@ mod imp {
             //   - emit_lead: whether lead_token is new output this cycle
             //     (bootstrap: next_token is new; steady: committed_token was
             //     already emitted last cycle as that cycle's correction).
-            let (lead_token, h_draft, emit_lead) = match carried_hidden {
+            // The rows the first draft folds: the pending verify rows of the last
+            // cycle (steady), or a Step-A forward's (bootstrap: no history ends at
+            // `committed_token`, e.g. the first cycle after a plain decode).
+            let entry = trunk_cache.full_attn_offset();
+            let pending = history.take_pending_for(entry);
+            let (lead_token, fold, emit_lead) = match pending {
                 None => {
-                    // BOOTSTRAP (cycle 0): seed the carry with a Step-A forward.
+                    // BOOTSTRAP: seed the carry with a Step-A forward.
                     self.set_mtp_capture_enabled(true);
                     let logits_a = self
                         .forward_with_opts(
@@ -5031,14 +5219,24 @@ mod imp {
                             .context("mtp_step1: bootstrap argmax")?
                     };
                     // cache: M -> M+1 (committed_token now at M).
-                    (next_token, h0, true)
+                    history.restart_at(entry);
+                    let fold = MtpPending {
+                        rows: h0,
+                        tokens: Vec::new(),
+                        pos: entry,
+                    };
+                    (next_token, fold, true)
                 }
-                Some(h) => {
-                    // STEADY: committed_token = previous cycle's correction
-                    // (already emitted). It enters the cache via verify_in[0];
-                    // h is its predecessor hidden, carried from the prior verify.
-                    (committed_token, h, false)
-                }
+                // STEADY: committed_token = previous cycle's correction (already
+                // emitted). It enters the cache via verify_in[0]; the fold is the
+                // verify rows up to its predecessor.
+                Some(p) => (committed_token, p, false),
+            };
+            let fold = if keep_history {
+                fold
+            } else {
+                history.kv.clear();
+                fold.last()?
             };
 
             // Offset where the verify forward will write `lead_token`.
@@ -5047,8 +5245,9 @@ mod imp {
             // === Drafter loop: extrapolate K tokens from (lead_token, h_draft) ===
             let trunk_final_norm_w = self.final_norm_weight.clone();
             let trunk_lm_head = self.trunk_lm_head_view();
-            let mut last_h = h_draft;
+            let mut last_h: Option<Array> = None;
             let mut last_tok = lead_token;
+            let mut fold_end = history.kv.offset();
             let mut drafts: Vec<u32> = Vec::with_capacity(n_draft);
             let mut draft_qs: Vec<Vec<f32>> = if sampling {
                 Vec::with_capacity(n_draft)
@@ -5063,21 +5262,51 @@ mod imp {
             let mut lazy_drafts: Vec<Array> = Vec::with_capacity(if lazy { n_draft } else { 0 });
             let t_draft0 = st.then(Instant::now);
             for k in 0..n_draft {
-                let embeds = match lazy_drafts.last() {
-                    Some(prev) => self.embed_lookup_ids(prev),
-                    None => self.embed_lookup_single(last_tok),
-                }
-                .with_context(|| format!("mtp_step1: drafter embed k={k}"))?;
-                let (logits_b, new_h) = block
-                    .forward(
-                        &embeds,
-                        &last_h,
-                        mtp_kv,
-                        /* causal */ false,
-                        &trunk_final_norm_w,
-                        &trunk_lm_head,
-                    )
-                    .with_context(|| format!("mtp_step1: drafter block.forward k={k}"))?;
+                let (logits_b, new_h) = match last_h.take() {
+                    // The first draft is the fold's last row: every pending pair and
+                    // (h, lead) enter the head cache in one forward.
+                    None => {
+                        let mut ids: Vec<i32> = fold.tokens.iter().map(|&x| x as i32).collect();
+                        ids.push(lead_token as i32);
+                        let ids = Array::from_slice(&ids, &[ids.len() as i32]);
+                        let embeds = self
+                            .embed_lookup_ids(&ids)
+                            .context("mtp_step1: fold embed")?;
+                        let out = block
+                            .forward_last(
+                                &embeds,
+                                &fold.rows,
+                                &mut history.kv,
+                                /* causal */ !fold.tokens.is_empty(),
+                                &trunk_final_norm_w,
+                                &trunk_lm_head,
+                                /* head */ true,
+                            )
+                            .context("mtp_step1: fold forward")?
+                            .ok_or_else(|| anyhow!("mtp_step1: fold returned no head"))?;
+                        fold_end = history.kv.offset();
+                        out
+                    }
+                    // The chained drafts run on a tail of the head cache that is cut
+                    // off below: only committed pairs stay.
+                    Some(h) => {
+                        let embeds = match lazy_drafts.last() {
+                            Some(prev) => self.embed_lookup_ids(prev),
+                            None => self.embed_lookup_single(last_tok),
+                        }
+                        .with_context(|| format!("mtp_step1: drafter embed k={k}"))?;
+                        block
+                            .forward(
+                                &embeds,
+                                &h,
+                                &mut history.kv,
+                                /* causal */ false,
+                                &trunk_final_norm_w,
+                                &trunk_lm_head,
+                            )
+                            .with_context(|| format!("mtp_step1: drafter block.forward k={k}"))?
+                    }
+                };
                 if lazy {
                     let draft = self
                         .argmax_last_token_lazy(&logits_b)
@@ -5086,7 +5315,7 @@ mod imp {
                         })
                         .with_context(|| format!("mtp_step1: drafter lazy argmax k={k}"))?;
                     lazy_drafts.push(draft);
-                    last_h = new_h;
+                    last_h = Some(new_h);
                     continue;
                 }
                 let draft_tok = if sampling {
@@ -5100,9 +5329,13 @@ mod imp {
                         .with_context(|| format!("mtp_step1: drafter argmax k={k}"))?
                 };
                 drafts.push(draft_tok);
-                last_h = new_h;
+                last_h = Some(new_h);
                 last_tok = draft_tok;
             }
+            history
+                .kv
+                .truncate_to(fold_end)
+                .context("mtp_step1: cut the draft tail off the head cache")?;
             if let Some(t) = t_draft0 {
                 t_draft = t.elapsed().as_secs_f64() * 1000.0;
             }
@@ -5247,20 +5480,23 @@ mod imp {
                 t_accept = t.elapsed().as_secs_f64() * 1000.0;
             }
 
-            // Next cycle's carry: trunk pre-final-norm hidden at verify position
-            // n_accepted = predecessor hidden of the correction token. Same
-            // capture site/distribution as the bootstrap's h_draft.
+            // Next cycle's fold: the verify rows of the lead and the accepted
+            // drafts (positions verify_base ..= verify_base + n_accepted), whose
+            // last is the correction's predecessor.
             let t_carry0 = st.then(Instant::now);
-            let idx = Array::from_slice(&[n_accepted as i32], &[1]);
-            let next_carried = verify_hidden_all
-                .take_axis(&idx, 1)
-                .context("mtp_step1: select verify_hidden[n_accepted]")?;
+            let keep: Vec<i32> = (0..=n_accepted as i32).collect();
+            let rows = verify_hidden_all
+                .take_axis(Array::from_slice(&keep, &[keep.len() as i32]), 1)
+                .context("mtp_step1: select the accepted verify rows")?;
             if st {
-                next_carried
-                    .eval()
-                    .context("mtp_step1: carry timing eval")?;
+                rows.eval().context("mtp_step1: carry timing eval")?;
                 t_carry = t_carry0.unwrap().elapsed().as_secs_f64() * 1000.0;
             }
+            history.pending = Some(MtpPending {
+                rows,
+                tokens: drafts[..n_accepted].to_vec(),
+                pos: verify_base,
+            });
 
             // === Rollback to keep [lead_token, accepted_drafts] ===
             let t_roll0 = st.then(Instant::now);
@@ -5319,7 +5555,6 @@ mod imp {
                 committed,
                 n_attempted: n_draft,
                 n_accepted,
-                carried_hidden: Some(next_carried),
             })
         }
 
@@ -5369,6 +5604,83 @@ mod imp {
                 .ok_or_else(|| anyhow!("argmax_last_token: argmax produced empty slice"))
         }
     }
+
+    #[cfg(test)]
+    mod mtp_history_tests {
+        use super::{MtpHistory, MtpPending};
+
+        /// `n` pairs into the head cache, as a fold would put them.
+        fn fold(h: &mut MtpHistory, n: i32) {
+            let kv = mlx_rs::ops::zeros::<f32>(&[1, 1, n, 4]).expect("kv");
+            h.kv.update_and_fetch(&kv, &kv).expect("append");
+        }
+
+        fn pending(pos: usize, rows: usize) -> MtpPending {
+            MtpPending {
+                rows: mlx_rs::ops::zeros::<f32>(&[1, rows as i32, 4]).expect("rows"),
+                tokens: vec![7; rows - 1],
+                pos,
+            }
+        }
+
+        /// A cycle continues the history only from rows that end at its lead and start where
+        /// the cache ends; anything else starts the cache over at the rows (acceptance is all
+        /// a wrong history costs, but it must never shift positions).
+        #[test]
+        fn a_fold_continues_the_cache_only_where_it_ends() {
+            let mut h = MtpHistory::new();
+            h.restart_at(0);
+            fold(&mut h, 9);
+            h.pending = Some(pending(9, 3));
+            // Rows 9, 10, 11: the lead is at 12.
+            assert!(
+                h.take_pending_for(11).is_none(),
+                "a lead before the rows' end"
+            );
+            h.pending = Some(pending(9, 3));
+            let p = h.take_pending_for(12).expect("rows ending at the lead");
+            assert_eq!((p.pos, p.tokens.len()), (9, 2));
+            assert_eq!((h.start, h.kv.offset()), (0, 9), "the cache continues");
+            // Rows after a gap (the cache ends at 9, the rows start at 20) restart it.
+            h.pending = Some(pending(20, 2));
+            let _ = h.take_pending_for(22).expect("rows ending at the lead");
+            assert_eq!(
+                (h.start, h.kv.offset()),
+                (20, 0),
+                "the cache restarts at the rows"
+            );
+        }
+
+        /// A rollback point brings back what the cache held and what was pending at the mark,
+        /// and an empty history when the cache restarted since.
+        #[test]
+        fn a_rollback_returns_the_history_of_its_mark() {
+            let mut h = MtpHistory::new();
+            h.restart_at(0);
+            fold(&mut h, 5);
+            h.pending = Some(pending(5, 1));
+            let mark = h.mark();
+            fold(&mut h, 4);
+            h.pending = Some(pending(9, 2));
+            h.restore(&mark).expect("restore");
+            assert_eq!(h.kv.offset(), 5);
+            let p = h.pending.as_ref().expect("pending at the mark");
+            assert_eq!((p.pos, p.end()), (5, 6));
+            // Restarted elsewhere after the mark: nothing of it is left to return to.
+            h.restart_at(40);
+            fold(&mut h, 3);
+            h.restore(&mark).expect("restore");
+            assert_eq!((h.kv.offset(), h.pending.is_none()), (0, true));
+        }
+
+        /// Without history a cycle folds the last pending row alone, at its own position.
+        #[test]
+        fn the_last_row_of_the_pending_is_the_lead_predecessor() {
+            let p = pending(30, 3).last().expect("last");
+            assert_eq!((p.pos, p.tokens.len(), p.end()), (32, 0, 33));
+            assert_eq!(p.rows.shape(), &[1, 1, 4]);
+        }
+    }
 }
 
 #[cfg(feature = "mlx-native")]
@@ -5401,6 +5713,10 @@ pub(crate) use imp::{ResolvedLinear, argmax_rows};
 // the crate root via `lumen_mlx::MtpStepOutput`.
 #[cfg(feature = "mlx-native")]
 pub use imp::MtpStepOutput;
+
+/// The MTP head's history of a sequence and a point to return it to (runner seq state).
+#[cfg(feature = "mlx-native")]
+pub(crate) use imp::{MtpHistory, MtpMark};
 
 /// bf16 KV storage toggle. Public so an A/B harness can flip it between runs in
 /// one process rather than relying on a per-process env read — see
