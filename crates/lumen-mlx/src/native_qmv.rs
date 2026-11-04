@@ -101,11 +101,16 @@ const ROWS_SIMDGROUPS: i32 = 4;
 /// together (`decode_qmv_rows`, or MLX's choice below GPU generation 15), more one each.
 const MAX_ROW_VECTORS: i32 = 4;
 
-/// Vectors [`ROWS_BODY`] dots with each decoded nibble at a time: all of them up to three, four
-/// in two passes of two. A lane holding four vectors' values spills (M3 Max, 17408x5120, four
-/// vectors: at once 531 us, in two passes 320 us).
-fn vectors_per_pass(vectors: i32) -> i32 {
-    if vectors == 4 { 2 } else { vectors }
+/// Vectors the row kernels dot with each decoded weight at a time: at 4 bits all of them up to
+/// three, four in two passes of two, as a lane holding four vectors' 16 values spills (M3 Max,
+/// 17408x5120, four vectors: at once 531 us, in two passes 320 us); at 8 bits, 8 values a vector,
+/// all four at once (two passes 465 us, one 369 us).
+fn vectors_per_pass(vectors: i32, bits: i32) -> i32 {
+    if vectors == 4 && bits == 4 {
+        2
+    } else {
+        vectors
+    }
 }
 /// Projections one shared launch takes at most: linear attention's four input projections.
 const MAX_SHARED: usize = 4;
@@ -961,7 +966,7 @@ fn run_fast(x: &Array, plans: &[Plan], weights: &[Weights<'_>]) -> Result<Vec<Ar
         if shared_rows {
             config.add_template_arg_int("VV", vectors)?;
             config.add_template_arg_int("SG", sg)?;
-            config.add_template_arg_int("VC", vectors_per_pass(vectors))?;
+            config.add_template_arg_int("VC", vectors_per_pass(vectors, bits))?;
         }
         for (p, plan) in plans.iter().enumerate() {
             config.add_template_arg_int(&format!("N{p}"), plan.outputs)?;
@@ -1652,7 +1657,21 @@ mod tests {
                 .collect();
             for (rows, inputs, layers) in shapes {
                 let ps: Vec<Projection> = (0..layers)
-                    .map(|i| projection(rows, inputs, i as u64))
+                    .map(|i| {
+                        let q = |k: &str, d: i32| {
+                            std::env::var(k)
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(d)
+                        };
+                        projection_q(
+                            rows,
+                            inputs,
+                            i as u64,
+                            q("QMV_BENCH_GROUP", 64),
+                            q("QMV_BENCH_BITS", 4),
+                        )
+                    })
                     .collect();
                 let wides: Vec<(Array, Array)> = ps
                     .iter()
@@ -1700,8 +1719,8 @@ mod tests {
                                     s,
                                     Some(b),
                                     true,
-                                    64,
-                                    4,
+                                    p.group,
+                                    p.bits,
                                     MODE_AFFINE,
                                 ),
                                 1 => matvec(&one, &x, &p.weights()),
@@ -1712,8 +1731,8 @@ mod tests {
                                     &p.s,
                                     Some(&p.b),
                                     true,
-                                    64,
-                                    4,
+                                    p.group,
+                                    p.bits,
                                     MODE_AFFINE,
                                 ),
                             }
