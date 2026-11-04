@@ -19,8 +19,8 @@ use mlx_rs::{Array, Dtype, random};
 use super::slot_pool::PoolTensor;
 use super::{distinct_in_order, split_entries, takes_staging_path};
 use crate::native_moe::{
-    SwitchExpertWeights, SwitchGluWeights, expert_entries, rejoin_entries, run_experts, switch_glu,
-    weighted_sum,
+    GateUpWeights, SwitchExpertWeights, SwitchGluWeights, expert_entries, rejoin_entries,
+    run_experts, switch_glu, weighted_sum,
 };
 use crate::native_quant::{MODE_AFFINE, quantize_with_mode};
 
@@ -71,12 +71,15 @@ fn glu_of(arrays: &Roles) -> SwitchGluWeights<'_> {
         biases: Some(&arrays[&format!("{p}.biases")]),
     };
     SwitchGluWeights {
-        gate_proj: proj("gate_proj"),
-        up_proj: proj("up_proj"),
+        gate_up: GateUpWeights::Split {
+            gate: proj("gate_proj"),
+            up: proj("up_proj"),
+        },
         down_proj: proj("down_proj"),
         group_size: GROUP,
         bits: 4,
         mode: MODE_AFFINE,
+        decode_views: None,
     }
 }
 
@@ -169,9 +172,13 @@ fn pool_view(pools: &BTreeMap<String, PoolTensor>, base: usize, len: usize) -> R
 
 /// `switch_glu` over `arrays` with `ids` as the gather indices: `[rows, TOP_K, HIDDEN]` as f32.
 fn run(x: &Array, ids: &[u32], arrays: &Roles) -> Vec<f32> {
+    run_glu(x, ids, &glu_of(arrays))
+}
+
+fn run_glu(x: &Array, ids: &[u32], glu: &SwitchGluWeights<'_>) -> Vec<f32> {
     let rows = ids.len() / TOP_K;
     let inds = Array::from_slice(ids, &[1, rows as i32, TOP_K as i32]);
-    let y = switch_glu(x, &inds, &glu_of(arrays)).expect("switch_glu");
+    let y = switch_glu(x, &inds, glu).expect("switch_glu");
     let y = y.as_dtype(Dtype::Float32).expect("f32");
     y.eval().expect("eval");
     y.try_as_slice::<f32>().expect("slice").to_vec()
@@ -386,5 +393,53 @@ fn a_call_split_into_resident_and_missing_entries_gives_the_whole_calls_bits() {
                 }
             }
         }
+    }
+}
+
+/// Stacking the experts' gate and up tensors (`fuse_moe_gate_up`) must not change a bit: one
+/// gather over `[gate; up]` rows has to give each output row what two gathers give it, on every
+/// kernel the call sizes reach (per-row decode, sorted per-row, sorted tiled).
+#[test]
+fn one_gather_over_stacked_gate_and_up_gives_the_bits_of_two() {
+    let layer = build_layer();
+    let stack = |part: &str| {
+        let stacked = mlx_rs::ops::concatenate_axis(
+            &[
+                &layer[&format!("gate_proj.{part}")],
+                &layer[&format!("up_proj.{part}")],
+            ],
+            1,
+        )
+        .expect("stack");
+        stacked.eval().expect("eval");
+        stacked
+    };
+    let (weight, scales, biases) = (stack("weight"), stack("scales"), stack("biases"));
+    let separate = glu_of(&layer);
+    let stacked = SwitchGluWeights {
+        gate_up: GateUpWeights::Fused(SwitchExpertWeights {
+            weight: &weight,
+            scales: &scales,
+            biases: Some(&biases),
+        }),
+        down_proj: SwitchExpertWeights {
+            weight: &layer["down_proj.weight"],
+            scales: &layer["down_proj.scales"],
+            biases: Some(&layer["down_proj.biases"]),
+        },
+        group_size: GROUP,
+        bits: 4,
+        mode: MODE_AFFINE,
+        decode_views: None,
+    };
+    for rows in ROWS {
+        let x = activations(rows);
+        let ids = routing(rows, 250, 11 + rows as u64);
+        let (differing, rel) = gap(&run_glu(&x, &ids, &separate), &run_glu(&x, &ids, &stacked));
+        assert_eq!(
+            differing, 0,
+            "{rows} rows: {differing} elements differ between two gathers and one stacked gather \
+             (largest gap {rel:.3e} of the largest value)"
+        );
     }
 }

@@ -84,6 +84,13 @@ fn replay_tool_body_parse() {
 }
 
 #[test]
+fn replay_qwen_parser_feed() {
+    for (_, bytes) in committed_inputs("qwen_parser_feed") {
+        lumen_mlx::parser_contract::assert_qwen35_parser_contract(&bytes);
+    }
+}
+
+#[test]
 fn replay_args_to_json() {
     for (path, bytes) in committed_inputs("args_to_json") {
         let Ok(text) = std::str::from_utf8(&bytes) else {

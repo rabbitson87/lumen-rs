@@ -9,6 +9,7 @@ use lumen_mlx::chat_io::{
     AssistantToolCall, BackendStreamEvent, ChatTurn, ParsedResponse, ParsedToolCall,
     ResolvedToolChoice, StopCause, ToolDef,
 };
+use lumen_mlx::stream_detok::StreamDetok;
 
 /// Prints the tokenizer work one request did when it goes out of scope, so a
 /// guard rejection or an early `?` return is still reported.
@@ -1042,11 +1043,7 @@ impl InferenceEngine {
     }
 
     /// Handle a streaming chat completion — sends tokens via channel as they're generated.
-    fn chat_completion_streaming(
-        &mut self,
-        req: &ChatCompletionRequest,
-        token_tx: &mpsc::Sender<StreamEvent>,
-    ) {
+    fn chat_completion_streaming(&mut self, req: &ChatCompletionRequest, token_tx: &StreamTx) {
         let _tokenize = TokenizeSpan::begin(&self.backend, "chat-stream");
         let ov = req.sampling_overrides();
         let mut messages: Vec<(String, String)> = req
@@ -1161,12 +1158,12 @@ impl InferenceEngine {
         // backend (the engine only has a token *count* here) — tracked
         // separately; for now an over-cap prompt is rejected with guidance.
         if let Err(e) = guard_prompt_fits(&self.backend, prompt_tokens) {
-            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+            let _ = token_tx.deliver(StreamEvent::Error(e.to_string()));
             return;
         }
         // Admitted: the route waits for this (or the refusal above) before it
         // writes the stream's head, so a refusal can still be an HTTP error.
-        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
+        let _ = token_tx.deliver(StreamEvent::Start { prompt_tokens });
 
         // Phase 1.5: when prior assistant tool_calls or role:"tool" are
         // in the request, dispatch through chat_streaming_from_history
@@ -1212,7 +1209,7 @@ impl InferenceEngine {
                             // (reuses the stopped_by_seq early-break path).
                             let (emit, stopped) = js.borrow_mut().push(t);
                             if !emit.is_empty() {
-                                let _ = token_tx.try_send(StreamEvent::Delta(emit));
+                                deliver_or_gone(token_tx, StreamEvent::Delta(emit))?;
                             }
                             if stopped {
                                 stopped_by_seq.set(true);
@@ -1233,7 +1230,7 @@ impl InferenceEngine {
                         }
                     }
                     BackendStreamEvent::Reasoning(t) => {
-                        let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                        deliver_or_gone(token_tx, StreamEvent::ReasoningDelta(t.to_string()))?;
                     }
                     BackendStreamEvent::ToolCallStart { name } => {
                         // Early per-call Start suppressed. Args are not known
@@ -1274,7 +1271,7 @@ impl InferenceEngine {
                             // (reuses the stopped_by_seq early-break path).
                             let (emit, stopped) = js.borrow_mut().push(t);
                             if !emit.is_empty() {
-                                let _ = token_tx.try_send(StreamEvent::Delta(emit));
+                                deliver_or_gone(token_tx, StreamEvent::Delta(emit))?;
                             }
                             if stopped {
                                 stopped_by_seq.set(true);
@@ -1295,7 +1292,7 @@ impl InferenceEngine {
                         }
                     }
                     BackendStreamEvent::Reasoning(t) => {
-                        let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                        deliver_or_gone(token_tx, StreamEvent::ReasoningDelta(t.to_string()))?;
                     }
                     BackendStreamEvent::ToolCallStart { name } => {
                         // Early per-call Start suppressed. Args are not known
@@ -1335,7 +1332,7 @@ impl InferenceEngine {
                 // but never completed) so it still streams to the client.
                 let tail = stop_matcher.borrow_mut().flush();
                 if !tail.is_empty() {
-                    let _ = token_tx.try_send(StreamEvent::Delta(tail));
+                    let _ = token_tx.deliver(StreamEvent::Delta(tail));
                 }
                 // Bug A: resolve abbreviated tool names (e.g. the model dropped
                 // an MCP namespace) by unique suffix match before emitting.
@@ -1366,7 +1363,7 @@ impl InferenceEngine {
                     };
                     if !already_started {
                         let id = format!("call_{}", gen_id());
-                        let _ = token_tx.try_send(StreamEvent::ToolCallStart {
+                        let _ = token_tx.deliver(StreamEvent::ToolCallStart {
                             index,
                             id,
                             name: call.name.clone(),
@@ -1374,11 +1371,11 @@ impl InferenceEngine {
                     }
                     let args =
                         serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
-                    let _ = token_tx.try_send(StreamEvent::ToolCallArgumentsDelta {
+                    let _ = token_tx.deliver(StreamEvent::ToolCallArgumentsDelta {
                         index,
                         partial_json: args,
                     });
-                    let _ = token_tx.try_send(StreamEvent::ToolCallStop { index });
+                    let _ = token_tx.deliver(StreamEvent::ToolCallStop { index });
                 }
                 let completion_tokens = completion_tokens_with_tools(
                     &self.backend,
@@ -1402,12 +1399,15 @@ impl InferenceEngine {
                 };
                 self.load_stats
                     .record(prompt_tokens as u64, completion_tokens as u64, tok_per_sec);
-                let _ = token_tx.try_send(StreamEvent::Done {
+                let _ = token_tx.deliver(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
                     finish_reason,
                     stop_sequence: stop_matcher.borrow().matched().map(str::to_owned),
                 });
+            }
+            Err(e) if client_gone(&e) => {
+                eprintln!("[chat-stream] client disconnected — stopped decoding");
             }
             Err(_) if stopped_by_seq.get() => {
                 // Stopped by a client stop sequence. The visible text up to the
@@ -1421,7 +1421,7 @@ impl InferenceEngine {
                 // Observability: still count the request (gen tokens unknown →
                 // 0, tok/s left unchanged via the 0.0 guard in `record`).
                 self.load_stats.record(prompt_tokens as u64, 0, 0.0);
-                let _ = token_tx.try_send(StreamEvent::Done {
+                let _ = token_tx.deliver(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens: 0,
                     finish_reason: FinishReason::Stop,
@@ -1431,7 +1431,7 @@ impl InferenceEngine {
             }
             Err(e) => {
                 eprintln!("[chat-stream] ERR: {e:#}");
-                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+                let _ = token_tx.deliver(StreamEvent::Error(e.to_string()));
             }
         }
     }
@@ -1441,27 +1441,19 @@ impl InferenceEngine {
     /// travel ahead of decode rather than with `Done` — and after the guard, so
     /// a rejected request emits `error` and no `message_start` at all. `false`
     /// means rejected (the error is already sent).
-    fn admit_anthropic_stream(
-        &self,
-        prompt_tokens: u32,
-        token_tx: &mpsc::Sender<StreamEvent>,
-    ) -> bool {
+    fn admit_anthropic_stream(&self, prompt_tokens: u32, token_tx: &StreamTx) -> bool {
         // Prompt-size reject cap — guard the prefill from an uncaught Metal
         // OOM that would crash the server process.
         if let Err(e) = guard_prompt_fits(&self.backend, prompt_tokens) {
-            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+            let _ = token_tx.deliver(StreamEvent::Error(e.to_string()));
             return false;
         }
-        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
+        let _ = token_tx.deliver(StreamEvent::Start { prompt_tokens });
         true
     }
 
     /// Handle a streaming Anthropic messages request.
-    fn anthropic_messages_streaming(
-        &mut self,
-        req: &AnthropicRequest,
-        token_tx: &mpsc::Sender<StreamEvent>,
-    ) {
+    fn anthropic_messages_streaming(&mut self, req: &AnthropicRequest, token_tx: &StreamTx) {
         let _tokenize = TokenizeSpan::begin(&self.backend, "messages-stream");
         let needs_structured = anthropic_needs_structured_history(&req.messages);
         let ov = req.sampling_overrides();
@@ -1473,7 +1465,7 @@ impl InferenceEngine {
         let all_images = match anthropic_images_flat(&req.messages, system_text.is_some()) {
             Ok(v) => v,
             Err(e) => {
-                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+                let _ = token_tx.deliver(StreamEvent::Error(e.to_string()));
                 return;
             }
         };
@@ -1540,7 +1532,7 @@ impl InferenceEngine {
             let (mut turns, turn_images) = match built {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+                    let _ = token_tx.deliver(StreamEvent::Error(e.to_string()));
                     return;
                 }
             };
@@ -1612,7 +1604,7 @@ impl InferenceEngine {
                 // did, ahead of the tool blocks, as the OpenAI stream does.
                 let tail = stops.flush();
                 if !tail.is_empty() {
-                    let _ = token_tx.try_send(StreamEvent::Delta(tail));
+                    let _ = token_tx.deliver(StreamEvent::Delta(tail));
                 }
                 // Bug A: resolve abbreviated tool names (e.g. the model dropped
                 // an MCP namespace) by unique suffix match before emitting.
@@ -1625,7 +1617,7 @@ impl InferenceEngine {
                     };
                     if !already_started {
                         let id = format!("toolu_{}", gen_id());
-                        let _ = token_tx.try_send(StreamEvent::ToolCallStart {
+                        let _ = token_tx.deliver(StreamEvent::ToolCallStart {
                             index,
                             id,
                             name: call.name.clone(),
@@ -1633,11 +1625,11 @@ impl InferenceEngine {
                     }
                     let args =
                         serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
-                    let _ = token_tx.try_send(StreamEvent::ToolCallArgumentsDelta {
+                    let _ = token_tx.deliver(StreamEvent::ToolCallArgumentsDelta {
                         index,
                         partial_json: args,
                     });
-                    let _ = token_tx.try_send(StreamEvent::ToolCallStop { index });
+                    let _ = token_tx.deliver(StreamEvent::ToolCallStop { index });
                 }
                 let completion_tokens = completion_tokens_with_tools(
                     &self.backend,
@@ -1651,19 +1643,22 @@ impl InferenceEngine {
                 let matched = stops.matched().map(str::to_owned);
                 let finish_reason =
                     FinishReason::resolve(parsed.stop, has_tool_calls, matched.is_some());
-                let _ = token_tx.try_send(StreamEvent::Done {
+                let _ = token_tx.deliver(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
                     finish_reason,
                     stop_sequence: matched,
                 });
             }
+            Err(e) if client_gone(&e) => {
+                eprintln!("[anthropic-stream] client disconnected — stopped decoding");
+            }
             Err(_) if stops.matched().is_some() => {
                 // The sink broke the decode loop at a stop sequence; the text
                 // before it is already out and the rest is dropped. Tokens past
                 // the break are unknown here, so the count is 0, as on the
                 // OpenAI stream.
-                let _ = token_tx.try_send(StreamEvent::Done {
+                let _ = token_tx.deliver(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens: 0,
                     finish_reason: FinishReason::Stop,
@@ -1671,7 +1666,7 @@ impl InferenceEngine {
                 });
             }
             Err(e) => {
-                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+                let _ = token_tx.deliver(StreamEvent::Error(e.to_string()));
             }
         }
     }
@@ -2744,6 +2739,35 @@ fn parsed_to_openai_tool_calls(calls: &[ParsedToolCall]) -> Vec<ToolCall> {
 use tokio::sync::{mpsc, oneshot};
 
 /// Events emitted during streaming generation.
+/// The queue from the engine thread to a client's writer.
+///
+/// Unbounded on purpose. It was 256 slots and sent with `try_send`, so a client
+/// more than 256 events behind lost deltas, tool-argument events and `Done`
+/// without a trace. Blocking until there is room is not available — the engine
+/// thread runs inside a runtime, where a blocking send panics — and would not
+/// be wanted: one slow reader would hold up the batched scheduler's other
+/// streams. The events are small and a stream is bounded by `max_tokens`.
+pub type StreamTx = mpsc::UnboundedSender<StreamEvent>;
+pub type StreamRx = mpsc::UnboundedReceiver<StreamEvent>;
+
+/// A new stream queue: the one place its capacity is decided.
+pub fn stream_channel() -> (StreamTx, StreamRx) {
+    mpsc::unbounded_channel()
+}
+
+/// Queue an event for the client.
+trait Deliver {
+    /// `false` once the client has gone (its writer dropped the receiver), so a
+    /// decode that would only be streaming to nobody can stop.
+    fn deliver(&self, event: StreamEvent) -> bool;
+}
+
+impl Deliver for StreamTx {
+    fn deliver(&self, event: StreamEvent) -> bool {
+        self.send(event).is_ok()
+    }
+}
+
 pub enum StreamEvent {
     /// New visible-text fragment (assistant content).
     Delta(String),
@@ -2894,6 +2918,25 @@ fn trim_at_stop(text: &mut String, stops: &[String]) -> Option<String> {
 /// record of the stop, never by this text.
 const STOP_SEQUENCE_BREAK: &str = "__lumen_stop_sequence__";
 
+/// What a sink returns when the client it streams to has gone, so the backend's
+/// decode loop ends instead of writing a reply nobody reads: the engine serves
+/// one request at a time, and a disconnected client used to keep it busy until
+/// `max_tokens`.
+const CLIENT_GONE: &str = "client disconnected";
+
+fn client_gone(e: &anyhow::Error) -> bool {
+    e.to_string() == CLIENT_GONE
+}
+
+/// [`Deliver::deliver`] for a sink: `Err` once the client has gone.
+fn deliver_or_gone(tx: &StreamTx, event: StreamEvent) -> Result<()> {
+    if tx.deliver(event) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(CLIENT_GONE))
+    }
+}
+
 /// Pass one streamed text piece through the client's stop sequences and send
 /// what is safe to send. A piece that could still grow into a sequence is held
 /// back, so a sequence split across pieces is caught before any of it goes out.
@@ -2905,15 +2948,14 @@ const STOP_SEQUENCE_BREAK: &str = "__lumen_stop_sequence__";
 fn stream_text_through_stops(
     stops: &mut lumen_core::stop::StopMatcher,
     text: &str,
-    token_tx: &mpsc::Sender<StreamEvent>,
+    token_tx: &StreamTx,
 ) -> Result<()> {
     if stops.is_inert() {
-        let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
-        return Ok(());
+        return deliver_or_gone(token_tx, StreamEvent::Delta(text.to_string()));
     }
     let step = stops.push(text);
     if !step.emit.is_empty() {
-        let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
+        deliver_or_gone(token_tx, StreamEvent::Delta(step.emit))?;
     }
     if step.stopped {
         return Err(anyhow::anyhow!(STOP_SEQUENCE_BREAK));
@@ -2925,14 +2967,14 @@ fn stream_text_through_stops(
 /// Visible text goes through the request's `stop_sequences` (the trace is
 /// not matched, as the non-streaming route trims only the answer).
 fn anthropic_stream_sink<'a>(
-    token_tx: &'a mpsc::Sender<StreamEvent>,
+    token_tx: &'a StreamTx,
     stops: &'a mut lumen_core::stop::StopMatcher,
 ) -> impl FnMut(BackendStreamEvent<'_>) -> Result<()> + 'a {
     move |ev| {
         match ev {
             BackendStreamEvent::Text(t) => return stream_text_through_stops(stops, t, token_tx),
             BackendStreamEvent::Reasoning(t) => {
-                let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                deliver_or_gone(token_tx, StreamEvent::ReasoningDelta(t.to_string()))?;
             }
             BackendStreamEvent::ToolCallStart { name } => {
                 // Early per-call Start suppressed — see the OpenAI stream's
@@ -2955,7 +2997,7 @@ pub enum EngineRequest {
     },
     StreamingChatCompletion {
         req: ChatCompletionRequest,
-        token_tx: mpsc::Sender<StreamEvent>,
+        token_tx: StreamTx,
     },
     Completion {
         req: CompletionRequest,
@@ -2967,7 +3009,7 @@ pub enum EngineRequest {
     },
     StreamingAnthropicMessages {
         req: AnthropicRequest,
-        token_tx: mpsc::Sender<StreamEvent>,
+        token_tx: StreamTx,
     },
     ListModels {
         reply: oneshot::Sender<ModelListResponse>,
@@ -3037,11 +3079,8 @@ impl EngineHandle {
             .await?
     }
 
-    pub async fn chat_completion_streaming(
-        &self,
-        req: ChatCompletionRequest,
-    ) -> Result<mpsc::Receiver<StreamEvent>> {
-        let (token_tx, token_rx) = mpsc::channel(256);
+    pub async fn chat_completion_streaming(&self, req: ChatCompletionRequest) -> Result<StreamRx> {
+        let (token_tx, token_rx) = stream_channel();
         self.tx
             .send(EngineRequest::StreamingChatCompletion { req, token_tx })
             .await
@@ -3049,11 +3088,8 @@ impl EngineHandle {
         Ok(token_rx)
     }
 
-    pub async fn anthropic_messages_streaming(
-        &self,
-        req: AnthropicRequest,
-    ) -> Result<mpsc::Receiver<StreamEvent>> {
-        let (token_tx, token_rx) = mpsc::channel(256);
+    pub async fn anthropic_messages_streaming(&self, req: AnthropicRequest) -> Result<StreamRx> {
+        let (token_tx, token_rx) = stream_channel();
         self.tx
             .send(EngineRequest::StreamingAnthropicMessages { req, token_tx })
             .await
@@ -3394,7 +3430,7 @@ impl InferenceEngine {
     fn admit_streaming_mlx(
         &mut self,
         req: ChatCompletionRequest,
-        token_tx: mpsc::Sender<StreamEvent>,
+        token_tx: StreamTx,
         active: &mut std::collections::HashMap<u64, ActiveSeqState>,
         next_seq_id: &mut u64,
     ) {
@@ -3414,7 +3450,7 @@ impl InferenceEngine {
         ) {
             Ok((seq, done)) => {
                 if done {
-                    let _ = seq.token_tx.try_send(StreamEvent::Done {
+                    let _ = seq.token_tx.deliver(StreamEvent::Done {
                         prompt_tokens: seq.prompt_tokens,
                         completion_tokens: seq.generated.len() as u32,
                         finish_reason: seq.finish_reason(),
@@ -3430,7 +3466,7 @@ impl InferenceEngine {
                 *next_seq_id += 1;
             }
             Err(e) => {
-                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+                let _ = token_tx.deliver(StreamEvent::Error(e.to_string()));
             }
         }
     }
@@ -3511,7 +3547,7 @@ impl InferenceEngine {
                 Err(e) => {
                     eprintln!("[mlx batched] decode_step_batch failed: {e}");
                     for (_id, seq) in active.drain() {
-                        let _ = seq.token_tx.try_send(StreamEvent::Error(e.to_string()));
+                        let _ = seq.token_tx.deliver(StreamEvent::Error(e.to_string()));
                     }
                     continue;
                 }
@@ -3531,12 +3567,19 @@ impl InferenceEngine {
                 seq.generated.push(next_tok);
                 seq.last_token = next_tok;
                 seq.position = new_pos;
-                if let Some((visible, reasoning)) = channels {
-                    emit_channel_delta(seq, visible, reasoning);
-                }
-                if seq.eos_tokens.contains(&next_tok) || seq.generated.len() >= seq.max_new {
+                let last = seq.eos_tokens.contains(&next_tok) || seq.generated.len() >= seq.max_new;
+                let open = match channels {
+                    Some((visible, reasoning)) => emit_channel_delta(seq, visible, reasoning, last),
+                    None => true,
+                };
+                if !last && (!open || seq.token_tx.is_closed()) {
+                    // The client is gone: decoding on would only fill a queue
+                    // nobody reads, and the slot is another stream's.
+                    eprintln!("[mlx batched] seq {id}: client disconnected — dropped");
+                    to_remove.push(id);
+                } else if last {
                     let n_gen = seq.generated.len();
-                    let _ = seq.token_tx.try_send(StreamEvent::Done {
+                    let _ = seq.token_tx.deliver(StreamEvent::Done {
                         prompt_tokens: seq.prompt_tokens,
                         completion_tokens: n_gen as u32,
                         finish_reason: seq.finish_reason(),
@@ -3595,7 +3638,7 @@ impl InferenceEngine {
         messages: &[ChatMessage],
         max_tokens: usize,
         thinking: bool,
-        token_tx: mpsc::Sender<StreamEvent>,
+        token_tx: StreamTx,
     ) -> Result<(ActiveSeqState, bool)> {
         let msg_pairs: Vec<(String, String)> = messages
             .iter()
@@ -3616,7 +3659,7 @@ impl InferenceEngine {
         // The sequential path's context guard and admission. Without the guard
         // an over-cap prompt went straight into prefill here.
         guard_prompt_fits(&self.backend, prompt_tokens)?;
-        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
+        let _ = token_tx.deliver(StreamEvent::Start { prompt_tokens });
         let qb = self.mlx_batched_driver().ok_or_else(driver_missing)?;
         let max_new = if max_tokens == 0 { 256 } else { max_tokens };
 
@@ -3637,15 +3680,13 @@ impl InferenceEngine {
         // token 0 (e.g. when the very first token opens the `<|channel>` span).
         let generated = vec![first_tok];
         let (vis0, rea0) = qb.stream_channels(&generated).unwrap_or_default();
-        let mut prev_text = String::new();
-        let mut prev_reasoning = String::new();
-        if !vis0.contains('\u{FFFD}') && !vis0.is_empty() {
-            let _ = token_tx.try_send(StreamEvent::Delta(vis0.clone()));
-            prev_text = vis0;
+        let mut visible = StreamDetok::whole();
+        let mut reasoning = StreamDetok::whole();
+        if let Some(delta) = visible.next(&generated, |_| Ok(vis0)) {
+            let _ = token_tx.deliver(StreamEvent::Delta(delta));
         }
-        if !rea0.contains('\u{FFFD}') && !rea0.is_empty() {
-            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(rea0.clone()));
-            prev_reasoning = rea0;
+        if let Some(delta) = reasoning.next(&generated, |_| Ok(rea0)) {
+            let _ = token_tx.deliver(StreamEvent::ReasoningDelta(delta));
         }
         let done = eos_tokens.contains(&first_tok) || generated.len() >= max_new;
 
@@ -3655,8 +3696,8 @@ impl InferenceEngine {
             max_new,
             last_token: first_tok,
             position,
-            prev_text,
-            prev_reasoning,
+            visible,
+            reasoning,
             prompt_tokens,
             eos_tokens,
         };
@@ -3851,16 +3892,16 @@ mod tool_name_resolve_tests {
 /// temperature, tools, `response_format` or stop strings is routed to the
 /// sequential path — so the sampling fields were constants it never consulted.
 pub(crate) struct ActiveSeqState {
-    pub token_tx: mpsc::Sender<StreamEvent>,
+    pub token_tx: StreamTx,
     pub generated: Vec<u32>,
     pub max_new: usize,
     pub last_token: u32,
     pub position: usize,
-    pub prev_text: String,
-    /// Channel-aware streaming: cumulative reasoning-channel text already
-    /// emitted as `ReasoningDelta`. Mirrors `prev_text` for the visible
-    /// channel.
-    pub prev_reasoning: String,
+    /// What of the visible channel has gone out as `Delta`.
+    pub visible: StreamDetok,
+    /// Channel-aware streaming: what of the reasoning channel has gone out as
+    /// `ReasoningDelta`. Mirrors `visible`.
+    pub reasoning: StreamDetok,
     pub prompt_tokens: u32,
     /// EOS token IDs used by the batched decode loop for this sequence.
     pub eos_tokens: Vec<u32>,
@@ -3877,39 +3918,40 @@ impl ActiveSeqState {
     }
 }
 
-/// Overlap-scheduling helper: detokenize the seq's full `generated` prefix and
-/// emit the incremental text delta vs `prev_text`, then clear `pending_emit`.
-///
-/// This is intentionally *cumulative* (decode the whole prefix, diff against
-/// `prev_text`) rather than per-token: the diff `text[prev_text.len()..]`
-/// guarantees that emitting "one decode step late" produces a byte-for-byte
-/// identical stream to emitting eagerly — no byte is ever dropped or
-/// duplicated, regardless of how many tokens accumulated since the last flush.
-/// Multi-byte UTF-8 boundaries are handled by the replacement-char guard
-/// exactly as the original synchronous path did.
-/// Channel-aware incremental emit for the MLX batched scheduler. Diffs the
-/// freshly-decoded `(visible, reasoning)` channel strings against the seq's
-/// cumulative `prev_text` / `prev_reasoning` and sends only the new tail of
-/// each channel (`Delta` / `ReasoningDelta`). The replacement-char guard skips
-/// emitting across an incomplete multi-byte UTF-8 boundary exactly like the
-/// flat-decode path: the next token completes the char and the cumulative diff
-/// recovers the held bytes, so no byte is dropped or duplicated.
+/// Channel-aware incremental emit for the MLX batched scheduler. Hands the
+/// freshly-decoded `(visible, reasoning)` channel strings to the seq's two
+/// [`StreamDetok`]s and sends the new tail of each (`Delta` / `ReasoningDelta`).
+/// A tail that ends in an incomplete multi-byte UTF-8 character is held until
+/// the next token completes it; a replacement character the model wrote is
+/// sent like any other text. `last` is the seq's final token: whatever is still
+/// held goes out with it. `false` once the client has gone.
 #[cfg(feature = "mlx-native")]
-fn emit_channel_delta(seq: &mut ActiveSeqState, visible: String, reasoning: String) {
-    if !visible.contains('\u{FFFD}') && visible.len() > seq.prev_text.len() {
-        let delta = visible[seq.prev_text.len()..].to_string();
-        if !delta.is_empty() {
-            let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
-            seq.prev_text = visible;
-        }
+fn emit_channel_delta(
+    seq: &mut ActiveSeqState,
+    visible: String,
+    reasoning: String,
+    last: bool,
+) -> bool {
+    let generated = &seq.generated;
+    let (visible, reasoning) = if last {
+        (
+            seq.visible.finish(generated, |_| Ok(visible)),
+            seq.reasoning.finish(generated, |_| Ok(reasoning)),
+        )
+    } else {
+        (
+            seq.visible.next(generated, |_| Ok(visible)),
+            seq.reasoning.next(generated, |_| Ok(reasoning)),
+        )
+    };
+    let mut open = true;
+    if let Some(delta) = visible {
+        open &= seq.token_tx.deliver(StreamEvent::Delta(delta));
     }
-    if !reasoning.contains('\u{FFFD}') && reasoning.len() > seq.prev_reasoning.len() {
-        let delta = reasoning[seq.prev_reasoning.len()..].to_string();
-        if !delta.is_empty() {
-            let _ = seq.token_tx.try_send(StreamEvent::ReasoningDelta(delta));
-            seq.prev_reasoning = reasoning;
-        }
+    if let Some(delta) = reasoning {
+        open &= seq.token_tx.deliver(StreamEvent::ReasoningDelta(delta));
     }
+    open
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -4630,7 +4672,7 @@ mod gemma_structured_stream {
         }))
         .expect("a valid chat request");
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        let (tx, mut rx) = crate::engine::stream_channel();
         engine.chat_completion_streaming(&req, &tx);
         drop(tx);
         let mut text = String::new();
@@ -4748,6 +4790,10 @@ mod gemma_chunked_prefill {
     #[test]
     #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
     fn a_long_prompt_is_prefilled_in_chunks() {
+        // With the disk tier on, the boundary resumes from a cold state the
+        // batch request above it (or an earlier run) wrote, which leaves a few
+        // hundred tokens to prefill: nothing for this to measure.
+        let _disk = ScopedEnv::set("LUMEN_KV_DISK", "0");
         let Some(mut engine) = gemma4(false) else {
             return;
         };
@@ -5065,19 +5111,109 @@ mod finish_reason_mapping {
     #[test]
     fn the_batched_scheduler_reports_a_budget_cut() {
         let seq = |generated: Vec<u32>| super::ActiveSeqState {
-            token_tx: tokio::sync::mpsc::channel(1).0,
+            token_tx: crate::engine::stream_channel().0,
             generated,
             max_new: 3,
             last_token: 0,
             position: 0,
-            prev_text: String::new(),
-            prev_reasoning: String::new(),
+            visible: lumen_mlx::stream_detok::StreamDetok::whole(),
+            reasoning: lumen_mlx::stream_detok::StreamDetok::whole(),
             prompt_tokens: 0,
             eos_tokens: vec![2],
         };
         assert_eq!(seq(vec![5, 6, 7]).finish_reason(), FinishReason::Length);
         assert_eq!(seq(vec![5, 6, 2]).finish_reason(), FinishReason::Stop);
         assert_eq!(seq(vec![2]).finish_reason(), FinishReason::Stop);
+    }
+
+    /// What the batched scheduler's per-token emit sends for a channel whose
+    /// text so far is, step by step, `steps`; the last one ends the sequence
+    /// when `last` is set.
+    #[cfg(feature = "mlx-native")]
+    fn batched_stream(steps: &[&str], last: bool) -> String {
+        let (tx, mut rx) = crate::engine::stream_channel();
+        let mut seq = super::ActiveSeqState {
+            token_tx: tx,
+            generated: Vec::new(),
+            max_new: 100,
+            last_token: 0,
+            position: 0,
+            visible: lumen_mlx::stream_detok::StreamDetok::whole(),
+            reasoning: lumen_mlx::stream_detok::StreamDetok::whole(),
+            prompt_tokens: 0,
+            eos_tokens: Vec::new(),
+        };
+        for (n, text) in steps.iter().enumerate() {
+            seq.generated.push(n as u32);
+            let is_last = last && n + 1 == steps.len();
+            super::emit_channel_delta(&mut seq, (*text).to_string(), String::new(), is_last);
+        }
+        let mut sent = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let super::StreamEvent::Delta(text) = event {
+                sent.push_str(&text);
+            }
+        }
+        sent
+    }
+
+    /// A sequence whose client has hung up is dropped from the batch instead of
+    /// decoding to `max_tokens` for nobody.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn the_batched_scheduler_notices_a_client_that_left() {
+        let (tx, rx) = crate::engine::stream_channel();
+        let mut seq = super::ActiveSeqState {
+            token_tx: tx,
+            generated: vec![1],
+            max_new: 100,
+            last_token: 0,
+            position: 0,
+            visible: lumen_mlx::stream_detok::StreamDetok::whole(),
+            reasoning: lumen_mlx::stream_detok::StreamDetok::whole(),
+            prompt_tokens: 0,
+            eos_tokens: Vec::new(),
+        };
+        assert!(super::emit_channel_delta(
+            &mut seq,
+            "a".into(),
+            String::new(),
+            false
+        ));
+        drop(rx);
+        seq.generated.push(2);
+        assert!(!super::emit_channel_delta(
+            &mut seq,
+            "ab".into(),
+            String::new(),
+            false
+        ));
+        assert!(seq.token_tx.is_closed());
+    }
+
+    /// A replacement character the model wrote used to end the stream: the
+    /// channel's text contained it from then on, so nothing after it was sent.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn a_replacement_character_the_model_wrote_does_not_end_the_batched_stream() {
+        let steps = [
+            "a",
+            "a\u{FFFD}",
+            "a\u{FFFD}b",
+            "a\u{FFFD}bc",
+            "a\u{FFFD}bcd",
+        ];
+        assert_eq!(batched_stream(&steps, false), "a\u{FFFD}bcd");
+    }
+
+    /// A character the model began and never finished is held for the token
+    /// that would complete it, and goes out with the last one.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn the_last_token_sends_what_the_batched_stream_held() {
+        let steps = ["a", "a\u{FFFD}"];
+        assert_eq!(batched_stream(&steps, false), "a");
+        assert_eq!(batched_stream(&steps, true), "a\u{FFFD}");
     }
 }
 
@@ -5087,7 +5223,7 @@ mod finish_reason_mapping {
 /// the whole of what the route does with the text.
 #[cfg(test)]
 mod anthropic_stream_stops {
-    use super::{StreamEvent, anthropic_stream_sink};
+    use super::{Deliver, StreamEvent, anthropic_stream_sink};
     use lumen_core::stop::StopMatcher;
     use lumen_mlx::chat_io::BackendStreamEvent;
 
@@ -5103,7 +5239,7 @@ mod anthropic_stream_stops {
         Ok(())
     }
 
-    fn drain(rx: &mut tokio::sync::mpsc::Receiver<StreamEvent>) -> (String, String) {
+    fn drain(rx: &mut crate::engine::StreamRx) -> (String, String) {
         let (mut text, mut trace) = (String::new(), String::new());
         while let Ok(ev) = rx.try_recv() {
             match ev {
@@ -5115,12 +5251,65 @@ mod anthropic_stream_stops {
         (text, trace)
     }
 
+    /// The engine serves one request at a time, so a decode for a client that
+    /// has gone holds up everyone behind it until `max_tokens`. The sink is how
+    /// the backend's loop hears of it: text and reasoning alike end it.
+    #[test]
+    fn a_sink_ends_the_decode_once_the_client_has_gone() {
+        use BackendStreamEvent::{Reasoning, Text};
+        let (tx, rx) = crate::engine::stream_channel();
+        let mut stops = StopMatcher::new(Vec::new());
+        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        assert!(sink(Text("still here")).is_ok());
+        drop(rx);
+        for ev in [Text("x"), Reasoning("y")] {
+            let err = sink(ev).expect_err("a sink with no reader must end the decode");
+            assert!(super::client_gone(&err), "{err:#}");
+        }
+        let mut stops = StopMatcher::new(vec!["END".into()]);
+        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        let err = sink(Text("held? no: sent")).expect_err("with a matcher too");
+        assert!(super::client_gone(&err), "{err:#}");
+    }
+
+    /// A client that reads more slowly than the model writes: the engine does
+    /// not wait for it, so the queue between them has to hold the whole
+    /// reply. Built the way the engine builds it. RED before: 256 slots, and
+    /// every delta, tool-argument event and `Done` past the 256th was dropped
+    /// without a trace.
+    #[test]
+    fn a_reader_that_falls_behind_still_gets_every_event() {
+        use BackendStreamEvent::Text;
+        let (tx, mut rx) = crate::engine::stream_channel();
+        let mut stops = StopMatcher::new(Vec::new());
+        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        for n in 0..1000 {
+            let _ = sink(Text(&format!("{n},")));
+        }
+        drop(sink);
+        let _ = tx.deliver(StreamEvent::Done {
+            prompt_tokens: 1,
+            completion_tokens: 1000,
+            finish_reason: super::FinishReason::Stop,
+            stop_sequence: None,
+        });
+        let (mut deltas, mut done) = (0, false);
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Delta(_) => deltas += 1,
+                StreamEvent::Done { .. } => done = true,
+                _ => {}
+            }
+        }
+        assert_eq!((deltas, done), (1000, true));
+    }
+
     /// RED before: the sink forwarded every piece, so the stream ran past the
     /// sequence to the end of the turn and nothing recorded which one hit.
     #[test]
     fn a_sequence_split_across_pieces_ends_the_stream_and_is_named() {
         use BackendStreamEvent::Text;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = crate::engine::stream_channel();
         let mut stops = StopMatcher::new(vec!["\n\nHuman:".into(), "END".into()]);
         let mut sink = anthropic_stream_sink(&tx, &mut stops);
 
@@ -5148,7 +5337,7 @@ mod anthropic_stream_stops {
     #[test]
     fn a_decode_loop_that_ignores_the_break_streams_nothing_after_the_stop() {
         use BackendStreamEvent::Text;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = crate::engine::stream_channel();
         let mut stops = StopMatcher::new(vec![", four".into()]);
         let mut sink = anthropic_stream_sink(&tx, &mut stops);
         for p in ["one", ", two", ", three", ", fo", "ur", ", five", ", six"] {
@@ -5167,7 +5356,7 @@ mod anthropic_stream_stops {
     #[test]
     fn a_held_tail_that_never_completes_is_released_by_the_flush() {
         use BackendStreamEvent::Text;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = crate::engine::stream_channel();
         let mut stops = StopMatcher::new(vec!["END".into()]);
         let mut sink = anthropic_stream_sink(&tx, &mut stops);
         decode(&mut sink, &[Text("THE E"), Text("N")]).expect("no stop");
@@ -5183,7 +5372,7 @@ mod anthropic_stream_stops {
     #[test]
     fn the_trace_is_not_matched_and_no_sequences_pass_everything() {
         use BackendStreamEvent::{Reasoning, Text};
-        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = crate::engine::stream_channel();
         let mut stops = StopMatcher::new(vec!["END".into()]);
         let mut sink = anthropic_stream_sink(&tx, &mut stops);
         decode(&mut sink, &[Reasoning("think END think"), Text("ok")]).expect("no stop");
@@ -5206,7 +5395,7 @@ mod gemma_finish_reason {
     use crate::types::{AnthropicRequest, ChatCompletionRequest};
     use serde_json::json;
 
-    fn finish_of(rx: &mut tokio::sync::mpsc::Receiver<StreamEvent>) -> Option<FinishReason> {
+    fn finish_of(rx: &mut crate::engine::StreamRx) -> Option<FinishReason> {
         let mut finish = None;
         while let Ok(event) = rx.try_recv() {
             match event {
@@ -5252,7 +5441,7 @@ mod gemma_finish_reason {
             .expect("chat");
         assert_eq!(resp.choices[0].finish_reason, "length");
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        let (tx, mut rx) = crate::engine::stream_channel();
         engine.chat_completion_streaming(&openai(long, 8, true), &tx);
         drop(tx);
         assert_eq!(finish_of(&mut rx), Some(FinishReason::Length));
@@ -5263,7 +5452,7 @@ mod gemma_finish_reason {
         assert_eq!(resp.stop_reason, "max_tokens");
         assert_eq!(resp.stop_sequence, None);
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        let (tx, mut rx) = crate::engine::stream_channel();
         engine.anthropic_messages_streaming(&anthropic(8, true), &tx);
         drop(tx);
         assert_eq!(finish_of(&mut rx), Some(FinishReason::Length));

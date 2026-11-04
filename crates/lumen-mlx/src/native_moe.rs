@@ -270,10 +270,31 @@ mod imp {
         pub biases: Option<&'a Array>,
     }
 
+    /// The routed experts' gate and up projections: two stacked tensors sets, or one set with
+    /// both stacked along every expert's output axis.
+    pub enum GateUpWeights<'a> {
+        Split {
+            gate: SwitchExpertWeights<'a>,
+            up: SwitchExpertWeights<'a>,
+        },
+        /// `[E, 2 * intermediate, ..]`: the gate rows, then the up rows, of each expert. One
+        /// gather yields both outputs side by side, and every output row is the same
+        /// reduction the separate gather runs, so the halves are bit-identical to it.
+        Fused(SwitchExpertWeights<'a>),
+    }
+
+    impl GateUpWeights<'_> {
+        fn scales_dtype(&self) -> mlx_rs::Dtype {
+            match self {
+                Self::Split { up, .. } => up.scales.dtype(),
+                Self::Fused(gate_up) => gate_up.scales.dtype(),
+            }
+        }
+    }
+
     /// Resolved tensors for the three SwitchLinear layers + meta.
     pub struct SwitchGluWeights<'a> {
-        pub gate_proj: SwitchExpertWeights<'a>,
-        pub up_proj: SwitchExpertWeights<'a>,
+        pub gate_up: GateUpWeights<'a>,
         pub down_proj: SwitchExpertWeights<'a>,
         pub group_size: i32,
         pub bits: i32,
@@ -281,6 +302,9 @@ mod imp {
         /// MXFP4 in the production checkpoint, but parameterised so a
         /// future affine MoE checkpoint can reuse the helper.
         pub mode: &'a CStr,
+        /// One-expert views of the stacked tensors for the decode kernels to bind instead of the
+        /// stacks ([`crate::native_moe_decode::ExpertViews`]); `None` binds the stacks.
+        pub decode_views: Option<&'a crate::native_moe_decode::ExpertViews>,
     }
 
     /// `SwitchGLU.__call__(x, indices)` — quantized expert dispatch with the
@@ -355,53 +379,48 @@ mod imp {
             (x_5d, indices.clone(), None)
         };
 
-        // Three gather_qmm calls — MXFP4 with the sorted-flag wired through.
-        let x_up = gather_qmm_with_mode(
-            &x_for_qmm,
-            weights.up_proj.weight,
-            weights.up_proj.scales,
-            weights.up_proj.biases,
-            None,
-            Some(&idx_for_qmm),
-            true,
-            weights.group_size,
-            weights.bits,
-            weights.mode,
-            do_sort,
-        )
-        .context("switch_glu: gather_qmm(up_proj) failed")?;
+        // gather_qmm per stacked projection — MXFP4 with the sorted-flag wired through.
+        let gather = |input: &Array, p: &SwitchExpertWeights<'_>| {
+            gather_qmm_with_mode(
+                input,
+                p.weight,
+                p.scales,
+                p.biases,
+                None,
+                Some(&idx_for_qmm),
+                true,
+                weights.group_size,
+                weights.bits,
+                weights.mode,
+                do_sort,
+            )
+        };
 
-        let x_gate = gather_qmm_with_mode(
-            &x_for_qmm,
-            weights.gate_proj.weight,
-            weights.gate_proj.scales,
-            weights.gate_proj.biases,
-            None,
-            Some(&idx_for_qmm),
-            true,
-            weights.group_size,
-            weights.bits,
-            weights.mode,
-            do_sort,
-        )
-        .context("switch_glu: gather_qmm(gate_proj) failed")?;
+        let activated = match &weights.gate_up {
+            GateUpWeights::Split { gate, up } => {
+                let x_up =
+                    gather(&x_for_qmm, up).context("switch_glu: gather_qmm(up_proj) failed")?;
+                let x_gate =
+                    gather(&x_for_qmm, gate).context("switch_glu: gather_qmm(gate_proj) failed")?;
+                switch_activation(&x_gate, &x_up)?
+            }
+            GateUpWeights::Fused(gate_up) => {
+                let both = gather(&x_for_qmm, gate_up)
+                    .context("switch_glu: gather_qmm(gate_up_proj) failed")?;
+                // `[.., 2 * intermediate]` -> the gate half, then the up half.
+                let mut halves = mlx_rs::ops::split(&both, 2, -1)
+                    .context("switch_glu: split(gate_up) failed")?
+                    .into_iter();
+                let (x_gate, x_up) = halves
+                    .next()
+                    .zip(halves.next())
+                    .ok_or_else(|| anyhow!("switch_glu: split(gate_up, 2) returned < 2 arrays"))?;
+                switch_activation(&x_gate, &x_up)?
+            }
+        };
 
-        let activated = switch_activation(&x_gate, &x_up)?;
-
-        let down = gather_qmm_with_mode(
-            &activated,
-            weights.down_proj.weight,
-            weights.down_proj.scales,
-            weights.down_proj.biases,
-            None,
-            Some(&idx_for_qmm),
-            true,
-            weights.group_size,
-            weights.bits,
-            weights.mode,
-            do_sort,
-        )
-        .context("switch_glu: gather_qmm(down_proj) failed")?;
+        let down = gather(&activated, &weights.down_proj)
+            .context("switch_glu: gather_qmm(down_proj) failed")?;
 
         // _scatter_unsort + unflatten + squeeze(-2).
         let recombined = if let Some(inv_order) = inv_order_opt {
@@ -453,8 +472,15 @@ mod imp {
         in_scale_dtype: bool,
     ) -> Result<Array> {
         use mlx_rs::Dtype::{Bfloat16, Float16, Float32};
+        // The bank serves gate and up as separate roles; a fused pair never reaches it.
+        let GateUpWeights::Split { gate, up } = &glu.gate_up else {
+            return Err(anyhow!(
+                "expert_entries: the expert bank's gate and up pools are separate roles, \
+                 but the experts were handed over fused"
+            ));
+        };
         // The dtype policy of `switch_glu_in_scale_dtype`.
-        let scale_dtype = glu.up_proj.scales.dtype();
+        let scale_dtype = glu.gate_up.scales_dtype();
         let cast = in_scale_dtype
             && matches!(scale_dtype, Bfloat16 | Float16 | Float32)
             && scale_dtype != x.dtype();
@@ -485,9 +511,9 @@ mod imp {
                 false,
             )
         };
-        let x_up = gather(&x_rows, &glu.up_proj, Some(rows))
+        let x_up = gather(&x_rows, up, Some(rows))
             .context("expert_entries: gather_qmm(up_proj) failed")?;
-        let x_gate = gather(&x_rows, &glu.gate_proj, Some(rows))
+        let x_gate = gather(&x_rows, gate, Some(rows))
             .context("expert_entries: gather_qmm(gate_proj) failed")?;
         let activated = switch_activation(&x_gate, &x_up)?;
         let down = gather(&activated, &glu.down_proj, None)
@@ -532,7 +558,7 @@ mod imp {
         weights: &SwitchGluWeights<'_>,
     ) -> Result<Array> {
         use mlx_rs::Dtype::{Bfloat16, Float16, Float32};
-        let scale_dtype = weights.up_proj.scales.dtype();
+        let scale_dtype = weights.gate_up.scales_dtype();
         let is_float = matches!(scale_dtype, Bfloat16 | Float16 | Float32);
         if !is_float || scale_dtype == x.dtype() {
             return switch_glu(x, indices, weights);
@@ -651,6 +677,10 @@ mod imp {
         /// scales (see [`switch_glu_in_scale_dtype`]). Off for the families
         /// whose outputs are pinned to the f32 path.
         pub experts_in_scale_dtype: bool,
+        /// Run a single-token step's routed and shared experts through the two decode kernels of
+        /// [`crate::native_moe_decode`] when the layer's tensors allow it (stacked gate/up, affine
+        /// 4-bit). Prefill and every other layout take the composed ops.
+        pub fused_decode: bool,
         /// `Some` when this layer's routed experts are served from the expert
         /// bank (task 023) instead of `switch_glu`, whose stacked tensors are
         /// then never touched and so never loaded into memory.
@@ -684,12 +714,15 @@ mod imp {
             })
         };
         Ok(SwitchGluWeights {
-            gate_proj: proj("gate_proj")?,
-            up_proj: proj("up_proj")?,
+            gate_up: GateUpWeights::Split {
+                gate: proj("gate_proj")?,
+                up: proj("up_proj")?,
+            },
             down_proj: proj("down_proj")?,
             group_size: like.group_size,
             bits: like.bits,
             mode: like.mode,
+            decode_views: None,
         })
     }
 
@@ -884,6 +917,38 @@ mod imp {
         let last_axis = (x.ndim() as i32) - 1;
         let timing_on = fine_timing_active();
 
+        // A single token's routing and experts in kernels: three dispatches instead of ~40.
+        if w.fused_decode
+            && w.offload.is_none()
+            && !timing_on
+            && !crate::decode_probe::sync_on()
+            && let Some(dims) = crate::native_moe_decode::plan(
+                x,
+                &w.switch_glu,
+                &w.shared_expert,
+                w.top_k,
+                w.experts_in_scale_dtype,
+            )
+        {
+            if crate::native_moe_decode::router_supported(w, dims) {
+                return crate::native_moe_decode::run_routed(x, w, dims);
+            }
+            let (inds, scores) = routing_graph(x, w)?;
+            let shared_logits = project_gate(x, &w.shared_gate)
+                .context("moe_block_forward: shared_expert_gate(x) failed")?;
+            let shared_score = mlx_rs::ops::sigmoid(&shared_logits)
+                .context("moe_block_forward: sigmoid(shared_gate) failed")?;
+            return crate::native_moe_decode::run(
+                x,
+                &inds,
+                &scores,
+                &shared_score,
+                &w.switch_glu,
+                &w.shared_expert,
+                dims,
+            );
+        }
+
         // (R: routing) gate matmul + softmax + argpartition + take_along + scores norm.
         // Lever B: dropped explicit `as_dtype(f32)` after gate matmul — the
         // affine quantized linear returns f32 when x is f32, so the cast was
@@ -984,7 +1049,7 @@ mod imp {
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3d.4 wiring in native_model.rs.
 pub(crate) use imp::{
-    AffineGateWeights, GateProj, MoeBlockWeights, OffloadLayer, SharedMlpWeights,
+    AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, OffloadLayer, SharedMlpWeights,
     SwitchExpertWeights, SwitchGluWeights, dense_mlp_forward, gelu_mul_fuse_enabled,
     gelu_mul_fused, moe_after_routing, moe_block_forward, moe_router, swiglu_fuse_enabled,
     swiglu_fused, switch_glu,

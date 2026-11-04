@@ -42,15 +42,19 @@ mod gemma4_tools;
 pub mod gemma4_vision;
 pub mod grammar;
 mod jinja_chat;
+#[doc(hidden)]
+pub mod parser_contract;
 /// Pre-flight prefill allocation budget. Ungated on purpose — see the module
 /// docs: it is the OOM guard's arithmetic, and it is only testable at tier 0
 /// because it is separated from the backend that consumes it.
 pub mod prefill_budget;
+/// Every chat-path encode/decode, and what it cost. Ungated: the Qwen backend
+/// tokenizes in every build.
+pub mod prompt_text;
 /// Qwen 3.5/3.6 `config.json` parsing. Ungated on purpose — see the module docs.
 pub mod qwen35_config;
 pub mod qwen36_vision;
-/// Every chat-path encode/decode, and what it cost. Ungated: the Qwen backend
-/// tokenizes in every build.
+pub mod stream_detok;
 pub mod text_tokenizer;
 pub use text_tokenizer::{TextTokenizer, TokenizeSnapshot, TokenizeStats};
 /// Resource-bounded image decoding shared by both image towers.
@@ -251,7 +255,14 @@ mod native_kernels;
 #[cfg(feature = "mlx-native")]
 pub mod native_metal_bridge;
 mod native_moe;
+#[cfg(feature = "mlx-native")]
+mod native_moe_decode;
+// How many drafts each MTP cycle proposes (measured per sequence). Pure bookkeeping, so it
+// builds without MLX too: `decode_tokens` names its type either way.
+mod mtp_depth;
 mod native_norm;
+#[cfg(feature = "mlx-native")]
+mod native_qmv;
 mod native_quant;
 mod native_rope;
 mod native_runtime;
@@ -261,6 +272,8 @@ pub mod native_ssm;
 pub use bandwidth::{MemoryBandwidth, measure_memory_bandwidth};
 #[cfg(feature = "mlx-native")]
 mod decode_probe;
+#[cfg(all(test, feature = "mlx-native"))]
+mod moe_routed_probe;
 #[cfg(feature = "mlx-native")]
 mod offload;
 /// Build the contiguous expert pack of a Flash-Next checkpoint (`lumen-server --pack-experts`).
@@ -292,6 +305,10 @@ pub use qwen3_5_tools::render_tools_system_block;
 pub use native_attention::set_sparse_decode;
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::MtpStepOutput;
+#[cfg(feature = "mlx-native")]
+pub use qwen3_5_moe::set_act_bf16;
+#[cfg(feature = "mlx-native")]
+pub use qwen3_5_moe::set_fused_moe_decode;
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::set_kv_store_bf16;
 
@@ -328,6 +345,8 @@ mod turboquant;
 use runner_native::NativeMlxRunner;
 
 use chat_io::PromptSource;
+use prompt_text::PromptText;
+use stream_detok::StreamDetok;
 
 pub use native_runtime::FineTimings;
 
@@ -417,6 +436,18 @@ trait Runner {
         last_token: u32,
         position: usize,
     ) -> Result<(u32, usize)>;
+    /// [`Runner::decode_step`] for a greedy loop that feeds each token it gets
+    /// back in as the next input. Returns the same thing; a runner that can
+    /// build the next step while this one runs may do so. The default is the
+    /// plain step.
+    fn decode_step_chained(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        position: usize,
+    ) -> Result<(u32, usize)> {
+        self.decode_step(seq_id, last_token, position)
+    }
     /// Phase 1: advance N sequences by one token each, returning
     /// `(next_token, position)` per input index. The default implementation
     /// loops over [`Runner::decode_step`] and is therefore **bit-identical** to
@@ -511,6 +542,15 @@ impl Runner for NativeMlxRunner {
         NativeMlxRunner::decode_step(self, seq_id, last_token, position)
     }
 
+    fn decode_step_chained(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        position: usize,
+    ) -> Result<(u32, usize)> {
+        NativeMlxRunner::decode_step_chained(self, seq_id, last_token, position)
+    }
+
     fn decode_step_batch(
         &mut self,
         seq_ids: &[u64],
@@ -593,11 +633,11 @@ fn load_tokenizer_via_hub(model_id: &str) -> Result<TextTokenizer> {
 /// computing it is an encode of the whole system+tools head.
 fn lazy_head_boundary<'a>(
     tokenizer: Option<&'a TextTokenizer>,
-    head: Option<&'a str>,
+    head: Option<&'a PromptText>,
     prompt_len: usize,
 ) -> impl FnOnce() -> Option<usize> + 'a {
     move || {
-        let n = tokenizer?.encode(head?, true).ok()?.len();
+        let n = tokenizer?.encode_prompt(head?).ok()?.len();
         (n > 0 && n < prompt_len).then_some(n)
     }
 }
@@ -890,6 +930,16 @@ impl RunnerImpl {
     ) -> Result<(u32, usize)> {
         self.as_runner_mut()
             .decode_step(seq_id, last_token, position)
+    }
+
+    fn decode_step_chained(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        position: usize,
+    ) -> Result<(u32, usize)> {
+        self.as_runner_mut()
+            .decode_step_chained(seq_id, last_token, position)
     }
 
     fn decode_step_batch(
@@ -1345,24 +1395,29 @@ fn model_has_mtp_head(dir: &std::path::Path) -> bool {
     dir.join("mtp").join("weights.safetensors").is_file() || dir.join("mtp.safetensors").is_file()
 }
 
-/// Resolve the effective MTP draft count for the streaming decode, assuming the
-/// caller has already confirmed the head is installed (`qwen35_mtp_enabled()`).
-/// `LUMEN_SPEC=mtp` → explicit on (K = `LUMEN_SPEC_K`, default 2). `LUMEN_SPEC`
-/// set to anything else → `None` (defer to that mode). UNSET → AUTO-route
-/// through MTP (K = `LUMEN_SPEC_K`, default 1 — the dense-27B accept sweet spot),
-/// so a self-contained MTP model serves at spec speed with no env vars.
+/// Resolve the MTP draft counts for the streaming decode, assuming the caller has
+/// already confirmed the head is installed (`qwen35_mtp_enabled()`).
+/// `LUMEN_SPEC` UNSET or `mtp` → MTP, `LUMEN_SPEC` set to anything else → `None`
+/// (defer to that mode), so a self-contained MTP model serves at spec speed with no
+/// env vars. The count is chosen per cycle from what the sequence measures
+/// (`mtp_depth`), or fixed by `LUMEN_SPEC_K`; either way at most
+/// `MAX_EXACT_DRAFTS`, the deepest draft the verify checks exactly.
 #[cfg(feature = "mlx-native")]
-fn effective_qwen35_mtp_k() -> Option<usize> {
-    let k_env = || {
-        std::env::var("LUMEN_SPEC_K")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&v| v >= 1)
-    };
+fn effective_qwen35_mtp_depth() -> Option<crate::mtp_depth::MtpDepth> {
+    use crate::mtp_depth::{MAX_EXACT_DRAFTS, MtpDepth};
+    let depth = std::env::var("LUMEN_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+        .map_or(
+            MtpDepth::Auto {
+                max: MAX_EXACT_DRAFTS,
+            },
+            |k| MtpDepth::Fixed(k.min(MAX_EXACT_DRAFTS)),
+        );
     match std::env::var("LUMEN_SPEC") {
-        Ok(s) if s.eq_ignore_ascii_case("mtp") => Some(k_env().unwrap_or(2)),
-        Ok(_) => None,
-        Err(_) => Some(k_env().unwrap_or(1)),
+        Ok(s) if !s.eq_ignore_ascii_case("mtp") => None,
+        _ => Some(depth),
     }
 }
 
@@ -1862,11 +1917,11 @@ fn qwen35_tool_grammar_eager_auto() -> bool {
 fn format_system_prefix(
     message: &(String, String),
     effort: Option<crate::chat_io::ReasoningEffort>,
-) -> String {
+) -> PromptText {
     let (role, content) = message;
-    let mut s = String::new();
+    let mut s = PromptText::new();
     s.push_str("<|im_start|>");
-    s.push_str(role);
+    s.push_content(role);
     s.push('\n');
     // The probe must render the system block EXACTLY as the real prompt does,
     // effort included — it exists to locate that block's token boundary inside
@@ -1880,7 +1935,7 @@ fn format_system_prefix(
             s.push_str("\n\n");
         }
     }
-    s.push_str(content);
+    s.push_content(content);
     s.push_str("<|im_end|>\n");
     s
 }
@@ -1929,6 +1984,17 @@ pub trait MlxBatchedSeqDriver {
     fn stream_channels(&self, generated: &[u32]) -> Result<(String, String)> {
         Ok((self.decode(generated)?, String::new()))
     }
+}
+
+/// What [`MlxQwen35Backend::decode_tokens`] decoded after a prompt's feed.
+struct DecodedTokens {
+    /// The reply: the feed's token and what followed it, up to EOS, the token limit or a stop.
+    answer: Vec<u32>,
+    /// Every token decoded after the prompt, in order, including any an MTP cycle fed past the
+    /// end of the reply.
+    fed: Vec<u32>,
+    /// The sequence's position afterwards: the prompt and `fed` up to here are in its cache.
+    pos: usize,
 }
 
 impl MlxBatchedSeqDriver for MlxQwen35Backend {
@@ -3155,8 +3221,11 @@ impl MlxBackend {
                 let visible = {
                     let mut text_adapter = |chunk: &str| {
                         let (reasoning, visible) = splitter.feed(chunk);
-                        if !reasoning.is_empty() {
-                            let _ = on_event(BackendStreamEvent::Reasoning(&reasoning));
+                        if !reasoning.is_empty()
+                            && flow_of(on_event(BackendStreamEvent::Reasoning(&reasoning)))
+                                .is_break()
+                        {
+                            return ControlFlow::Break(());
                         }
                         if visible.is_empty() {
                             return ControlFlow::Continue(());
@@ -3432,7 +3501,15 @@ impl MlxBackend {
     ) -> Result<Vec<u32>> {
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (temperature, top_p, ov);
+                // Installed on every request, greedy ones included, as every
+                // chat entry point does: the decode steps read it, so leaving
+                // it out decoded a completion with the previous request's
+                // temperature and seed, and never with its own.
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
                 // Unconditional, like the chat twin: without an explicit id the
                 // prompt identifies its own continuation, so a client that
                 // re-sends prompt + completion + more extends the KV instead of
@@ -3587,14 +3664,15 @@ struct DraftRunner {
     eos_tokens: Vec<u32>,
 }
 
-/// Messages rewritten to carry their images, plus everything prefill needs to
+/// How many image blocks lead each message, plus everything prefill needs to
 /// pair each placeholder run with the right image. See
 /// [`MlxQwen35Backend::attach_image_blocks`].
 #[cfg(feature = "mlx-native")]
 struct AttachedImages {
-    /// `(role, content)` with an `<|image_pad|>` block prepended to the body of
-    /// every message that had an image attached.
-    messages: Vec<(String, String)>,
+    /// `per_message[i]` image blocks lead message `i`'s text. The renderer
+    /// emits them as template text: spliced into the message, they would be
+    /// the client's, and encode as ordinary text.
+    per_message: Vec<usize>,
     /// Decoded and resized images, in prompt order.
     prepared: Vec<crate::qwen36_vision::PreparedImage>,
     /// `counts[k]` is how many placeholder rows `prepared[k]` occupies.
@@ -3953,6 +4031,26 @@ impl MlxQwen35Backend {
         self.runner.decode_step(seq_id, last_token, position)
     }
 
+    /// [`Self::decode_step`] for a plain greedy loop: one that feeds each token
+    /// back in as the next input and touches nothing else of the sequence
+    /// between steps. Same tokens, same positions; the runner may keep the GPU a
+    /// step ahead (see `NativeMlxRunner::decode_step_chained`). A sampled
+    /// request needs each token on the host before the next step, so it takes
+    /// the plain step.
+    pub fn decode_step_chained(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        position: usize,
+    ) -> Result<(u32, usize)> {
+        #[cfg(feature = "mlx-native")]
+        if self.sampling.is_some() {
+            return self.decode_step(seq_id, last_token, position);
+        }
+        self.runner
+            .decode_step_chained(seq_id, last_token, position)
+    }
+
     /// Phase 1: advance N already-prefilled sequences by one token each in a
     /// single call, returning `(next_token, position)` per input index. Used by
     /// the multi-sequence batched scheduler (Phase 2). Currently a bit-identical
@@ -4138,6 +4236,17 @@ impl MlxQwen35Backend {
             crate::qwen3_5_mtp::MtpMlpConfig::Dense { .. } => "Dense",
             crate::qwen3_5_mtp::MtpMlpConfig::Moe(_) => "MoE",
         };
+        // A MoE head is loaded only on request. Qwen3.6-35B-A3B-MTPLX, M3 Max, greedy: a K=1
+        // cycle took 18 ms for 1.45 tokens (acceptance 0.45), against the pipelined decode's 9 ms
+        // a token, and its two-token verify runs the experts through `gather_qmm`, whose low bits
+        // depend on the token count, so the text drifts from the plain decode's.
+        if matches!(mlp_cfg, crate::qwen3_5_mtp::MtpMlpConfig::Moe(_)) && !explicit_on {
+            eprintln!(
+                "[mlx] qwen3.5 MTP head found but left off: a MoE head is slower than the plain \
+                 decode and not exact (LUMEN_QWEN35_MTP=1 loads it)"
+            );
+            return Ok(());
+        }
         let label = format!(
             "{label} hidden={} heads={}/{} head_dim={}",
             dims.hidden_size, dims.num_attention_heads, dims.num_key_value_heads, dims.head_dim
@@ -4278,7 +4387,7 @@ impl MlxQwen35Backend {
         );
 
         let mut generated: Vec<u32> = Vec::new();
-        let mut prev_text = String::new();
+        let mut detok = StreamDetok::whole();
         let mut n_attempts: u64 = 0;
         let mut n_accept_tokens: u64 = 0;
         let mut n_verify_tokens: u64 = 0;
@@ -4296,11 +4405,8 @@ impl MlxQwen35Backend {
             ($tok:expr) => {{
                 let tok = $tok;
                 generated.push(tok);
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 step += 1;
                 if self.eos_tokens.contains(&tok) || step >= max_new_tokens {
@@ -4496,12 +4602,30 @@ impl MlxQwen35Backend {
         self.runner.fork_from_snapshot(snapshot_id, dst_seq_id)
     }
 
+    /// Encode `text` as written: an added token spelled anywhere in it is that
+    /// control token. For text that is the caller's on purpose — a raw
+    /// `/v1/completions` prompt, a template's generation header. A rendered
+    /// chat prompt goes through [`Self::encode_prompt`].
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let tok = self
             .tokenizer
             .as_ref()
             .ok_or_else(|| anyhow!("tokenizer not loaded"))?;
         tok.encode(text, true)
+            .map_err(|e| anyhow!("tokenizer encode: {e}"))
+    }
+
+    /// Encode a rendered chat prompt: the template's added tokens as control
+    /// tokens, what the client sent as ordinary text (see
+    /// [`TextTokenizer::encode_prompt`]). Qwen's post-processor adds no ids, so
+    /// this is [`Self::encode`] for a prompt whose client text spells no added
+    /// token.
+    fn encode_prompt(&self, prompt: &PromptText) -> Result<Vec<u32>> {
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow!("tokenizer not loaded"))?;
+        tok.encode_prompt(prompt)
             .map_err(|e| anyhow!("tokenizer encode: {e}"))
     }
 
@@ -4555,8 +4679,9 @@ impl MlxQwen35Backend {
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
         let attached = self.attach_image_blocks(messages, images)?;
-        let ids = self.encode(&format_qwen3_chat(
-            &attached.messages,
+        let ids = self.encode_prompt(&format_qwen3_chat(
+            messages,
+            &attached.per_message,
             thinking,
             effort,
             self.preserves_thinking_on_replay,
@@ -4565,15 +4690,15 @@ impl MlxQwen35Backend {
         Ok((ids, attached.prepared))
     }
 
-    /// Decode every attached image and splice an `<|image_pad|>` block into the
-    /// head of its message, returning the rewritten messages together with the
-    /// prepared images and their token counts **in prompt order**.
+    /// Decode every attached image, returning how many lead each message
+    /// together with the prepared images and their token counts **in prompt
+    /// order**.
     ///
     /// Prompt order is the contract: `prefill_with_images` pairs the k-th
     /// placeholder run with the k-th prepared image, and
     /// [`expand_image_placeholders`](Self::expand_image_placeholders) sizes the
-    /// k-th run from `counts[k]`. Iterating messages in order and prepending to
-    /// each body is what keeps all three in step.
+    /// k-th run from `counts[k]`. Iterating messages in order, with each
+    /// message's blocks ahead of its text, is what keeps all three in step.
     #[cfg(feature = "mlx-native")]
     fn attach_image_blocks(
         &self,
@@ -4581,21 +4706,18 @@ impl MlxQwen35Backend {
         images: &[Vec<Vec<u8>>],
     ) -> Result<AttachedImages> {
         let mut out = AttachedImages {
-            messages: Vec::with_capacity(messages.len()),
+            per_message: Vec::with_capacity(messages.len()),
             prepared: Vec::new(),
             counts: Vec::new(),
         };
-        for (i, (role, content)) in messages.iter().enumerate() {
+        for i in 0..messages.len() {
             let attached = images.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            let mut body = String::new();
             for bytes in attached {
                 let p = self.runner.prepare_image(bytes)?;
                 out.counts.push(p.num_tokens);
                 out.prepared.push(p);
-                body.push_str(crate::qwen36_vision::IMAGE_BLOCK);
             }
-            body.push_str(content);
-            out.messages.push((role.clone(), body));
+            out.per_message.push(attached.len());
         }
         Ok(out)
     }
@@ -4624,11 +4746,12 @@ impl MlxQwen35Backend {
     ) -> Result<Vec<u32>> {
         let prompt = format_qwen3_chat(
             messages,
+            &[],
             thinking,
             effort,
             self.preserves_thinking_on_replay,
         );
-        self.encode(&prompt)
+        self.encode_prompt(&prompt)
     }
 
     /// Phase 2: tool-aware variant of `build_chat_input` that uses Qwen
@@ -4650,11 +4773,11 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
-        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
+        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill};
         let mut full = format_qwen3_chat_with_tools(messages, thinking, tools, effort);
-        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
-        full.push_str(&prefill);
-        Ok((self.encode(&full)?, prefill))
+        let prefill = qwen35_tool_choice_prefill(tool_choice);
+        full.append(&prefill);
+        Ok((self.encode_prompt(&full)?, prefill.into_string()))
     }
 
     /// Like [`build_chat_input_with_tools`] but also returns the exact trailing
@@ -4671,11 +4794,11 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String, Vec<u32>)> {
-        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
+        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill};
         let prompt_only = format_qwen3_chat_with_tools(messages, thinking, tools, effort);
-        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        let prefill = qwen35_tool_choice_prefill(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
-        Ok((ids, prefill, prefill_tokens))
+        Ok((ids, prefill.into_string(), prefill_tokens))
     }
 
     /// [`build_chat_input_with_tools_split`](Self::build_chat_input_with_tools_split)
@@ -4704,13 +4827,26 @@ impl MlxQwen35Backend {
         Vec<u32>,
         Vec<crate::qwen36_vision::PreparedImage>,
     )> {
-        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
+        use crate::qwen3_5_tools::{
+            format_qwen3_chat_with_tools_and_images, qwen35_tool_choice_prefill,
+        };
         let attached = self.attach_image_blocks(messages, images)?;
-        let prompt_only = format_qwen3_chat_with_tools(&attached.messages, thinking, tools, effort);
-        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        let prompt_only = format_qwen3_chat_with_tools_and_images(
+            messages,
+            &attached.per_message,
+            thinking,
+            tools,
+            effort,
+        );
+        let prefill = qwen35_tool_choice_prefill(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         let ids = self.expand_image_placeholders(&ids, &attached.counts)?;
-        Ok((ids, prefill, prefill_tokens, attached.prepared))
+        Ok((
+            ids,
+            prefill.into_string(),
+            prefill_tokens,
+            attached.prepared,
+        ))
     }
 
     /// Encode `prompt_only + prefill` and isolate the prefill's trailing token
@@ -4722,17 +4858,16 @@ impl MlxQwen35Backend {
     /// than free sampling). The full `ids` are always exact.
     fn encode_with_prefill_split(
         &self,
-        prompt_only: &str,
-        prefill: &str,
+        prompt_only: &PromptText,
+        prefill: &PromptText,
     ) -> Result<(Vec<u32>, Vec<u32>)> {
-        let mut full = String::with_capacity(prompt_only.len() + prefill.len());
-        full.push_str(prompt_only);
-        full.push_str(prefill);
-        let ids = self.encode(&full)?;
+        let mut full = prompt_only.clone();
+        full.append(prefill);
+        let ids = self.encode_prompt(&full)?;
         if prefill.is_empty() {
             return Ok((ids, Vec::new()));
         }
-        let prompt_ids = self.encode(prompt_only)?;
+        let prompt_ids = self.encode_prompt(prompt_only)?;
         // The split is valid only if the full encoding starts with the
         // prompt-only encoding (no cross-join BPE merge). Otherwise report no
         // clean prefill split.
@@ -4761,12 +4896,12 @@ impl MlxQwen35Backend {
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
         use crate::qwen3_5_tools::{
-            format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill_str,
+            format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill,
         };
         let mut full = format_qwen3_chat_with_tools_from_history(turns, thinking, tools, effort);
-        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
-        full.push_str(&prefill);
-        Ok((self.encode(&full)?, prefill))
+        let prefill = qwen35_tool_choice_prefill(tool_choice);
+        full.append(&prefill);
+        Ok((self.encode_prompt(&full)?, prefill.into_string()))
     }
 
     /// `_split` variant of [`build_chat_input_with_tools_from_history`] —
@@ -4780,12 +4915,12 @@ impl MlxQwen35Backend {
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String, Vec<u32>)> {
         use crate::qwen3_5_tools::{
-            format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill_str,
+            format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill,
         };
         let prompt_only = format_qwen3_chat_with_tools_from_history(turns, thinking, tools, effort);
-        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        let prefill = qwen35_tool_choice_prefill(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
-        Ok((ids, prefill, prefill_tokens))
+        Ok((ids, prefill.into_string(), prefill_tokens))
     }
 
     /// [`build_chat_input_with_tools_from_history_split`](Self::build_chat_input_with_tools_from_history_split)
@@ -4816,51 +4951,35 @@ impl MlxQwen35Backend {
     )> {
         use crate::chat_io::ChatTurn;
         use crate::qwen3_5_tools::{
-            format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill_str,
+            format_qwen3_chat_with_tools_from_history_and_images, qwen35_tool_choice_prefill,
         };
 
-        // Rewrite the User turns that carry images. The rewritten bodies are
-        // owned here so the borrowed `ChatTurn`s built below can point at them.
-        let mut bodies: Vec<Option<String>> = Vec::with_capacity(turns.len());
+        let mut per_turn = Vec::with_capacity(turns.len());
         let mut prepared = Vec::new();
         let mut counts = Vec::new();
         for (i, turn) in turns.iter().enumerate() {
             let attached = images.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            if attached.is_empty() {
-                bodies.push(None);
-                continue;
-            }
-            let ChatTurn::User(text) = turn else {
+            if !attached.is_empty() && !matches!(turn, ChatTurn::User(_)) {
                 return Err(anyhow!(
                     "images can only be attached to a user message on the Qwen 3.6 \
                      tool-calling path"
                 ));
-            };
-            let mut body = String::new();
+            }
             for bytes in attached {
                 let p = self.runner.prepare_image(bytes)?;
                 counts.push(p.num_tokens);
                 prepared.push(p);
-                body.push_str(crate::qwen36_vision::IMAGE_BLOCK);
             }
-            body.push_str(text);
-            bodies.push(Some(body));
+            per_turn.push(attached.len());
         }
-        let rewritten: Vec<ChatTurn<'_>> = turns
-            .iter()
-            .zip(bodies.iter())
-            .map(|(turn, body)| match body {
-                Some(b) => ChatTurn::User(b.as_str()),
-                None => turn.clone(),
-            })
-            .collect();
 
-        let prompt_only =
-            format_qwen3_chat_with_tools_from_history(&rewritten, thinking, tools, effort);
-        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        let prompt_only = format_qwen3_chat_with_tools_from_history_and_images(
+            turns, &per_turn, thinking, tools, effort,
+        );
+        let prefill = qwen35_tool_choice_prefill(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         let ids = self.expand_image_placeholders(&ids, &counts)?;
-        Ok((ids, prefill, prefill_tokens, prepared))
+        Ok((ids, prefill.into_string(), prefill_tokens, prepared))
     }
 
     pub fn alloc_seq_id(&self) -> u64 {
@@ -5170,14 +5289,10 @@ impl MlxQwen35Backend {
         }
 
         let mut generated: Vec<u32> = vec![last];
-        let mut emitted_idx: usize = 0;
+        let mut detok = StreamDetok::tail();
         let mut halted = false;
-        if let Ok(text) = self.decode(&generated)
-            && !text.is_empty()
-            && !text.contains('\u{FFFD}')
-        {
+        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
             halted = on_token(&text).is_break();
-            emitted_idx = generated.len();
         }
         if halted || self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -5219,18 +5334,12 @@ impl MlxQwen35Backend {
                     self.decode_step(seq_id, last, pos)?
                 }
             } else {
-                self.decode_step(seq_id, last, pos)?
+                self.decode_step_chained(seq_id, last, pos)?
             };
             last = next;
             pos = new_pos;
             generated.push(next);
-            let tail_start = emitted_idx;
-            if tail_start < generated.len()
-                && let Ok(text) = self.decode(&generated[tail_start..])
-                && !text.is_empty()
-                && !text.contains('\u{FFFD}')
-            {
-                emitted_idx = generated.len();
+            if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
                 // The caller has what it needs (the first complete JSON value):
                 // the tokens after it would only be dropped.
                 if on_token(&text).is_break() {
@@ -5432,14 +5541,14 @@ impl MlxQwen35Backend {
         if !has_images
             && self.qwen35_mtp_enabled()
             && mtp_sampling_is_supported(self.sampling.as_ref())
-            && let Some(k) = effective_qwen35_mtp_k()
+            && let Some(depth) = effective_qwen35_mtp_depth()
         {
             return self.chat_streaming_qwen35_mtp(
                 messages,
                 max_new_tokens,
                 thinking,
                 seq_id,
-                k,
+                depth,
                 &mut text_only,
                 effort,
             );
@@ -5555,15 +5664,15 @@ impl MlxQwen35Backend {
         let mut n_emits: usize = 0;
 
         let mut generated: Vec<u32> = vec![last];
-        let mut prev_text = String::new();
-        let mut emitted_idx: usize = 0;
+        let mut detok = if incr_detok {
+            StreamDetok::tail()
+        } else {
+            StreamDetok::whole()
+        };
         // `on_token` ends the loop when the caller has what it needs (a client
         // stop sequence matched): the tokens after it would only be dropped.
         let mut halted = false;
-        if let Ok(text) = self.decode(&generated)
-            && !text.is_empty()
-            && !text.contains('\u{FFFD}')
-        {
+        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
             if stream_timing {
                 let now = std::time::Instant::now();
                 if t_first_emit.is_none() {
@@ -5576,8 +5685,6 @@ impl MlxQwen35Backend {
                 n_emits += 1;
             }
             halted = on_token(&text).is_break();
-            prev_text = text;
-            emitted_idx = generated.len();
         }
         if halted || self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -5588,35 +5695,11 @@ impl MlxQwen35Backend {
 
         let t_decode = std::time::Instant::now();
         for step in 1..max_new_tokens {
-            let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
+            let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
             last = next;
             pos = new_pos;
             generated.push(next);
-            if incr_detok {
-                let tail_start = emitted_idx;
-                if tail_start < generated.len()
-                    && let Ok(text) = self.decode(&generated[tail_start..])
-                    && !text.is_empty()
-                    && !text.contains('\u{FFFD}')
-                {
-                    if stream_timing {
-                        let now = std::time::Instant::now();
-                        if t_first_emit.is_none() {
-                            t_first_emit = Some(now);
-                        }
-                        if n_emits == stream_skip {
-                            t_skip_emit = Some(now);
-                        }
-                        t_last_emit = Some(now);
-                        n_emits += 1;
-                    }
-                    halted = on_token(&text).is_break();
-                    emitted_idx = generated.len();
-                }
-            } else if let Ok(text) = self.decode(&generated)
-                && text.len() > prev_text.len()
-                && !text.contains('\u{FFFD}')
-            {
+            if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
                 if stream_timing {
                     let now = std::time::Instant::now();
                     if t_first_emit.is_none() {
@@ -5628,8 +5711,7 @@ impl MlxQwen35Backend {
                     t_last_emit = Some(now);
                     n_emits += 1;
                 }
-                halted = on_token(&text[prev_text.len()..]).is_break();
-                prev_text = text;
+                halted = on_token(&text).is_break();
             }
             if halted {
                 break;
@@ -5641,6 +5723,9 @@ impl MlxQwen35Backend {
                 );
                 break;
             }
+        }
+        if !halted && let Some(text) = detok.finish(&generated, |t| self.decode(t)) {
+            let _ = on_token(&text);
         }
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
         let n_gen = generated.len();
@@ -5701,7 +5786,7 @@ impl MlxQwen35Backend {
         source: PromptSource<'_, '_>,
         tools: &[crate::chat_io::ToolDef<'_>],
         effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> (Option<String>, Option<String>) {
+    ) -> (Option<String>, Option<PromptText>) {
         match source {
             PromptSource::Flat(messages) => (
                 auto_prefix_key(messages, effort),
@@ -5942,7 +6027,7 @@ impl MlxQwen35Backend {
         // boundary (unless `LUMEN_MLX_PREFIX_INCREMENTAL=0`). Passed as text
         // because measuring it means encoding the whole head, and the cache
         // asks for it on a cold MISS only. `None` keeps the single-prefill MISS.
-        boundary_head: Option<String>,
+        boundary_head: Option<PromptText>,
         // Tool name → required param keys. Empty unless
         // `LUMEN_QWEN35_FORCE_REQUIRED_PARAMS` is on; when non-empty the decode
         // loop injects a `<parameter=KEY>\n` opener before the model can close
@@ -6021,7 +6106,7 @@ impl MlxQwen35Backend {
                 prefix_cache_key,
                 lazy_head_boundary(
                     self.tokenizer.as_ref(),
-                    boundary_head.as_deref(),
+                    boundary_head.as_ref(),
                     prompt_ids.len(),
                 ),
             )?
@@ -6042,7 +6127,7 @@ impl MlxQwen35Backend {
                 prefix_cache_key,
                 lazy_head_boundary(
                     self.tokenizer.as_ref(),
-                    boundary_head.as_deref(),
+                    boundary_head.as_ref(),
                     prompt_ids.len(),
                 ),
             )?
@@ -6146,16 +6231,13 @@ impl MlxQwen35Backend {
 
         // Detokenize + parser-feed for the first decoded token.
         let mut generated: Vec<u32> = vec![last];
-        let mut emitted_idx: usize = 0;
-        if let Ok(text) = self.decode(&generated) {
+        let mut detok = StreamDetok::tail();
+        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
             if debug_qwen_tools {
                 eprintln!("[qwen35-tools] first decoded text: {text:?}");
             }
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                for ev in parser.feed(&text) {
-                    forward_parse_event(ev, &mut on_event)?;
-                }
-                emitted_idx = generated.len();
+            for ev in parser.feed(&text) {
+                forward_parse_event(ev, &mut on_event)?;
             }
         }
         if self.eos_tokens.contains(&last) {
@@ -6227,7 +6309,7 @@ impl MlxQwen35Backend {
                     combined.extend_from_slice(&inj_tokens);
                     let (next2, pos2) = self.runner.extend(seq_id, &combined)?;
                     generated.extend_from_slice(&inj_tokens);
-                    emitted_idx = generated.len();
+                    detok.skip_to(generated.len());
                     for ev in parser.feed(&inj) {
                         forward_parse_event(ev, &mut on_event)?;
                     }
@@ -6240,14 +6322,10 @@ impl MlxQwen35Backend {
                     last = next2;
                     pos = pos2;
                     generated.push(last);
-                    if let Ok(text) = self.decode(&generated[emitted_idx..])
-                        && !text.is_empty()
-                        && !text.contains('\u{FFFD}')
-                    {
+                    if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
                         for ev in parser.feed(&text) {
                             forward_parse_event(ev, &mut on_event)?;
                         }
-                        emitted_idx = generated.len();
                     }
                     if self.eos_tokens.contains(&last) {
                         break;
@@ -6294,24 +6372,18 @@ impl MlxQwen35Backend {
                     self.decode_step(seq_id, last, pos)?
                 }
             } else {
-                self.decode_step(seq_id, last, pos)?
+                self.decode_step_chained(seq_id, last, pos)?
             };
             last = next;
             pos = new_pos;
             generated.push(next);
-            let tail_start = emitted_idx;
-            if tail_start < generated.len()
-                && let Ok(text) = self.decode(&generated[tail_start..])
-                && !text.is_empty()
-                && !text.contains('\u{FFFD}')
-            {
+            if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
                 if debug_qwen_tools {
                     eprintln!("[qwen35-tools] step={step} text={text:?}");
                 }
                 for ev in parser.feed(&text) {
                     forward_parse_event(ev, &mut on_event)?;
                 }
-                emitted_idx = generated.len();
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -6320,6 +6392,15 @@ impl MlxQwen35Backend {
                 );
                 break;
             }
+        }
+        // Tokens still held back for a character they might have completed.
+        if let Some(text) = detok.finish(&generated, |t| self.decode(t)) {
+            for ev in parser.feed(&text) {
+                forward_parse_event(ev, &mut on_event)?;
+            }
+        }
+        for ev in parser.flush() {
+            forward_parse_event(ev, &mut on_event)?;
         }
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
         let n_gen = generated.len();
@@ -6537,13 +6618,9 @@ impl MlxQwen35Backend {
 
         // ── Decode loop (parallel to chat_streaming) ──
         let mut generated: Vec<u32> = vec![last];
-        let mut prev_text = String::new();
-        if let Ok(text) = self.decode(&generated)
-            && !text.is_empty()
-            && !text.contains('\u{FFFD}')
-        {
+        let mut detok = StreamDetok::whole();
+        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
             on_token(&text);
-            prev_text = text;
         }
         if self.eos_tokens.contains(&last) {
             self.persist_boundary_snapshot(persist_after.take(), prefix_cache_key);
@@ -6555,16 +6632,12 @@ impl MlxQwen35Backend {
 
         let t_decode = std::time::Instant::now();
         for step in 1..max_new_tokens {
-            let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
+            let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
             last = next;
             pos = new_pos;
             generated.push(next);
-            if let Ok(text) = self.decode(&generated)
-                && text.len() > prev_text.len()
-                && !text.contains('\u{FFFD}')
-            {
-                on_token(&text[prev_text.len()..]);
-                prev_text = text;
+            if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                on_token(&fresh);
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -6573,6 +6646,9 @@ impl MlxQwen35Backend {
                 );
                 break;
             }
+        }
+        if let Some(text) = detok.finish(&generated, |t| self.decode(t)) {
+            on_token(&text);
         }
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
         let n_gen = generated.len();
@@ -6636,7 +6712,7 @@ impl MlxQwen35Backend {
             return Ok(0);
         }
         let block = format_system_prefix(first, effort);
-        let sys_ids = self.encode(&block)?;
+        let sys_ids = self.encode_prompt(&block)?;
         Ok(sys_ids.len())
     }
 
@@ -6657,7 +6733,7 @@ impl MlxQwen35Backend {
         messages: &[(String, String)],
         tools: &[crate::chat_io::ToolDef<'_>],
         effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Option<String> {
+    ) -> Option<PromptText> {
         let leading_system = match messages.first() {
             Some((role, text)) if role == "system" && !text.is_empty() => Some(text.as_str()),
             _ => None,
@@ -6670,7 +6746,7 @@ impl MlxQwen35Backend {
         turns: &[crate::chat_io::ChatTurn<'_>],
         tools: &[crate::chat_io::ToolDef<'_>],
         effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Option<String> {
+    ) -> Option<PromptText> {
         use crate::chat_io::ChatTurn;
         let leading_system = match turns.first() {
             Some(ChatTurn::System(s)) if !s.is_empty() => Some(*s),
@@ -6683,7 +6759,7 @@ impl MlxQwen35Backend {
         leading_system: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
         effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Option<String> {
+    ) -> Option<PromptText> {
         if tools.is_empty() {
             let system = leading_system?;
             return Some(format_system_prefix(
@@ -6790,7 +6866,7 @@ impl MlxQwen35Backend {
         }
 
         let mut generated: Vec<u32> = Vec::new();
-        let mut prev_text = String::new();
+        let mut detok = StreamDetok::whole();
         let mut stats = spec_decode::SpecStats::default();
 
         let t_decode = std::time::Instant::now();
@@ -6816,12 +6892,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, t_pred);
                 history.push(t_pred);
                 stats.committed_via_baseline += 1;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&t_pred) {
                     break;
@@ -6846,12 +6918,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, t_pred);
                 history.push(t_pred);
                 stats.committed_via_baseline += 1;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&t_pred) {
                     break;
@@ -6893,12 +6961,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, d1);
                 history.push(d1);
                 stats.committed_via_spec += 2;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&d0) || self.eos_tokens.contains(&d1) {
                     break;
@@ -6912,12 +6976,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, row1);
                 history.push(row1);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&row1) {
                     break;
@@ -6940,12 +7000,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, d0);
                 history.push(d0);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&d0) {
                     break;
@@ -6962,12 +7018,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, after_d0);
                 history.push(after_d0);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&after_d0) {
                     break;
@@ -7009,7 +7061,7 @@ impl MlxQwen35Backend {
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
-        k: usize,
+        depth: crate::mtp_depth::MtpDepth,
         mut on_token: F,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
@@ -7021,40 +7073,133 @@ impl MlxQwen35Backend {
             return Err(anyhow!("empty prompt after tokenization"));
         }
         let t_prefill = std::time::Instant::now();
-        let (mut last, _pos) = self.prefill(seq_id, &prompt_ids)?;
+        let (last, pos) = self.prefill(seq_id, &prompt_ids)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
-            "[mlx-mtp] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms (K={k}) -> tok={last}",
+            "[mlx-mtp] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms ({depth:?}) -> tok={last}",
             prompt_ids.len(),
         );
 
-        let mut generated: Vec<u32> = vec![last];
-        let mut prev_text = String::new();
-        if let Ok(text) = self.decode(&generated)
-            && !text.is_empty()
-            && !text.contains('\u{FFFD}')
-        {
-            on_token(&text);
-            prev_text = text;
-        }
-        if self.eos_tokens.contains(&last) {
-            let out = self.decode(&generated).unwrap_or_default();
-            self.remove_seq(seq_id).ok();
-            self.note_stop(&generated, max_new_tokens);
-            return Ok(out);
-        }
+        let mut on_text = |t: &str| {
+            on_token(t);
+            ControlFlow::Continue(())
+        };
+        let decoded = self.decode_tokens(
+            seq_id,
+            last,
+            pos,
+            max_new_tokens,
+            Some(depth),
+            Some(&mut on_text),
+        )?;
+        let out = self.decode(&decoded.answer).unwrap_or_default();
+        self.remove_seq(seq_id).ok();
+        self.note_stop(&decoded.answer, max_new_tokens);
+        Ok(out)
+    }
 
-        // MTP acceptance regime. Greedy (temp 0) is exact argmax-match and
-        // lossless; `temperature > 0` switches to Leviathan rejection sampling
-        // (accept `min(1,p/q)` + residual), which keeps the committed stream a
-        // valid sample at that temperature.
-        //
-        // The request's temperature is the default, taken from the sampling
-        // policy the entry point installed. It used to read `LUMEN_MTP_TEMP`
-        // alone and default to 0.0, which meant a client asking for
-        // `temperature: 1.5` got greedy output and no error. The env vars stay
-        // as an operator override for A/B measurement — that is what they were
-        // added for — but they no longer decide the request's regime.
+    /// The MTP draft count when this request's decode runs as MTP cycles: a drafter is installed,
+    /// the sampling policy is one MTP keeps exact, and `LUMEN_SPEC` leaves it on.
+    fn mtp_draft_count(&self) -> Option<crate::mtp_depth::MtpDepth> {
+        #[cfg(feature = "mlx-native")]
+        if self.qwen35_mtp_enabled() && mtp_sampling_is_supported(self.sampling.as_ref()) {
+            return effective_qwen35_mtp_depth();
+        }
+        None
+    }
+
+    /// Decode after `first`, the token a prompt's feed returned with the sequence at `pos`: MTP
+    /// cycles at the draft counts `mtp` gives when given, else the plain loop (`decode_step_chained`).
+    ///
+    /// `on_text`, when given, gets the reply's text as it becomes ready and may stop the decode.
+    /// The answer is `first` and what follows it, cut at EOS, at `max_new_tokens` or at that stop.
+    /// What the sequence holds is [`DecodedTokens::fed`] up to [`DecodedTokens::pos`]: an MTP
+    /// cycle commits several tokens and feeds every one but the last, so an answer cut inside a
+    /// cycle leaves fed tokens after the cut.
+    fn decode_tokens(
+        &mut self,
+        seq_id: u64,
+        first: u32,
+        pos: usize,
+        max_new_tokens: usize,
+        mtp: Option<crate::mtp_depth::MtpDepth>,
+        mut on_text: Option<&mut dyn FnMut(&str) -> ControlFlow<()>>,
+    ) -> Result<DecodedTokens> {
+        let mut answer = Vec::with_capacity(max_new_tokens);
+        let mut fed = vec![first];
+        let mut pos = pos;
+        let mut detok = StreamDetok::whole();
+        // Adds `tok` to the answer and says whether the decode is over.
+        let mut take = |this: &Self, answer: &mut Vec<u32>, tok: u32| -> bool {
+            // The feed's token is always the reply's first.
+            if answer.len() >= max_new_tokens.max(1) {
+                return true;
+            }
+            answer.push(tok);
+            let halted = match on_text.as_deref_mut() {
+                Some(on_text) => detok
+                    .next(answer, |t| this.decode(t))
+                    .is_some_and(|text| on_text(&text).is_break()),
+                None => false,
+            };
+            halted || this.eos_tokens.contains(&tok)
+        };
+        let mut stop = take(self, &mut answer, first);
+        #[cfg(feature = "mlx-native")]
+        if let Some(depth) = mtp {
+            let cfg = self.mtp_sampling();
+            let mut control = crate::mtp_depth::DepthController::new(depth);
+            let t_decode = std::time::Instant::now();
+            let (mut cycles, mut accepted, mut attempted) = (0usize, 0usize, 0usize);
+            let mut last = first;
+            while !stop && answer.len() < max_new_tokens {
+                let k = control.next();
+                let t_cycle = std::time::Instant::now();
+                let out = self
+                    .qwen35_mtp_step(seq_id, last, k, &cfg)
+                    .with_context(|| format!("[mlx-mtp] seq {seq_id} cycle {cycles} failed"))?;
+                control.observe(k, out.n_accepted, t_cycle.elapsed().as_secs_f64() * 1000.0);
+                cycles += 1;
+                accepted += out.n_accepted;
+                attempted += out.n_attempted;
+                // The cycle fed `last` and the accepted drafts: one token per committed one.
+                pos += out.committed.len();
+                for &tok in &out.committed {
+                    fed.push(tok);
+                    stop = stop || take(self, &mut answer, tok);
+                }
+                last = *out.committed.last().context("mtp_step committed nothing")?;
+            }
+            let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[mlx-mtp] seq {seq_id} done: {} tokens in {decode_ms:.0}ms ({:.1} tok/s); \
+                 cycles={cycles} accept={:.3} emit/cycle={:.2} depths={}",
+                answer.len(),
+                answer.len() as f64 / (decode_ms / 1000.0),
+                accepted as f64 / attempted.max(1) as f64,
+                (fed.len() - 1) as f64 / cycles.max(1) as f64,
+                control.summary(),
+            );
+            return Ok(DecodedTokens { answer, fed, pos });
+        }
+        let _ = mtp;
+        let mut last = first;
+        while !stop && answer.len() < max_new_tokens {
+            let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
+            (last, pos) = (next, new_pos);
+            fed.push(next);
+            stop = take(self, &mut answer, next);
+        }
+        Ok(DecodedTokens { answer, fed, pos })
+    }
+
+    /// The acceptance regime of an MTP cycle: the request's sampling policy. Greedy (temp 0) is
+    /// exact argmax-match and lossless; `temperature > 0` is Leviathan rejection sampling (accept
+    /// `min(1,p/q)` + residual), which keeps the committed stream a valid sample at that
+    /// temperature. `LUMEN_MTP_TEMP` / `LUMEN_MTP_TOPP` override it for A/B measurement; they used
+    /// to be the only source, so a client asking for `temperature: 1.5` got greedy output.
+    #[cfg(feature = "mlx-native")]
+    fn mtp_sampling(&self) -> lumen_core::sampling::SamplingConfig {
         let mut mtp_cfg = self.sampling.unwrap_or_default();
         if let Some(t) = std::env::var("LUMEN_MTP_TEMP")
             .ok()
@@ -7068,78 +7213,7 @@ impl MlxQwen35Backend {
         {
             mtp_cfg.top_p = p;
         }
-        let t_decode = std::time::Instant::now();
-        let mut cycles: usize = 0;
-        let mut accepted_total: usize = 0;
-        let mut attempted_total: usize = 0;
-        let mut stop = false;
-        while generated.len() < max_new_tokens && !stop {
-            let t_cycle = std::time::Instant::now();
-            let out = self
-                .qwen35_mtp_step(seq_id, last, k, &mtp_cfg)
-                .with_context(|| {
-                    format!("[mlx-mtp] seq {seq_id} mtp_step cycle {cycles} failed")
-                })?;
-            let cycle_ms = t_cycle.elapsed().as_secs_f64() * 1000.0;
-            cycles += 1;
-            accepted_total += out.n_accepted;
-            attempted_total += out.n_attempted;
-            // Emit committed tokens one-by-one, honoring EOS + max_new_tokens
-            // mid-cycle. We always keep the LAST committed token as `last` for
-            // the next mtp_step call (it's the correction/bonus not yet in
-            // cache), even if EOS was emitted earlier in the cycle.
-            for tok in &out.committed {
-                if generated.len() >= max_new_tokens {
-                    stop = true;
-                    break;
-                }
-                generated.push(*tok);
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
-                }
-                if self.eos_tokens.contains(tok) {
-                    stop = true;
-                    break;
-                }
-            }
-            last = *out.committed.last().expect("mtp_step committed non-empty");
-            if std::env::var("LUMEN_MTP_DEBUG")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
-                eprintln!(
-                    "[mlx-mtp-cycle] seq {seq_id} {cycle_ms:.2} ms  n_acc={}/{}  emitted={}",
-                    out.n_accepted,
-                    out.n_attempted,
-                    out.committed.len(),
-                );
-            }
-        }
-        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
-        let n_gen = generated.len();
-        let accept_rate = if attempted_total > 0 {
-            (accepted_total as f64) / (attempted_total as f64)
-        } else {
-            0.0
-        };
-        let emit_per_cycle = if cycles > 0 {
-            ((n_gen - 1) as f64) / (cycles as f64)
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[mlx-mtp] seq {seq_id} done: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s); \
-             cycles={cycles} accept={accept_rate:.3} emit/cycle={emit_per_cycle:.2}",
-            n_gen as f64 / (decode_ms / 1000.0),
-        );
-        let out = self.decode(&generated).unwrap_or_default();
-        self.remove_seq(seq_id).ok();
-        self.note_stop(&generated, max_new_tokens);
-        Ok(out)
+        mtp_cfg
     }
 
     /// Streaming chat with prompt-cache reuse keyed by `session_id`.
@@ -7186,7 +7260,7 @@ impl MlxQwen35Backend {
                 })?;
         self.make_room_for_session_feed(start.from, prompt_ids.len());
         let seq_id = start.seq_id;
-        let (mut last, mut pos, point) = session::feed(
+        let (last, pos, point) = session::feed(
             &mut self.runner,
             session_id,
             &start,
@@ -7195,45 +7269,18 @@ impl MlxQwen35Backend {
             "",
         )?;
 
-        let mut generated: Vec<u32> = vec![last];
-        let mut prev_text = String::new();
-        // `on_token` ends the loop when the caller has what it needs (a client
+        // `on_token` ends the decode when the caller has what it needs (a client
         // stop sequence matched): the tokens after it would only be dropped.
-        let mut halted = false;
-        if let Ok(text) = self.decode(&generated)
-            && !text.is_empty()
-            && !text.contains('\u{FFFD}')
-        {
-            halted = on_token(&text).is_break();
-            prev_text = text;
-        }
-
-        if !halted && !self.eos_tokens.contains(&last) {
-            for _ in 1..max_new_tokens {
-                let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
-                last = next;
-                pos = new_pos;
-                generated.push(next);
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    halted = on_token(&text[prev_text.len()..]).is_break();
-                    prev_text = text;
-                }
-                if halted || self.eos_tokens.contains(&next) {
-                    break;
-                }
-            }
-        }
-
+        let mtp = self.mtp_draft_count();
+        let decoded =
+            self.decode_tokens(seq_id, last, pos, max_new_tokens, mtp, Some(&mut on_token))?;
+        let generated = decoded.answer;
         let out = self.decode(&generated).unwrap_or_default();
 
-        // Persist session: prompt + all generated tokens. Don't remove_seq —
-        // the cache state is needed for the next turn.
+        // Persist session: what the sequence was fed. Don't remove_seq — the
+        // cache state is needed for the next turn.
         let prompt_len = prompt_ids.len();
-        let mut new_tokens = prompt_ids;
-        new_tokens.extend_from_slice(&generated);
+        let new_tokens = session::held_tokens(prompt_ids, &decoded.fed, decoded.pos);
         session::persist_point(
             &mut self.runner,
             session_id,
@@ -7281,7 +7328,7 @@ impl MlxQwen35Backend {
         )?;
         self.make_room_for_session_feed(start.from, prompt_ids.len());
         let seq_id = start.seq_id;
-        let (mut last, mut pos, point) = session::feed(
+        let (last, pos, point) = session::feed(
             &mut self.runner,
             session_id,
             &start,
@@ -7290,22 +7337,12 @@ impl MlxQwen35Backend {
             " (completion)",
         )?;
 
-        let mut generated: Vec<u32> = vec![last];
-        if !self.eos_tokens.contains(&last) {
-            for _ in 1..max_new_tokens {
-                let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
-                last = next;
-                pos = new_pos;
-                generated.push(next);
-                if self.eos_tokens.contains(&next) {
-                    break;
-                }
-            }
-        }
+        let mtp = self.mtp_draft_count();
+        let decoded = self.decode_tokens(seq_id, last, pos, max_new_tokens, mtp, None)?;
+        let generated = decoded.answer;
 
         let prompt_len = prompt_ids.len();
-        let mut new_tokens = prompt_ids;
-        new_tokens.extend_from_slice(&generated);
+        let new_tokens = session::held_tokens(prompt_ids, &decoded.fed, decoded.pos);
         session::persist_point(
             &mut self.runner,
             session_id,
@@ -7397,14 +7434,20 @@ where
 /// system block, creating one if the conversation has no system message. `None`
 /// (every pre-3.8 checkpoint, and any request that disabled thinking) renders
 /// byte-identically to before.
+///
+/// `images[i]` image blocks lead `messages[i]`'s text (a shorter slice means no
+/// images on the rest).
 fn format_qwen3_chat(
     messages: &[(String, String)],
+    images: &[usize],
     thinking: bool,
     effort: Option<crate::chat_io::ReasoningEffort>,
     preserve_thinking: bool,
-) -> String {
-    let mut s = String::new();
-    let mut messages = messages;
+) -> PromptText {
+    use crate::qwen3_5_tools::{Trim, push_body};
+    let images_on = |i: usize| images.get(i).copied().unwrap_or(0);
+    let mut s = PromptText::new();
+    let mut first = 0;
     if let Some(text) = effort.and_then(crate::chat_io::ReasoningEffort::instructions) {
         // Fold the sentence into the leading system message, or emit a system
         // block for it alone. Matches the template's two no-tools branches.
@@ -7414,17 +7457,19 @@ fn format_qwen3_chat(
         s.push_str("<|im_start|>system\n");
         s.push_str(text);
         if let Some((_, content)) = leading_system {
-            if !content.is_empty() {
+            if images_on(0) > 0 || !content.is_empty() {
                 s.push_str("\n\n");
-                s.push_str(content);
+                push_body(&mut s, images_on(0), content, Trim::None);
             }
-            messages = &messages[1..];
+            first = 1;
         }
         s.push_str("<|im_end|>\n");
     }
-    for (role, content) in messages {
+    for (i, (role, content)) in messages.iter().enumerate().skip(first) {
+        let images = images_on(i);
+        let assistant = role.eq_ignore_ascii_case("assistant");
         s.push_str("<|im_start|>");
-        s.push_str(role);
+        s.push_content(role);
         s.push('\n');
         // A replayed assistant turn carries the same `<think>` block the
         // generation prompt ended with, on the checkpoints whose template keeps
@@ -7447,18 +7492,28 @@ fn format_qwen3_chat(
         // otherwise render `</think>\n\n\n\nA1`, whose newline run the
         // pre-tokenizer reads as one piece, so the prompt stops being a token
         // prefix of the KV the model wrote (`</think>`, `\n\n`, `A1`).
-        if preserve_thinking && role.eq_ignore_ascii_case("assistant") {
-            let (reasoning, visible) = crate::chat_io::split_reasoning_envelope(content);
+        //
+        // A body led by image blocks never opens with `<think>`, so it has no
+        // envelope to split off.
+        if preserve_thinking && assistant {
+            let (reasoning, visible) = if images > 0 {
+                ("", content.as_str())
+            } else {
+                crate::chat_io::split_reasoning_envelope(content)
+            };
             s.push_str("<think>\n");
-            s.push_str(reasoning);
+            s.push_content(reasoning);
             s.push_str("\n</think>\n\n");
-            s.push_str(visible.trim());
-        } else {
+            push_body(&mut s, images, visible, Trim::Both);
+        } else if assistant && images == 0 {
             // `preserve_thinking:false` checkpoints render the turn verbatim,
             // envelope included. That is deliberate: 3.6's template drops
             // reasoning from history, but the tokens in the KV have it, so
-            // passing the content through unchanged is what still matches.
-            s.push_str(content);
+            // passing the content through unchanged is what still matches —
+            // its envelope tags as the control tokens the model wrote.
+            crate::chat_io::push_reasoning_envelope_verbatim(&mut s, content);
+        } else {
+            push_body(&mut s, images, content, Trim::None);
         }
         s.push_str("<|im_end|>\n");
     }
@@ -7930,7 +7985,8 @@ mod tests {
 
     /// Where the replay does reproduce the header (3.8 with thinking off
     /// renders the empty block), the whole session is still extended — the
-    /// point is only the fallback.
+    /// point is only the fallback. The extension starts at the reply's last
+    /// token: turn one returned it and stopped, never feeding it.
     #[test]
     fn a_turn_that_extends_the_whole_session_still_extends_it() {
         session_rollback_enabled::with(true, || {
@@ -7943,7 +7999,7 @@ mod tests {
                 ("assistant", "Blue"),
                 ("user", "U2"),
             ];
-            assert_eq!(chat_turn(&mut b, &turn2), vec![ScriptFeed::Extend(8)]);
+            assert_eq!(chat_turn(&mut b, &turn2), vec![ScriptFeed::Extend(9)]);
         });
     }
 
@@ -8282,7 +8338,7 @@ mod tests {
         ];
 
         // 3.6 must render byte-identically to before this existed.
-        let legacy = format_qwen3_chat(&convo, false, None, false);
+        let legacy = format_qwen3_chat(&convo, &[], false, None, false);
         assert!(
             legacy.contains("<|im_start|>assistant\nA1<|im_end|>"),
             "a checkpoint that does not preserve thinking must be unchanged:\n{legacy}",
@@ -8291,12 +8347,12 @@ mod tests {
         // 3.8 replays the block, and the result must literally extend the
         // previous turn's generation prompt — that is the property the session
         // reuse check tests, so assert it rather than the substring alone.
-        let preserved = format_qwen3_chat(&convo, false, None, true);
+        let preserved = format_qwen3_chat(&convo, &[], false, None, true);
         assert!(
             preserved.contains("<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>"),
             "3.8 replays the think block:\n{preserved}",
         );
-        let turn1_prompt = format_qwen3_chat(&convo[..2], false, None, true);
+        let turn1_prompt = format_qwen3_chat(&convo[..2], &[], false, None, true);
         assert!(
             preserved.starts_with(&format!("{turn1_prompt}A1<|im_end|>\n")),
             "turn 2 must extend turn 1's prompt + its reply, or the KV cannot be \
@@ -8308,7 +8364,10 @@ mod tests {
         // instead of trimmed as the template and the tools renderer write it.
         let mut padded = convo.clone();
         padded[2].1 = "\n\nA1\n".to_string();
-        assert_eq!(format_qwen3_chat(&padded, false, None, true), preserved);
+        assert_eq!(
+            format_qwen3_chat(&padded, &[], false, None, true),
+            preserved
+        );
     }
 
     /// Does reusing a session's KV give the same tokens as prefilling the
@@ -8322,17 +8381,19 @@ mod tests {
     /// `forward_chunked` on that same cache, so the argument should cover
     /// session reuse too.
     ///
-    /// It does not, in practice: a `session_id` conversation and the same
-    /// conversation cold-prefilled produce different reasoning traces on
-    /// Qwen3.8-27B, deterministically, and identically across runs on each
-    /// side. That was written off as reduction-order noise, which is
-    /// inconsistent with chunk invariance — hence this.
+    /// A `session_id` conversation and the same conversation cold-prefilled did
+    /// produce different reasoning traces on Qwen3.8-27B. The cause was an
+    /// off-by-one in the session store, not arithmetic: a turn's last returned
+    /// token is never fed, yet the session listed it, so the next turn's
+    /// `extend` started one token late (`session::held_tokens` fixes it, and
+    /// `a_completion_continuing_its_reply_equals_a_cold_one` guards it). This
+    /// test had the same slip until its session arm fed that token.
     ///
-    /// Exactly one thing session reuse does that chunked prefill does not: the
-    /// tokens between the two prompts went through the cache **one at a time**
-    /// as decode steps rather than inside a bulk chunk. The three arms separate
-    /// that from `extend` itself, so the answer names a mechanism instead of a
-    /// suspicion.
+    /// What session reuse still does that chunked prefill does not: the tokens
+    /// between the two prompts went through the cache **one at a time** as
+    /// decode steps (M=1) rather than inside a bulk chunk (M=N), a different
+    /// matmul, so their keys and values need not equal a prefill's in every
+    /// bit. The three arms separate that from `extend` itself.
     #[test]
     #[ignore = "needs a real Qwen checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
     fn session_reuse_reproduces_a_cold_prefill() {
@@ -8385,7 +8446,11 @@ mod tests {
         // Arm C — what a session actually does: prefill, decode, then extend.
         let (first, pos) = m.prefill(1, &p).expect("prefill P");
         let g = decode_n(m, 1, first, pos, n_gen);
-        let (cf, cp) = m.runner.extend(1, &s).expect("extend after decode");
+        // `decode_n` returns the token it generated last without feeding it, so the extend
+        // feeds that token ahead of the suffix: the cache then holds P + G + S, as in A and B.
+        let mut tail = vec![*g.last().expect("generated tokens")];
+        tail.extend_from_slice(&s);
+        let (cf, cp) = m.runner.extend(1, &tail).expect("extend after decode");
         let c = decode_n(m, 1, cf, cp, n_gen);
         m.remove_seq(1).ok();
 
@@ -8425,23 +8490,160 @@ mod tests {
         // `extend` is exact and must stay that way — this is the invariant
         // worth guarding, and it held: A and B were bit-identical.
         assert_eq!(ab, None, "extend must reproduce a bulk prefill exactly");
-        // The session arm is NOT asserted equal, because it is not: measured
-        // divergence at token 44 of 48, with the first 43 identical. The cause
-        // is the only thing left once `extend` is exonerated — the tokens
-        // between the two prompts advanced the cache one at a time, and a
-        // single-token forward is a different matmul shape (M=1, GEMV) from a
-        // bulk chunk (M=N, GEMM), so the reduction order differs and a near-tie
-        // argmax eventually flips. Chunk invariance does not cover this: 256 vs
-        // 2048 are both GEMM.
+        // The session arm is not asserted equal: its generated tokens' cache
+        // came from decode steps, a different matmul than a prefill's, so a
+        // near-tie could flip on some prompt. None did: all 48 tokens equal
+        // the cold prefill's on Qwen3.6-35B-A3B, Qwen3.6-27B and Qwen3.8-27B.
         //
         // What IS asserted is that the immediate next-token prediction agrees.
-        // A cache that had genuinely diverged would not survive one token, let
-        // alone forty-three, so this separates "float drift" from "wrong KV"
-        // without inventing a threshold.
+        // A cache that had genuinely diverged (a token fed twice, or skipped,
+        // as the session store once skipped one) does not survive one token,
+        // so this separates float drift from a wrong KV without a threshold.
         assert!(
             ac.is_none_or(|i| i > 0),
             "the first token after reuse must match a cold prefill; \
              diverging immediately means the reused KV is wrong, not imprecise"
+        );
+    }
+
+    /// A completion that continues the previous one's prompt and reply extends that session, and
+    /// must answer as a cold prefill of the same prompt does. The previous turn's last token was
+    /// returned but never fed (each decode step feeds the token before the one it returns), so the
+    /// session may only claim the tokens before it; the next turn then feeds it.
+    #[test]
+    #[ignore = "needs a real Qwen checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn a_completion_continuing_its_reply_equals_a_cold_one() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            return;
+        };
+        let mut backend = MlxBackend::load(&dir).expect("load checkpoint");
+        let MlxBackend::Qwen35Family(m) = &mut backend else {
+            panic!("this equivalence only concerns the Qwen path");
+        };
+        let user = |text: &str| [("user".to_string(), text.to_string())];
+        let p = m
+            .build_chat_input(
+                &user("Summarize the history of the printing press."),
+                false,
+                None,
+            )
+            .expect("prompt");
+        let reply = m.completion_session(&p, 24, Some("turn")).expect("turn 1");
+        let rendered = m
+            .build_chat_input(&user("And another one."), false, None)
+            .expect("suffix");
+        let mut next = p;
+        next.extend_from_slice(&reply);
+        next.extend_from_slice(&rendered[rendered.len().saturating_sub(16)..]);
+        let warm = m
+            .completion_session(&next, 24, Some("turn"))
+            .expect("turn 2");
+        let cold = m.completion_session(&next, 24, Some("cold")).expect("cold");
+        assert_eq!(
+            warm, cold,
+            "the extended session must answer as a cold prefill"
+        );
+    }
+
+    /// With an MTP head installed, a chat turn decodes through MTP cycles, answers as the plain
+    /// greedy decode does, and leaves the session holding what the cycles fed: the next turn,
+    /// continuing it, answers as a cold prefill of the same conversation does.
+    ///
+    /// A cycle commits one or two tokens (K=1) and feeds all but the last, so a token limit that
+    /// falls inside a cycle leaves a fed token past the answer, which the session must hold. The
+    /// limits below are swept until one does, and that turn is the one continued.
+    #[test]
+    #[ignore = "needs a Qwen checkpoint with an MTP head; set LUMEN_QWEN35_MODEL_DIR"]
+    fn an_mtp_session_turn_answers_and_holds_as_the_plain_decode() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            return;
+        };
+        let mut backend = MlxBackend::load(&dir).expect("load checkpoint");
+        let MlxBackend::Qwen35Family(m) = &mut backend else {
+            panic!("MTP only concerns the Qwen path");
+        };
+        assert!(
+            m.mtp_draft_count().is_some(),
+            "the checkpoint must carry an MTP head and the request must take MTP"
+        );
+        let msg = |role: &str, text: &str| (role.to_string(), text.to_string());
+        let q1 = [msg("user", "Summarize the history of the printing press.")];
+        let prompt = m.build_chat_input(&q1, false, None).expect("prompt");
+
+        // The plain greedy reply, long enough for every limit below.
+        let seq = m.alloc_seq_id();
+        let (mut last, mut pos) = m.prefill(seq, &prompt).expect("prefill");
+        let mut plain = vec![last];
+        while plain.len() < 40 && !m.eos_tokens.contains(&last) {
+            (last, pos) = m.decode_step(seq, last, pos).expect("decode");
+            plain.push(last);
+        }
+        m.remove_seq(seq).ok();
+        assert_eq!(
+            plain.len(),
+            40,
+            "the reply must not end before the limits swept"
+        );
+
+        let mut overfed = None;
+        for n in 24..=36 {
+            let id = format!("mtp{n}");
+            let reply = m
+                .chat_streaming_session(
+                    &q1,
+                    n,
+                    false,
+                    Some(&id),
+                    |_| ControlFlow::Continue(()),
+                    None,
+                )
+                .expect("turn 1");
+            assert_eq!(
+                reply,
+                m.decode(&plain[..n]).expect("detokenize"),
+                "limit {n}: MTP must answer as the plain greedy decode"
+            );
+            // The answer's last token is never fed; a cycle crossing the limit fed more.
+            let held = m.sessions.get(&id).expect("session").tokens.len();
+            assert!(
+                held >= prompt.len() + n - 1,
+                "limit {n}: the session holds too little"
+            );
+            if held > prompt.len() + n - 1 {
+                overfed = Some((n, reply));
+                break;
+            }
+        }
+        let (n, reply) = overfed.expect("some limit must fall inside a cycle");
+
+        let conversation = [
+            q1[0].clone(),
+            msg("assistant", &reply),
+            msg("user", "Now its effect on science, in two sentences."),
+        ];
+        let warm = m
+            .chat_streaming_session(
+                &conversation,
+                24,
+                false,
+                Some(&format!("mtp{n}")),
+                |_| ControlFlow::Continue(()),
+                None,
+            )
+            .expect("turn 2");
+        let cold = m
+            .chat_streaming_session(
+                &conversation,
+                24,
+                false,
+                Some("cold"),
+                |_| ControlFlow::Continue(()),
+                None,
+            )
+            .expect("cold");
+        assert_eq!(
+            warm, cold,
+            "a session continued after a cycle that crossed the limit must answer as a cold prefill"
         );
     }
 
@@ -8690,7 +8892,7 @@ mod tests {
             ("system".to_string(), "S".to_string()),
             ("user".to_string(), "U1".to_string()),
         ];
-        let turn1_prompt = format_qwen3_chat(&turn1, true, None, true);
+        let turn1_prompt = format_qwen3_chat(&turn1, &[], true, None, true);
         assert!(
             turn1_prompt.ends_with("<|im_start|>assistant\n<think>\n"),
             "thinking-on generation prompt stops at the open block:\n{turn1_prompt:?}",
@@ -8710,7 +8912,7 @@ mod tests {
             ),
             ("user".to_string(), "U2".to_string()),
         ];
-        let turn2 = format_qwen3_chat(&convo, true, None, true);
+        let turn2 = format_qwen3_chat(&convo, &[], true, None, true);
         assert!(
             turn2.starts_with(&format!("{kv}\n")),
             "a returned trace must reproduce the generated tokens:\nkv  ={kv:?}\nturn2={turn2:?}",
@@ -8724,7 +8926,7 @@ mod tests {
             ("assistant".to_string(), "A1".to_string()),
             convo[3].clone(),
         ];
-        let turn2_no_trace = format_qwen3_chat(&without, true, None, true);
+        let turn2_no_trace = format_qwen3_chat(&without, &[], true, None, true);
         assert!(
             !turn2_no_trace.starts_with(&format!("{kv}\n")),
             "this is the state being fixed; if it now matches, the test lost its point",
@@ -9433,6 +9635,28 @@ mod tests {
                      sampling must not survive"
                 );
             }
+        }
+    }
+
+    /// RED before: `/v1/completions` dropped the request's `temperature` and
+    /// `top_p` on Qwen and installed nothing, while its decode steps read the
+    /// installed sampling, so a completion decoded greedily when it asked to
+    /// sample, and with the previous request's temperature and seed when it
+    /// asked for greedy.
+    #[test]
+    fn a_completion_decodes_with_its_own_sampling() {
+        let ov = SamplingOverrides::default();
+        let leftover = MlxQwen35Backend::qwen_sampling_config(1.5, 0.9, &ov);
+        for (temperature, sampled) in [(0.0, false), (0.8, true)] {
+            let mut b = qwen_with_prefix_cache();
+            qwen(&mut b).set_sampling(leftover);
+            b.generate(&[CHAT_BLUE, CHAT_BLUE], 4, temperature, 1.0, &ov, None)
+                .expect("a scripted completion");
+            assert_eq!(
+                qwen(&mut b).sampling.map(|c| c.temperature),
+                sampled.then_some(temperature),
+                "temperature {temperature}: the completion must decode with its own sampling"
+            );
         }
     }
 

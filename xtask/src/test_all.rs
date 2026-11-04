@@ -373,17 +373,22 @@ fn kernel_coverage_gaps(declared: &[String], output: &str) -> Vec<String> {
     gaps
 }
 
+/// The constructors that declare a run-time kernel; each opens with the kernel's name.
+const KERNEL_CONSTRUCTORS: [&str; 2] = ["MetalKernel::new(", "MetalKernel::new_with_header("];
+
 /// The kernel names a source file declares: the string literal each
-/// `MetalKernel::new(` call opens with. A name that is not a literal is an
-/// error — the pass could not hold that kernel to running.
+/// `MetalKernel::new(` or `MetalKernel::new_with_header(` call opens with. A
+/// name that is not a literal is an error — the pass could not hold that
+/// kernel to running.
 fn declared_kernels(src: &str) -> Result<Vec<String>, String> {
     let code: String = src
         .lines()
         .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
         .collect::<Vec<_>>()
         .join("\n");
-    code.split("MetalKernel::new(")
-        .skip(1)
+    KERNEL_CONSTRUCTORS
+        .iter()
+        .flat_map(|constructor| code.split(constructor).skip(1))
         .map(|rest| {
             let rest = rest.trim_start();
             rest.strip_prefix('"')
@@ -409,7 +414,10 @@ fn kernel_files() -> Result<Vec<String>, String> {
             "grep",
             "-l",
             "--untracked",
-            "MetalKernel::new(",
+            "-e",
+            KERNEL_CONSTRUCTORS[0],
+            "-e",
+            KERNEL_CONSTRUCTORS[1],
             "--",
             "crates/*/src/*.rs",
         ])
@@ -550,6 +558,10 @@ mod tests {
         );
         let err = declared_kernels("let k = MetalKernel::new(NAME, &[], &[]);").unwrap_err();
         assert!(err.contains("NAME"), "{err}");
+        // The constructor that takes a header opens with the name as well.
+        let with_header = "MetalKernel::new_with_header(\n \"moe_decode\", &[], &[], HEADER, SRC)";
+        assert_eq!(declared_kernels(with_header).unwrap(), ["moe_decode"]);
+        assert!(declared_kernels("MetalKernel::new_with_header(NAME, &[])").is_err());
     }
 
     /// A kernel counts as checked only when it ran, and a kernel generic over

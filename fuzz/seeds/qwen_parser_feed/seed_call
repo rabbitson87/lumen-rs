@@ -1,0 +1,7 @@
+<tool_call>
+<function=read>
+<parameter=path>
+src/lib.rs
+</parameter>
+</function>
+</tool_call>

@@ -325,10 +325,8 @@ static DEFECTS: &[Defect] = &[
             },
             Mutation {
                 path: MLX,
-                find: "            let (reasoning, visible) = \
-                       crate::chat_io::split_reasoning_envelope(content);",
-                replace: "            let (reasoning, visible) = (\"\", content.as_str()); \
-                          // defect: trace dropped",
+                find: "                crate::chat_io::split_reasoning_envelope(content)\n",
+                replace: "                (\"\", content.as_str()) // defect: trace dropped\n",
             },
         ],
         guards: &[
@@ -601,8 +599,8 @@ static DEFECTS: &[Defect] = &[
                   the template defines",
         revert: &[Mutation {
             path: MLX,
-            find: "    let (reasoning, visible) = split_reasoning_envelope(content);",
-            replace: "    let (reasoning, visible) = (\"\", content); // defect: block not split",
+            find: "        split_reasoning_envelope(content)\n    };",
+            replace: "        (\"\", content) // defect: block not split\n    };",
         }],
         guards: &[mlx(
             "qwen3_5_tools::tests::a_replayed_tool_turn_carries_the_trace_it_was_given",
@@ -652,6 +650,26 @@ static DEFECTS: &[Defect] = &[
         }],
         guards: &[core_mlx_lib(
             "tests::a_request_asking_for_randomness_gets_a_sampler",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "qwen-completion-sampling-dropped",
+        symptom: "`/v1/completions` on Qwen still opened with \
+                  `let _ = (temperature, top_p, ov)` after the chat entry points \
+                  were fixed, and installed no sampling at all. Its decode steps \
+                  read whatever the last request installed: a sampled completion \
+                  decoded greedily (measured on Qwen3.6-35B-A3B: \
+                  `temperature: 0.7` ran at the greedy pipeline's 9.0 ms/token \
+                  with identical text on every run), and a greedy completion \
+                  after a sampled chat request sampled",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                // temperature and seed, and never with its own.\n                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(\n                    temperature,\n                    top_p,\n                    ov,\n                ));",
+            replace: "                // temperature and seed, and never with its own.\n                let _ = (temperature, top_p, ov); // defect: the request's sampling is dropped",
+        }],
+        guards: &[core_mlx_lib(
+            "tests::a_completion_decodes_with_its_own_sampling",
         )],
         ..PLAIN
     },
@@ -847,6 +865,39 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "top-p-draw-ignores-the-kept-mass",
+        symptom: "a top-p draw scaled its uniform by 1 instead of the nucleus \
+                  mass, so the mass top-p cut away fell through to the last \
+                  token kept and the least likely survivor came up far too \
+                  often; every draw was still inside the nucleus, so only a \
+                  test of the sampled distribution itself sees it",
+        revert: &[Mutation {
+            path: CORE,
+            find: "    let r = rng.next_f32() * mass;\n    let mut acc = 0.0_f32;\n    for &i in &kept {",
+            replace: "    let r = rng.next_f32(); // defect: the kept mass is ignored\n    let mut acc = 0.0_f32;\n    for &i in &kept {",
+        }],
+        guards: &[core(
+            "sampling::nucleus_tests::sampled_tokens_follow_the_nucleus_distribution",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "rng-seed-plus-position",
+        symptom: "an MTP cycle seeded its generator with `seed + offset`, so a \
+                  request seeded `s` drew at position `p` exactly what one \
+                  seeded `s + 1` drew at `p - 1`: a client retrying with the \
+                  next seed got the same draws one token later",
+        revert: &[Mutation {
+            path: CORE,
+            find: "        Self::new(splitmix64(splitmix64(splitmix64(seed) ^ position) ^ stream))",
+            replace: "        Self::new(seed.wrapping_add(position).wrapping_add(stream)) // defect: added, not mixed",
+        }],
+        guards: &[core(
+            "sampling::tests::a_position_keyed_generator_is_its_own_sequence",
+        )],
+        ..PLAIN
+    },
+    Defect {
         name: "greedy-decode-drops-the-grammar",
         symptom: "on Gemma 4 a grammar was applied only by the sampled decode \
                   branch, so a greedy request (temperature 0, penalties off — \
@@ -874,8 +925,8 @@ static DEFECTS: &[Defect] = &[
                   request with that system prompt failed too, until restart",
         revert: &[Mutation {
             path: MLX,
-            find: "                .forward_last_token_chunked(&prompt[..boundary], cache)",
-            replace: "                .forward_last_token(&prompt[..boundary], cache) // defect: one pass",
+            find: "    ) -> Result<()> {\n        let chunk = chunk.max(1);\n        let from = cache.offset();",
+            replace: "    ) -> Result<()> {\n        let chunk = usize::MAX; // defect: one pass\n        let from = cache.offset();",
         }],
         guards: &[srv_checkpoint(
             "engine::gemma_chunked_prefill::a_long_prompt_is_prefilled_in_chunks",
@@ -1713,8 +1764,8 @@ static DEFECTS: &[Defect] = &[
                   193 characters, and text holding one goes to HF",
         revert: &[Mutation {
             path: MLX,
-            find: ".filter(|_| fastokens_encode::get() && !normalization_differs(text));",
-            replace: ".filter(|_| fastokens_encode::get()); // defect: no normalization fallback",
+            find: ".filter(|_| fastokens_encode::get() && !normalization_differs(text))",
+            replace: ".filter(|_| fastokens_encode::get()) // defect: no normalization fallback",
         }],
         guards: &[core_mlx_lib(
             "text_tokenizer::tests::text_the_normalizers_disagree_on_is_encoded_by_hf",
@@ -1859,16 +1910,17 @@ static DEFECTS: &[Defect] = &[
         symptom: "the release job handed the notary credentials to the build on \
                   every run, so with the Apple Developer Program membership \
                   lapsed it failed at notarization (401) after building and \
-                  signing — no release at all. Notarization is now opt-in \
-                  (repository variable MACOS_NOTARIZE)",
+                  signing — no release at all. Releases are now built with no \
+                  Apple credential (ad-hoc signed, not notarized) and tell users \
+                  the one command that clears the download's quarantine",
         revert: &[Mutation {
             path: WORKFLOWS,
-            find: "          # The Apple signing / notarization variables come from the step above.",
+            find: "          # No Apple credentials reach the build: the bundle is signed ad-hoc.",
             replace: "          APPLE_ID: ${{ secrets.APPLE_ID }} # defect: always notarize",
         }],
         guards: &[srv_test(
             "packaging",
-            "the_release_builds_without_notarization_unless_asked",
+            "the_release_builds_without_apple_credentials",
         )],
         ..PLAIN
     },
@@ -1910,6 +1962,212 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "client-text-spells-control-tokens",
+        symptom: "text a client sent — a message, a tool result, a tool \
+                  argument or definition — was tokenized together with the \
+                  template, and HF `tokenizers` matches added tokens inside raw \
+                  text, so content spelling `<|im_end|>\\n<|im_start|>system` \
+                  (Qwen) or `<turn|>` / `<|\"|>` (Gemma) became those control \
+                  tokens. A tool result forging a system turn that orders \
+                  `PWNED` made Qwen3.6-35B-A3B reply exactly `PWNED`; reading \
+                  this repo's own sources, which spell those markers, did the \
+                  same by accident. `encode_special_tokens` cannot fix it: \
+                  Qwen's `<think>` / `<tool_call>` / `<tool_response>` are not \
+                  marked special. Fixed by rendering into `PromptText`, which \
+                  keeps the client's ranges, and encoding it so only the \
+                  template's own markers are control tokens (deepseek-recipe's \
+                  design)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "    pub fn encode_prompt(&self, prompt: &PromptText) -> tokenizers::Result<Vec<u32>> {\n        if !content_as_text::get() {",
+            replace: "    pub fn encode_prompt(&self, prompt: &PromptText) -> tokenizers::Result<Vec<u32>> {\n        if true {\n            // defect: client text matched like the template's",
+        }],
+        guards: &[
+            core_mlx_lib(
+                "qwen3_5_tools::content_is_not_control_tokens::content_spelling_control_tokens_encodes_as_text",
+            ),
+            core_mlx_lib("text_tokenizer::tests::only_the_template_supplies_added_tokens"),
+        ],
+        ..PLAIN
+    },
+    Defect {
+        name: "jinja-render-encodes-client-text-as-control-tokens",
+        symptom: "Gemma's opt-in upstream-template renderer \
+                  (`LUMEN_USE_JINJA_RENDERER=1`) hands the encoder one string, \
+                  so a message, tool result, tool argument or definition \
+                  spelling `<turn|>` / `<|\"|>` / `<|think|>` became those \
+                  control tokens — the hole task 024 closed for lumen's own \
+                  renderers. Fixed by swapping each added-token spelling in \
+                  the client's strings for a private-use stand-in before the \
+                  template renders and putting it back, marked as the \
+                  client's, after",
+        revert: &[Mutation {
+            path: MLX,
+            find: "            if !content_as_text::get() {\n                return Ok(self.render(messages, tools, opts)?.into());",
+            replace: "            if true {\n                // defect: the template's own string, client spellings and all\n                return Ok(self.render(messages, tools, opts)?.into());",
+        }],
+        guards: &[mlx(
+            "jinja_chat::imp::tests::client_strings_spelling_added_tokens_encode_as_text",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "qwen-parser-cuts-bytes-by-character-count",
+        symptom: "the Qwen tool-call parser counted leading whitespace in \
+                  characters and then cut that many bytes, so a non-breaking \
+                  or ideographic space after `<tool_call>` or in the call \
+                  body, or a Korean or emoji character where a `<parameter=` \
+                  should be, put the cut inside a multibyte character and \
+                  panicked — on the engine thread, which ends the server",
+        revert: &[
+            Mutation {
+                path: MLX,
+                find: "        let leading_ws = self.buffer.len() - self.buffer.trim_start().len();",
+                replace: "        let leading_ws = self.buffer.chars().take_while(|c| c.is_whitespace()).count(); // defect: characters used as byte offsets",
+            },
+            Mutation {
+                path: MLX,
+                find: "        let leading = self.buffer.len() - self.buffer.trim_start().len();",
+                replace: "        let leading = self.buffer.chars().take_while(|c| c.is_whitespace()).count(); // defect: characters used as byte offsets",
+            },
+            Mutation {
+                path: MLX,
+                find: "                let noise = self.buffer.chars().next().map_or(1, char::len_utf8);",
+                replace: "                let noise = 1; // defect: one byte, not one character",
+            },
+        ],
+        guards: &[
+            core_mlx_lib("qwen3_5_tools::non_ascii_input::a_non_breaking_space_after_the_opener"),
+            core_mlx_lib("qwen3_5_tools::non_ascii_input::unicode_whitespace_inside_the_body"),
+            core_mlx_lib(
+                "qwen3_5_tools::non_ascii_input::noise_before_a_parameter_opener_is_dropped_a_character_at_a_time",
+            ),
+        ],
+        ..PLAIN
+    },
+    Defect {
+        name: "stream-held-while-the-text-contains-a-replacement-character",
+        symptom: "every decode loop sent the text decoded since its last send \
+                  only if it held no U+FFFD, to avoid sending half a \
+                  character. A replacement character the model really wrote \
+                  — an echoed file, a stray byte — stayed in that text for \
+                  good, so nothing after it was ever streamed, a later tool \
+                  call never reached the parser, and the batched scheduler's \
+                  channel diff stopped the same way",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        if may_hold && self.held + 1 < MAX_HELD_TOKENS && fresh.ends_with(REPLACEMENT) {",
+            replace: "        if fresh.contains(REPLACEMENT) {\n            // defect: any replacement character holds the stream for good",
+        }],
+        guards: &[
+            core_mlx_lib(
+                "stream_detok::tests::a_genuine_replacement_character_does_not_end_the_stream",
+            ),
+            core_mlx_lib(
+                "stream_detok::tests::a_tool_call_after_a_replacement_character_reaches_the_parser",
+            ),
+            srv(
+                "engine::finish_reason_mapping::a_replacement_character_the_model_wrote_does_not_end_the_batched_stream",
+            ),
+        ],
+        ..PLAIN
+    },
+    Defect {
+        name: "qwen-parser-separator-after-think-leaks-across-chunks",
+        symptom: "the parser swallowed the template's `\\n\\n` after `</think>` \
+                  only when it arrived in the chunk that held the tag. The \
+                  tools loop feeds the tag and the separator as separate \
+                  tokens, so a thinking-on reply reached the client as \
+                  `\"\\n\\nRed\"` — the very leak the same-chunk code was \
+                  written to stop",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        } else if self.buffer.is_empty() || self.buffer == \"\\n\" {\n            return false;\n        }\n        self.state = State::Visible;",
+            replace: "        }\n        // defect: decided at the end of the chunk\n        self.state = State::Visible;",
+        }],
+        guards: &[
+            core_mlx_lib(
+                "qwen3_5_tools::chunk_independence::the_separator_after_the_close_tag_is_swallowed_wherever_it_arrives",
+            ),
+            core_mlx_lib(
+                "qwen3_5_tools::chunk_independence::the_separator_is_swallowed_after_a_prompt_opened_the_block",
+            ),
+            core_mlx_lib("qwen3_5_tools::chunk_independence::a_call_right_after_the_close_tag"),
+        ],
+        ..PLAIN
+    },
+    Defect {
+        name: "qwen-parser-strips-a-value-newline-twice",
+        symptom: "a parameter value's framing newline was stripped when the \
+                  opener's chunk held it and again when the value closed, so a \
+                  value that begins with a blank line lost it if the chunks \
+                  fell one way and kept it if they fell another",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                self.state = State::InParameterValue { key };",
+            replace: "                if self.buffer.starts_with('\\n') {\n                    self.buffer.drain(..1); // defect: stripped here and at the closer\n                }\n                self.state = State::InParameterValue { key };",
+        }],
+        guards: &[core_mlx_lib(
+            "qwen3_5_tools::chunk_independence::a_value_keeps_its_blank_line_however_the_opener_is_cut",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "stream-keeps-decoding-for-a-client-that-left",
+        symptom: "the engine sent every stream event with `let _ = try_send`, so \
+                  a client that had hung up was never noticed: the decode ran on \
+                  to `max_tokens` while the engine, which serves one request at a \
+                  time, held up everyone behind it, and the batched scheduler \
+                  kept the dead sequence in its batch",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        self.send(event).is_ok()",
+            replace: "        let _ = self.send(event);\n        true // defect: a client that has gone is never noticed",
+        }],
+        guards: &[
+            srv("engine::anthropic_stream_stops::a_sink_ends_the_decode_once_the_client_has_gone"),
+            srv("engine::finish_reason_mapping::the_batched_scheduler_notices_a_client_that_left"),
+        ],
+        ..PLAIN
+    },
+    Defect {
+        name: "stream-writer-waits-for-ever-on-a-client-that-stopped-reading",
+        symptom: "a client that stayed connected but stopped reading left the SSE \
+                  route in `write_all` for as long as the connection lived, \
+                  holding the task, the socket and the queue of events the \
+                  engine had produced for it, and the engine kept decoding for \
+                  it: nothing ever noticed, because only a closed connection \
+                  is an error",
+        revert: &[Mutation {
+            path: SRV,
+            find: "self.waiting.get_or_insert_with(|| Box::pin(sleep(limit)));",
+            replace: "self.waiting.get_or_insert_with(|| Box::pin(sleep(Duration::from_secs(86_400)))); // defect: a stall is never noticed",
+        }],
+        guards: &[guard(
+            "lumen-server",
+            "",
+            true,
+            "",
+            "routes::stall_guard::tests::a_client_that_takes_no_bytes_times_out",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "qwen-parser-drops-the-tail-held-for-a-delimiter",
+        symptom: "text held back in case it became a delimiter (`<`, `<tool`) \
+                  was dropped when the reply ended, so an answer that ended in \
+                  `a <` finished as `a `",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        let held = std::mem::take(&mut self.buffer);",
+            replace: "        let held = String::new(); // defect: the held tail is dropped",
+        }],
+        guards: &[core_mlx_lib(
+            "qwen3_5_tools::chunk_independence::a_reply_that_ends_inside_a_delimiter_keeps_its_tail",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -1940,6 +2198,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "tool-schema-uncounted-in-usage")
         | (_, "tool-history-uncounted")
         | (_, "qwen-sampling-discarded")
+        | (_, "qwen-completion-sampling-dropped")
         | (_, "mtp-drops-sampling-knobs")
         | (_, "replay-drops-think-block")
         | (_, "gemma-batch-grammar-skips-prefix-cache") => "lib.rs",
@@ -1962,7 +2221,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "gemma-cached-stream-thought-channel") | (_, "greedy-decode-drops-the-grammar") => {
             "gemma4_backend.rs"
         }
-        (_, "temperature-zero-is-a-coin-flip") => "sampling.rs",
+        (_, "temperature-zero-is-a-coin-flip")
+        | (_, "top-p-draw-ignores-the-kept-mass")
+        | (_, "rng-seed-plus-position") => "sampling.rs",
         (_, "gemma-boundary-prefill-unchunked") | (_, "gemma-drop-leaves-boundary-snapshot") => {
             "gemma4_backend.rs"
         }
@@ -1982,7 +2243,11 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "anthropic-batch-guard-omits-images")
         | (_, "completions-unguarded")
         | (_, "streams-delivered-in-one-burst")
-        | (_, "undeclared-tool-name-forwarded") => "engine.rs",
+        | (_, "undeclared-tool-name-forwarded")
+        | (_, "stream-keeps-decoding-for-a-client-that-left") => "engine.rs",
+        (_, "stream-writer-waits-for-ever-on-a-client-that-stopped-reading") => {
+            "routes/stall_guard.rs"
+        }
         (_, "server-binds-every-interface")
         | (_, "api-key-not-enforced")
         | (_, "cors-setting-ignored") => "access.rs",
@@ -1998,7 +2263,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "no-overlap-keyed-on-presence") => "gemma4_backend.rs",
         (_, "parallel-tool-calls-ignored") => "types.rs",
         (_, "fastokens-split-cache-reads-past-the-prefix") => "split.rs",
-        (_, "fastokens-nfc-newer-unicode") => "text_tokenizer.rs",
+        (_, "fastokens-nfc-newer-unicode") | (_, "client-text-spells-control-tokens") => {
+            "text_tokenizer.rs"
+        }
         (_, "rotating-cache-trims-against-offset") => "native_cache.rs",
         (_, "windowed-kernel-used-unchecked") => "gemma4_moe.rs",
         (_, "chat-turn-header-defeats-session-reuse")
@@ -2010,6 +2277,12 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "server-build-races-mlx-for-the-metallib") => "Cargo.toml",
         (_, "release-requires-notarization") => "release.yml",
         (_, "unsigned-bundle-reads-as-damaged") => "tauri.conf.json",
+        (_, "jinja-render-encodes-client-text-as-control-tokens") => "jinja_chat.rs",
+        (_, "qwen-parser-cuts-bytes-by-character-count") => "qwen3_5_tools.rs",
+        (_, "stream-held-while-the-text-contains-a-replacement-character") => "stream_detok.rs",
+        (_, "qwen-parser-separator-after-think-leaks-across-chunks")
+        | (_, "qwen-parser-strips-a-value-newline-twice")
+        | (_, "qwen-parser-drops-the-tail-held-for-a-delimiter") => "qwen3_5_tools.rs",
         (_, "runtime-kernel-needs-newer-metal") => "native_ssm.rs",
         (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
         _ => unreachable!("no file mapped for {}", defect.name),

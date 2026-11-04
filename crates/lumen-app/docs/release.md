@@ -160,29 +160,39 @@ URL baked into `tauri.conf.json`. The workflow's comments explain its runner and
 toolchain choices (macOS 26 for an SDK that knows MLX's availability guards, the separately
 downloaded Metal toolchain, why `mlx-sys` is cleaned first).
 
-### Code signing and notarization
+### Code signing and notarization: none needed
 
-The `Configure macOS signing` step decides both, from what the repository
-holds:
+Releases are built **without an Apple certificate** and are **not
+notarized**. The workflow reads no Apple secret, so cutting a release needs
+no Apple Developer Program membership: the only secrets it uses are the
+updater key (`TAURI_SIGNING_PRIVATE_KEY`, and its password if set) and the
+provisioned `GITHUB_TOKEN`. Any `APPLE_*` secrets or a `MACOS_NOTARIZE`
+variable left in the repository are ignored and can be deleted.
 
-| | Configured by | Without it |
-|---|---|---|
-| Developer ID signature | secrets `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` | ad-hoc signature (`signingIdentity: "-"`) |
-| Notarization | repository variable `MACOS_NOTARIZE=true` plus secrets `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | not notarized |
+Why: notarization needs an **active** membership. A lapsed one is what stopped
+the v0.12.0 run — `failed to notarize app: Error: HTTP status code: 401.
+Invalid credentials` after a successful build and code signature — even though
+the Developer ID certificate was still valid.
 
-Notarization needs an **active** Apple Developer Program membership. A lapsed
-one is what stopped the v0.12.0 run — `failed to notarize app: Error: HTTP
-status code: 401. Invalid credentials` after a successful build and code
-signature — even though the Developer ID certificate was still valid; a revoked
-or rotated app-specific password (`APPLE_PASSWORD`) fails the same way. Leave
-`MACOS_NOTARIZE` unset while the membership is inactive: the release still
-builds and ships, and users allow it once (README → Install from a release).
+What users see and do:
+- Tauri signs the bundle **ad-hoc** (`signingIdentity: "-"` in
+  `tauri.conf.json`). That seals it. A bundle with only the linker's signature
+  is reported as **damaged**, with no way to open it.
+- macOS blocks the first launch of a downloaded copy. The workflow's last step
+  writes the install notes onto the draft release, with the one command that
+  clears the download's quarantine:
 
-A Developer ID certificate outlives a lapsed membership but not its own expiry
-date. Once it expires, signing fails; delete the three certificate secrets and
-releases fall back to ad-hoc signing. Either signature is valid — what matters
-is that the bundle is sealed: an unsealed one is reported as **damaged**, with
-no Open Anyway.
+  ```sh
+  xattr -dr com.apple.quarantine /Applications/Lumen.app
+  ```
+
+  Add your own notes to the draft below them before publishing. The command
+  also appears in README → Install from a release; a packaging test keeps the
+  two the same.
+- After that the app opens normally. In-app updates install without the
+  command, because the updater's own downloads are not quarantined.
+- The install notes are not tauri-action's `releaseBody`: that body becomes
+  the `notes` of `latest.json`, which the app shows when it offers an update.
 
 ## Config schema migrations
 

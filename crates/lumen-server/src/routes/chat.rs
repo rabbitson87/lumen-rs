@@ -191,7 +191,9 @@ async fn handle_streaming(
         super::Admission::Pending => None,
     };
     let head = super::sse_head(response.headers());
-    let mut tcp = response.into_body().stream;
+    // A client that connects and stops reading would otherwise hold this task,
+    // the socket and the engine's queue for as long as the connection lives.
+    let mut tcp = super::stall_guard::StallGuard::new(response.into_body().stream);
 
     // Write HTTP headers for SSE
     tcp.write_all(head.as_bytes()).await?;

@@ -131,36 +131,70 @@ fn the_server_depends_on_mlx_sys_directly_at_lumen_mlx_s_rev() {
     );
 }
 
-/// v0.12.0 never shipped: the job always notarized, and with the Apple
-/// Developer Program membership lapsed Apple answered 401 — after the build and
-/// the code signature had succeeded. Notarization needs an active membership, so
-/// it is opt-in (`vars.MACOS_NOTARIZE`); the build step must not be handed the
-/// notary credentials unconditionally.
-#[test]
-fn the_release_builds_without_notarization_unless_asked() {
-    let workflow = std::fs::read_to_string(
+/// The release workflow, as text.
+fn release_workflow() -> String {
+    std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/release.yml"),
     )
-    .expect("read release.yml");
-    let action = workflow
-        .split("uses: tauri-apps/tauri-action")
-        .nth(1)
-        .and_then(|rest| rest.split("        with:").next())
-        .expect("the tauri-action step");
+    .expect("read release.yml")
+}
+
+/// v0.12.0 never shipped: the job handed the notary credentials to the build,
+/// and with the Apple Developer Program membership lapsed Apple answered 401 —
+/// after the build and the code signature had succeeded. Releases are now built
+/// with no Apple certificate and not notarized, so cutting one needs no
+/// membership: nothing in the workflow may read an Apple credential.
+#[test]
+fn the_release_builds_without_apple_credentials() {
+    let workflow = release_workflow();
+    let reads: Vec<&str> = workflow
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter(|l| l.contains("secrets.APPLE_") || l.contains("MACOS_NOTARIZE"))
+        .collect();
     assert!(
-        !action.contains("APPLE_ID"),
-        "the build step must not receive notary credentials directly"
+        reads.is_empty(),
+        "the release must build without Apple credentials, but reads {reads:?}"
     );
+}
+
+/// An unnotarized download is blocked on its first launch until its quarantine
+/// is cleared. The release page and the README give the same command for it,
+/// naming the app where the DMG installs it; the update notes, which the app
+/// shows when it offers an update, stay free of it (tauri-action's
+/// `releaseBody` would become those notes).
+#[test]
+fn the_release_page_and_the_readme_give_the_same_first_launch_command() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let conf: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("crates/lumen-app/tauri.conf.json"))
+            .expect("read tauri.conf.json"),
+    )
+    .expect("parse tauri.conf.json");
+    let app = conf["productName"].as_str().expect("productName");
+    let command = format!("xattr -dr com.apple.quarantine /Applications/{app}.app");
+    let workflow = release_workflow();
+    let notes_step = workflow
+        .split("- name: Put the install notes on the release")
+        .nth(1)
+        .expect("the step that writes the install notes");
     assert!(
-        workflow.contains("if [ \"$MACOS_NOTARIZE\" = \"true\" ]; then"),
-        "notarization must be gated on the MACOS_NOTARIZE variable"
+        notes_step.contains(&command),
+        "the release notes must give `{command}`"
+    );
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("read README.md");
+    assert!(readme.contains(&command), "README.md must give `{command}`");
+    assert!(
+        !workflow.contains("releaseBody:"),
+        "install notes as tauri-action's releaseBody would become the update notes"
     );
 }
 
 /// Without a Developer ID certificate Tauri left only the linker's signature on
 /// the executables, which promises a bundle seal that is not there: macOS calls
 /// such a download "damaged" and offers only Move to Trash. An ad-hoc identity
-/// seals the bundle, so an unnotarized build can still be opened (Open Anyway).
+/// seals the bundle, so an unnotarized build can still be opened once its
+/// quarantine is cleared.
 #[test]
 fn a_build_without_a_certificate_is_still_validly_signed() {
     let conf: serde_json::Value = serde_json::from_str(

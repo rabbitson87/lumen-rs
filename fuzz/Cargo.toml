@@ -76,3 +76,10 @@ path = "fuzz_targets/chat_render.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "qwen_parser_feed"
+path = "fuzz_targets/qwen_parser_feed.rs"
+test = false
+doc = false
+bench = false

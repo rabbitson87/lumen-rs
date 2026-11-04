@@ -39,11 +39,40 @@
 //!
 //! # determinism floor
 //! ... --example kv_bf16_quality -- --control
+//!
+//! # the bf16 activation cast (LUMEN_NATIVE_ACT_BF16) instead of bf16 KV: KV stays at its
+//! # serving default in both conditions, and the scales have to load as bf16
+//! LUMEN_NATIVE_WIDEN_SCALES=0 MODEL_ID=... ... --example kv_bf16_quality -- --act-bf16
+//!
+//! # how far apart two valid kernel paths already are: 384-token windows against 1-token windows
+//! ... --example kv_bf16_quality -- --window-control
+//!
+//! # the fused MoE decode kernels against the composed ops, one token per forward (the kernels
+//! # run on single-token steps only); the experts are stacked at load, so the flag must not be 0
+//! MODEL_ID=... ... --example kv_bf16_quality -- --fused-moe-decode
 //! ```
 
 use anyhow::{Result, anyhow};
 use lumen_mlx::metal_memory::clear_cache;
-use lumen_mlx::{MlxBackend, MlxQwen35Backend, set_kv_store_bf16};
+use lumen_mlx::{
+    MlxBackend, MlxQwen35Backend, set_act_bf16, set_fused_moe_decode, set_kv_store_bf16,
+};
+
+/// What the two conditions differ in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// bf16 against f32 KV storage (the default).
+    KvBf16,
+    /// bf16 activations into the quantized projections (`LUMEN_NATIVE_ACT_BF16`).
+    ActBf16,
+    /// The fused routed/shared expert decode kernels against the composed ops
+    /// (`LUMEN_NATIVE_FUSED_MOE_DECODE`). The kernels run on single-token steps only, so this
+    /// mode probes one token at a time.
+    FusedMoeDecode,
+    /// The same model both times, probed 384 tokens at a time (the prefill kernels) against one
+    /// token at a time (the decode kernels): how far apart two valid kernel paths already are.
+    WindowControl,
+}
 
 /// Realistic seeds across domains and scripts. Deliberately not filler: the
 /// point is to measure on text whose next token the model has an opinion about.
@@ -113,6 +142,8 @@ fn extend_seed(
     seq_id: u64,
 ) -> Result<Extended> {
     set_kv_store_bf16(false);
+    set_act_bf16(false);
+    set_fused_moe_decode(false);
     let msgs = vec![("user".to_string(), prompt.to_string())];
     let prompt_ids = backend.build_chat_input(&msgs, false, None)?;
     let prompt_len = prompt_ids.len();
@@ -147,9 +178,30 @@ fn teacher_force(
     backend: &mut MlxQwen35Backend,
     tokens: &[u32],
     bf16: bool,
+    mode: Mode,
     seq_id: u64,
 ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
-    set_kv_store_bf16(bf16);
+    let mut window = PROBE_WINDOW;
+    match mode {
+        Mode::ActBf16 => {
+            // Isolate the activation cast: the KV cache is at its serving default in both conditions.
+            set_kv_store_bf16(true);
+            set_act_bf16(bf16);
+        }
+        Mode::FusedMoeDecode => {
+            // Likewise the serving-default KV cache, one token per forward so the decode kernels run.
+            set_kv_store_bf16(true);
+            set_fused_moe_decode(bf16);
+            window = 1;
+        }
+        Mode::WindowControl => {
+            set_kv_store_bf16(true);
+            if bf16 {
+                window = 1;
+            }
+        }
+        Mode::KvBf16 => set_kv_store_bf16(bf16),
+    }
     // `forward_probe` needs a live sequence, so seed the cache with token 0 and
     // probe everything after it.
     backend.prefill(seq_id, &tokens[..1])?;
@@ -159,7 +211,7 @@ fn teacher_force(
     let mut top2_gap = Vec::with_capacity(tokens.len());
     let mut start = 1usize;
     while start < tokens.len() {
-        let end = (start + PROBE_WINDOW).min(tokens.len());
+        let end = (start + window).min(tokens.len());
         let rows = backend.forward_probe(seq_id, &tokens[start..end])?;
         argmaxes.extend_from_slice(&rows.row_argmaxes);
         max_abs.extend_from_slice(&rows.row_max_abs);
@@ -193,6 +245,7 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow!("set MODEL_ID to a local model directory or an HF repo id"))?;
     let mut extend = 600usize;
     let mut control = false;
+    let mut mode = Mode::KvBf16;
 
     let mut i = 1;
     while i < argv.len() {
@@ -208,11 +261,44 @@ fn main() -> Result<()> {
                 control = true;
                 i += 1;
             }
+            "--act-bf16" => {
+                mode = Mode::ActBf16;
+                i += 1;
+            }
+            "--fused-moe-decode" => {
+                mode = Mode::FusedMoeDecode;
+                i += 1;
+            }
+            "--window-control" => {
+                mode = Mode::WindowControl;
+                i += 1;
+            }
             other => return Err(anyhow!("unknown argument {other:?}")),
         }
     }
+    if mode == Mode::ActBf16 && std::env::var("LUMEN_NATIVE_WIDEN_SCALES").as_deref() != Ok("0") {
+        return Err(anyhow!(
+            "--act-bf16 acts on bf16 scales only: run with LUMEN_NATIVE_WIDEN_SCALES=0"
+        ));
+    }
+    if mode == Mode::FusedMoeDecode
+        && std::env::var("LUMEN_NATIVE_FUSED_MOE_DECODE").as_deref() == Ok("0")
+    {
+        return Err(anyhow!(
+            "--fused-moe-decode switches kernels over experts stacked at load: do not run with \
+             LUMEN_NATIVE_FUSED_MOE_DECODE=0"
+        ));
+    }
 
-    println!("--- bf16 KV quality, teacher-forced ---");
+    println!(
+        "--- {} quality, teacher-forced ---",
+        match mode {
+            Mode::KvBf16 => "bf16 KV",
+            Mode::ActBf16 => "bf16 activation",
+            Mode::FusedMoeDecode => "fused MoE decode kernels",
+            Mode::WindowControl => "prefill-window vs decode-window kernels",
+        }
+    );
     println!("model   = {model_id}");
     println!("seeds   = {} realistic prompts", SEEDS.len());
     println!("extend  = {extend} model-generated tokens per seed");
@@ -243,9 +329,9 @@ fn main() -> Result<()> {
         let ext = extend_seed(backend, label, prompt, extend, next_id)?;
         next_id += 1;
 
-        let (a_arg, a_mag, a_gap) = teacher_force(backend, &ext.tokens, false, next_id)?;
+        let (a_arg, a_mag, a_gap) = teacher_force(backend, &ext.tokens, false, mode, next_id)?;
         next_id += 1;
-        let (b_arg, b_mag, _b_gap) = teacher_force(backend, &ext.tokens, !control, next_id)?;
+        let (b_arg, b_mag, _b_gap) = teacher_force(backend, &ext.tokens, !control, mode, next_id)?;
         next_id += 1;
 
         if a_arg.len() != b_arg.len() {

@@ -71,9 +71,11 @@ mod imp {
     use crate::native_embedding::quantized_embedding_lookup_with_mode;
     use crate::native_kernels::{sigmoid_mul_fuse_enabled, sigmoid_mul_fused};
     use crate::native_moe::{
-        AffineGateWeights, GateProj, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights,
-        SwitchGluWeights, moe_block_forward, swiglu_fuse_enabled, swiglu_fused,
+        AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, SharedMlpWeights,
+        SwitchExpertWeights, SwitchGluWeights, moe_block_forward, swiglu_fuse_enabled,
+        swiglu_fused,
     };
+    use crate::native_moe_decode::ExpertViews;
     use crate::native_norm::rms_norm;
     use crate::native_quant::{
         MODE_AFFINE, MODE_MXFP4, MODE_NVFP4, dequantize_with_mode, quantize_with_mode,
@@ -91,8 +93,28 @@ mod imp {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// The random stream an MTP cycle draws its drafts and acceptances from,
+    /// keyed with the request's seed and the cycle's cache offset.
+    const MTP_RNG_STREAM: u64 = 0xA5;
+
     pub(crate) fn sigmoid_mul_fuse_enabled_pub() -> bool {
         sigmoid_mul_fuse_enabled()
+    }
+
+    lumen_flags::flag! {
+        /// Keep the MTP head's own attention cache across draft cycles and prime it with the
+        /// prompt ([`MtpHistory`]): every committed pair (trunk hidden, next token) enters it,
+        /// as MTPLX and oMLX run the head. With it off the cache is emptied every cycle and the
+        /// head attends to the current cycle's drafts only.
+        ///
+        /// Output-identical: the head only proposes drafts, the trunk's verify decides every
+        /// token. MTPLX measured depth-1 acceptance 0.90 with the history against 0.26 without
+        /// on code; numbers for this repo in the commit that added it.
+        pub(crate) mtp_history {
+            env: "LUMEN_MTP_HISTORY",
+            default: true,
+            kind: Optimization,
+        }
     }
 
     lumen_flags::flag! {
@@ -119,6 +141,64 @@ mod imp {
         pub(crate) kv_bf16 {
             env: "LUMEN_MLX_KV_BF16",
             default: true,
+            kind: Behavior,
+        }
+    }
+
+    lumen_flags::flag! {
+        /// Keep the affine projections' scales and biases in f32 so a matmul on the f32 residual
+        /// stream stops re-casting them on every call.
+        ///
+        /// MLX gives `quantized_matmul` the common dtype of the activations and the scales and
+        /// biases and casts whichever differs on every call. The trunk's activations are f32 and
+        /// the checkpoint's scales bf16, so each of a decode step's ~500 matmuls re-widened its
+        /// scales and biases before reading the weights. On stock MLX 0.32.3 (M3 Max, 17408x5120
+        /// 4-bit group 64) that is 187 GB/s against 276 GB/s with bf16 activations; pre-widened
+        /// scales recover most of it (237-250 GB/s). The widening is exact (bf16 -> f32), so the
+        /// output is bit-identical; the cost is the f32 copy minus the bf16 original the model
+        /// drops (`NativeWeights::release_scales_and_biases`): +1.45 GB of GPU memory on the 27B
+        /// (16.0 -> 17.5 GB footprint, `footprint`; `ps` RSS does not see GPU buffers).
+        /// Affine projections only (mxfp4/nvfp4 scales are integer exponents). Applies to
+        /// `resolve_linear`, i.e. the Qwen 3.5/3.6 trunk and lm_head. Measured on Qwen3.6-27B
+        /// (4-bit group 64, M3 Max): decode 84.3 -> 67.1 ms/step, 192 greedy tokens identical.
+        /// `=0` restores the per-call cast.
+        ///
+        /// A projection whose matvecs `LUMEN_NATIVE_DECODE_QMV` runs (4-bit group 64, inputs a
+        /// multiple of 512, outputs a multiple of 8) keeps its bf16 scales instead: those
+        /// kernels read them as they are, faster than MLX reads the f32 copy, and only a
+        /// prefill-sized matmul still casts them. On the 4-bit Qwen checkpoints that is every
+        /// trunk projection, so the copy, and its memory, is gone there.
+        pub(crate) widen_scales {
+            env: "LUMEN_NATIVE_WIDEN_SCALES",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
+    lumen_flags::flag! {
+        /// Run each quantized projection on a bf16 activation (cast back to f32 after) when the
+        /// activation is f32 and the scales are bf16/f16, so MLX takes its fast path (276 GB/s on
+        /// M3 Max against 187 GB/s with an f32 activation, stock MLX 0.32.3, 17408x5120 4-bit).
+        ///
+        /// **`Behavior`, not `Optimization`: this is a numerics change.** The activation is
+        /// rounded to bf16 before the matmul (the accumulation stays f32), as mlx-lm does
+        /// throughout. Applies to every `ResolvedLinear::apply` -- the Qwen trunk and MTP head
+        /// and Gemma 4 -- whose activation is f32 and scales are bf16/f16. A no-op on scales
+        /// `LUMEN_NATIVE_WIDEN_SCALES` widened; it does act on the projections that keep bf16
+        /// scales for `LUMEN_NATIVE_DECODE_QMV` (every trunk projection of a 4-bit group-64
+        /// checkpoint), where it replaces those kernels.
+        ///
+        /// Measured on Qwen3.6-27B (M3 Max): 65.9 -> 62.0 ms/step against the widened default,
+        /// with a cast before and after every matmul eating part of the gain. Teacher-forced
+        /// top-1 agreement with the f32 activation over 6 seeds x ~675 positions
+        /// (`examples/kv_bf16_quality.rs --act-bf16`; the f32-vs-f32 control is 100.000%): 27B
+        /// 99.31%, 9B 99.09%. Every flip is a near-tie (the largest top1-top2 gap sits at the
+        /// 3.4th / 3.9th percentile) and agreement does not fall with context depth, but it is
+        /// below the 99.73% that the bf16 KV cache cleared before it became the default.
+        /// Default off.
+        pub(crate) act_bf16 {
+            env: "LUMEN_NATIVE_ACT_BF16",
+            default: false,
             kind: Behavior,
         }
     }
@@ -162,6 +242,58 @@ mod imp {
         }
     }
 
+    lumen_flags::flag! {
+        /// Stack each MoE layer's routed-expert `gate_proj` and `up_proj` along the output axis
+        /// at load, so the experts' gate and up outputs come from one `gather_qmm` (split in
+        /// half afterwards) instead of two.
+        ///
+        /// Every output row is the same reduction either way, so the result is bit-identical.
+        /// It saves one gather launch per MoE layer per step. The stacked copy replaces the
+        /// separate tensors (the model drops them), so memory does not grow (footprint 19 GB
+        /// either way; the load takes ~4 s longer). Not used with SSD expert offload, whose pool
+        /// serves gate and up as separate roles, nor by the MTP block.
+        ///
+        /// Default OFF and **tested null**: Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy
+        /// decode, ABBA over four server runs: 12.0 / 11.8 ms/token off against 11.9 / 11.9 on,
+        /// 819 generated bytes identical in all four. Decode is GPU-bound, so a launch saved
+        /// between matmuls that already queue behind each other buys nothing. Kept as the layout a
+        /// fused gate+up+SwiGLU routed-expert kernel would read.
+        pub(crate) fuse_moe_gate_up {
+            env: "LUMEN_NATIVE_FUSE_MOE_GATE_UP",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
+    lumen_flags::flag! {
+        /// Run a single-token decode step's routed and shared experts in two Metal kernels
+        /// (`native_moe_decode`) instead of about twenty-five MLX ops. Implies the stacked
+        /// gate/up layout of `LUMEN_NATIVE_FUSE_MOE_GATE_UP`. Applies to affine 4-bit group-64
+        /// layers with a top-8 router whose hidden and intermediate sizes are multiples of 512,
+        /// behind an f32 activation and bf16 expert scales; prefill, SSD expert offload and other
+        /// layouts keep the composed ops.
+        ///
+        /// Bit-identical to the composed ops: the kernels run MLX's own quantized matvec arithmetic
+        /// (its lane partition, `load_vector`'s division and bf16 quad sum, `qdot`'s expression),
+        /// round to bf16 where the composed block does, and add the eight routed outputs in the
+        /// composed reduction's order. An `Optimization` flag. Default on; `=0` restores the
+        /// composed ops.
+        ///
+        /// SSD expert offload serves the experts through the composed ops. Because the kernels
+        /// equal them in every bit, an offloaded run equals the resident run on an affine
+        /// checkpoint too: the weights-gated offload tests pass with the kernels on.
+        ///
+        /// Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA: 11.2 ms/token composed
+        /// against 9.5 with the kernels (and the router kernels), the generated text identical
+        /// byte for byte. Before the kernels were bit-identical they ran at 11.1 ms against 12.0
+        /// with 814 of 819 bytes the same.
+        pub(crate) fused_moe_decode {
+            env: "LUMEN_NATIVE_FUSED_MOE_DECODE",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     pub(crate) fn kv_store_bf16() -> bool {
         kv_bf16::get()
     }
@@ -171,6 +303,21 @@ mod imp {
     /// that predate `lumen_flags` keep their entry point.
     pub fn set_kv_store_bf16(on: bool) {
         kv_bf16::set(on);
+    }
+
+    /// Pin `act_bf16` process-wide for an A/B harness, bypassing the env read. It only acts on
+    /// scales loaded as bf16/f16, so the model has to be loaded with
+    /// `LUMEN_NATIVE_WIDEN_SCALES=0`.
+    pub fn set_act_bf16(on: bool) {
+        act_bf16::set(on);
+    }
+
+    /// Pin `fused_moe_decode` process-wide for an A/B harness, bypassing the env read. The expert
+    /// tensors are stacked at load, so the model has to be loaded with
+    /// `LUMEN_NATIVE_FUSED_MOE_DECODE=1` (or `LUMEN_NATIVE_FUSE_MOE_GATE_UP=1`) for this to have
+    /// anything to switch.
+    pub fn set_fused_moe_decode(on: bool) {
+        fused_moe_decode::set(on);
     }
 
     // config.json parsing lives in the ungated `qwen35_config` module so a
@@ -417,6 +564,24 @@ mod imp {
         pub fn keys(&self) -> impl Iterator<Item = &String> {
             self.tensors.keys()
         }
+
+        /// Drop this bag's handles on every scales and biases tensor. What else holds one (the
+        /// resolved projections, the embedding) keeps it alive; what nothing else holds -- the
+        /// bf16 originals of scales that `widen_scales` replaced -- is freed. Without this the
+        /// model holds both copies, +3.2 GB on the 27B instead of +1.6 GB.
+        pub(crate) fn release_scales_and_biases(&mut self) {
+            self.tensors
+                .retain(|k, _| !(k.ends_with(".scales") || k.ends_with(".biases")));
+        }
+
+        /// Drop this bag's handles on the routed experts' separate gate and up tensors, once
+        /// the loader has stacked them (`fuse_moe_gate_up`). The stacked copy is the only one
+        /// the model reads; without this the bag would keep both.
+        pub(crate) fn release_expert_gate_up(&mut self) {
+            self.tensors.retain(|k, _| {
+                !(k.contains(".switch_mlp.gate_proj.") || k.contains(".switch_mlp.up_proj."))
+            });
+        }
     }
 
     // ──────────────────── pre-resolved per-layer weights ─────────────────
@@ -476,6 +641,63 @@ mod imp {
     impl ResolvedLinear {
         /// `y = x @ deq(W).T` at this projection's own quant params.
         pub fn apply(&self, x: &Array) -> Result<Array> {
+            let scales_dtype = self.scales.dtype();
+            if act_bf16::get()
+                && x.dtype() == mlx_rs::Dtype::Float32
+                && matches!(
+                    scales_dtype,
+                    mlx_rs::Dtype::Bfloat16 | mlx_rs::Dtype::Float16
+                )
+            {
+                let narrow = x
+                    .as_dtype(scales_dtype)
+                    .context("quantized linear: cast activation to the scales dtype failed")?;
+                return self
+                    .matmul(&narrow)?
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .context("quantized linear: cast result to f32 failed");
+            }
+            let weights = self.weights();
+            if let Some(plan) = crate::native_qmv::plan(x, &weights) {
+                return crate::native_qmv::matvec(&plan, x, &weights);
+            }
+            if let Some(rows) = crate::native_qmv::rows_on_mlx(x, &weights) {
+                return crate::native_qmv::row_by_row(x, rows, |row| self.matmul(row));
+            }
+            self.matmul(x)
+        }
+
+        /// [`Self::apply`] of each projection to the same `x`, in one decode-kernel launch when
+        /// the kernels take them all (`native_qmv::matvec_shared`: one f32 row, bf16 scales);
+        /// `None` otherwise, and the caller applies them one at a time. Equal in every bit to
+        /// `apply`.
+        pub fn apply_shared<const P: usize>(
+            x: &Array,
+            projections: [&ResolvedLinear; P],
+        ) -> Result<Option<[Array; P]>> {
+            if act_bf16::get() {
+                return Ok(None);
+            }
+            let weights = projections.map(ResolvedLinear::weights);
+            let Some(outputs) = crate::native_qmv::matvec_shared(x, &weights)? else {
+                return Ok(None);
+            };
+            Ok(outputs.try_into().ok())
+        }
+
+        /// The tensors and parameters the decode kernels read.
+        fn weights(&self) -> crate::native_qmv::Weights<'_> {
+            crate::native_qmv::Weights {
+                weight: &self.weight,
+                scales: &self.scales,
+                biases: self.biases.as_ref(),
+                group_size: self.group_size,
+                bits: self.bits,
+                mode: self.mode,
+            }
+        }
+
+        fn matmul(&self, x: &Array) -> Result<Array> {
             quantized_matmul_with_mode(
                 x,
                 &self.weight,
@@ -522,6 +744,34 @@ mod imp {
         Full(FullAttnLayerWeights),
     }
 
+    /// One stacked set of routed-expert tensors (`[E, out, ..]`), owned.
+    pub struct ExpertTensors {
+        pub weight: Array,
+        pub scales: Array,
+        /// Affine only: mxfp4/nvfp4 carry no biases, affine carries one next to every scales.
+        pub biases: Option<Array>,
+    }
+
+    impl ExpertTensors {
+        fn view(&self) -> SwitchExpertWeights<'_> {
+            SwitchExpertWeights {
+                weight: &self.weight,
+                scales: &self.scales,
+                biases: self.biases.as_ref(),
+            }
+        }
+    }
+
+    /// The routed experts' gate and up tensors as the loader keeps them: two stacked sets, or
+    /// the one set holding both (`fuse_moe_gate_up`), never both.
+    pub enum ResolvedGateUp {
+        Split {
+            gate: ExpertTensors,
+            up: ExpertTensors,
+        },
+        Fused(ExpertTensors),
+    }
+
     /// Pre-resolved MoE weights — same shape as the per-call
     /// `MoeBlockWeights<'_>` view but owns the `Array` handles.
     /// `moe_view()` returns the borrowed view that `moe_block_forward`
@@ -534,12 +784,10 @@ mod imp {
         pub gate_gs: i32,
         pub gate_bits: i32,
         // switch_mlp (mxfp4 by default)
-        pub sw_gate_w: Array,
-        pub sw_gate_s: Array,
-        pub sw_up_w: Array,
-        pub sw_up_s: Array,
+        pub sw_gate_up: ResolvedGateUp,
         pub sw_down_w: Array,
         pub sw_down_s: Array,
+        pub sw_down_b: Option<Array>,
         pub sw_gs: i32,
         pub sw_bits: i32,
         pub sw_mode: &'static CStr,
@@ -550,6 +798,9 @@ mod imp {
         pub se_up_s: Array,
         pub se_down_w: Array,
         pub se_down_s: Array,
+        pub se_gate_b: Option<Array>,
+        pub se_up_b: Option<Array>,
+        pub se_down_b: Option<Array>,
         pub se_gs: i32,
         pub se_bits: i32,
         pub se_mode: &'static CStr,
@@ -562,6 +813,12 @@ mod imp {
         // routing meta
         pub top_k: i32,
         pub norm_topk_prob: bool,
+        /// The experts are stacked, so single-token steps may run the decode kernels; whether they
+        /// do is `fused_moe_decode`, read at each call so a harness can switch it.
+        pub decode_kernels_ready: bool,
+        /// One-expert views of the stacks for the decode kernels to bind; `Some` for a stacked
+        /// layer whose experts carry biases.
+        pub decode_views: Option<ExpertViews>,
     }
 
     impl ResolvedMoeWeights {
@@ -575,35 +832,33 @@ mod imp {
                     bits: self.gate_bits,
                 }),
                 switch_glu: SwitchGluWeights {
-                    gate_proj: SwitchExpertWeights {
-                        weight: &self.sw_gate_w,
-                        scales: &self.sw_gate_s,
-                        biases: None,
-                    },
-                    up_proj: SwitchExpertWeights {
-                        weight: &self.sw_up_w,
-                        scales: &self.sw_up_s,
-                        biases: None,
+                    gate_up: match &self.sw_gate_up {
+                        ResolvedGateUp::Split { gate, up } => GateUpWeights::Split {
+                            gate: gate.view(),
+                            up: up.view(),
+                        },
+                        ResolvedGateUp::Fused(gate_up) => GateUpWeights::Fused(gate_up.view()),
                     },
                     down_proj: SwitchExpertWeights {
                         weight: &self.sw_down_w,
                         scales: &self.sw_down_s,
-                        biases: None,
+                        biases: self.sw_down_b.as_ref(),
                     },
                     group_size: self.sw_gs,
                     bits: self.sw_bits,
                     mode: self.sw_mode,
+                    decode_views: self.decode_views.as_ref(),
                 },
                 shared_expert: SharedMlpWeights {
                     gate_proj_w: &self.se_gate_w,
                     gate_proj_s: &self.se_gate_s,
-                    gate_proj_b: None,
+                    gate_proj_b: self.se_gate_b.as_ref(),
                     up_proj_w: &self.se_up_w,
                     up_proj_s: &self.se_up_s,
-                    up_proj_b: None,
+                    up_proj_b: self.se_up_b.as_ref(),
                     down_proj_w: &self.se_down_w,
                     down_proj_s: &self.se_down_s,
-                    down_proj_b: None,
+                    down_proj_b: self.se_down_b.as_ref(),
                     group_size: self.se_gs,
                     bits: self.se_bits,
                     mode: self.se_mode,
@@ -617,7 +872,12 @@ mod imp {
                 }),
                 top_k: self.top_k,
                 norm_topk_prob: self.norm_topk_prob,
-                experts_in_scale_dtype: false,
+                // An affine checkpoint's scales are bf16 and the activations f32, and MLX would
+                // cast the experts' whole stacked scales and biases to f32 on every gather;
+                // meeting the scales' dtype instead casts only the activations. mxfp4/nvfp4
+                // scales are integers, so this changes nothing for them.
+                experts_in_scale_dtype: self.sw_mode == MODE_AFFINE,
+                fused_decode: self.decode_kernels_ready && fused_moe_decode::get(),
                 offload: None,
             }
         }
@@ -713,11 +973,39 @@ mod imp {
         // at load (4→3 is lossy → quality drops; this is the SPEED proof on the
         // 4-bit checkpoint — a production 3-bit needs a bf16 source). Only affine
         // (mxfp4/nvfp4 are fixed E2M1 4-bit). MLP/attn/lm_head all qualify.
-        match requant_target_bits_for(base) {
+        let lin = match requant_target_bits_for(base) {
             Some(tb) if lin.mode == MODE_AFFINE && lin.bits > tb => requant_linear_affine(&lin, tb)
-                .with_context(|| format!("resolve_linear({base}): requant to {tb}-bit")),
-            _ => Ok(lin),
+                .with_context(|| format!("resolve_linear({base}): requant to {tb}-bit"))?,
+            _ => lin,
+        };
+        // The decode kernels read bf16 scales as they are, so a projection they serve keeps them.
+        let kernels_read_scales = crate::native_qmv::serves(&lin.weights());
+        if widen_scales::get() && lin.mode == MODE_AFFINE && !kernels_read_scales {
+            widen_linear_scales(lin)
+                .with_context(|| format!("resolve_linear({base}): widen scales"))
+        } else {
+            Ok(lin)
         }
+    }
+
+    /// Widen an affine projection's scales and biases to f32 (exact), evaluated now so the cast
+    /// is not rebuilt on every decode step.
+    fn widen_linear_scales(lin: ResolvedLinear) -> Result<ResolvedLinear> {
+        let widen = |a: Array| -> Result<Array> {
+            if a.dtype() == mlx_rs::Dtype::Float32 {
+                return Ok(a);
+            }
+            let wide = a
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .context("widen: cast to f32")?;
+            wide.eval().context("widen: eval")?;
+            Ok(wide)
+        };
+        Ok(ResolvedLinear {
+            scales: widen(lin.scales)?,
+            biases: lin.biases.map(widen).transpose()?,
+            ..lin
+        })
     }
 
     /// `LUMEN_NATIVE_REQUANT_BITS` → target affine bits ∈ {2,3} (else None/off).
@@ -911,10 +1199,44 @@ mod imp {
         })
     }
 
+    /// Stack the experts' gate and up tensors along each expert's output axis (axis 1 of
+    /// `[E, out, ..]`), gate rows first. Every output row is packed and scaled on its own, so
+    /// the stacked tensors give each row exactly the bits it had. Evaluated now, so the
+    /// separate tensors are free to go once the caller drops them.
+    fn fuse_expert_gate_up(gate: &ExpertTensors, up: &ExpertTensors) -> Result<ExpertTensors> {
+        let stack = |g: &Array, u: &Array, what: &str| -> Result<Array> {
+            let stacked = mlx_rs::ops::concatenate_axis(&[g, u], 1)
+                .with_context(|| format!("fuse_expert_gate_up: concat {what}"))?;
+            stacked
+                .eval()
+                .with_context(|| format!("fuse_expert_gate_up: eval {what}"))?;
+            Ok(stacked)
+        };
+        let biases = match (&gate.biases, &up.biases) {
+            (Some(g), Some(u)) => Some(stack(g, u, "biases")?),
+            (None, None) => None,
+            _ => {
+                return Err(anyhow!(
+                    "fuse_expert_gate_up: gate/up biases presence mismatch"
+                ));
+            }
+        };
+        Ok(ExpertTensors {
+            weight: stack(&gate.weight, &up.weight, "weight")?,
+            scales: stack(&gate.scales, &up.scales, "scales")?,
+            biases,
+        })
+    }
+
+    /// `stack_requested`: the model is resident (not SSD-offloaded) and a flag wants the experts
+    /// stacked. The layer is stacked if `LUMEN_NATIVE_FUSE_MOE_GATE_UP` asks for it outright or
+    /// the decode kernels can read it (affine 4-bit group 64); an mxfp4 layer would only pay the
+    /// load time.
     fn resolve_moe_layer(
         weights: &NativeWeights,
         config: &NativeModelConfig,
         layer_idx: usize,
+        stack_requested: bool,
     ) -> Result<ResolvedMoeWeights> {
         let cfg = &config.text_config;
         let prefix = format!("language_model.model.layers.{layer_idx}.mlp");
@@ -938,6 +1260,21 @@ mod imp {
         let sw_up_s = require_clone(weights, &format!("{prefix}.switch_mlp.up_proj.scales"))?;
         let sw_down_w = require_clone(weights, &format!("{prefix}.switch_mlp.down_proj.weight"))?;
         let sw_down_s = require_clone(weights, &format!("{prefix}.switch_mlp.down_proj.scales"))?;
+        let bias_of = |name: String| weights.get(&name).cloned();
+        let sw_gate_b = bias_of(format!("{prefix}.switch_mlp.gate_proj.biases"));
+        let sw_up_b = bias_of(format!("{prefix}.switch_mlp.up_proj.biases"));
+        let sw_down_b = bias_of(format!("{prefix}.switch_mlp.down_proj.biases"));
+        // MLX refuses an affine gather without biases ("Biases must be provided for affine
+        // quantization"), and it says so at the first prefill as a bare status code.
+        if sw_mode == MODE_AFFINE
+            && [&sw_gate_b, &sw_up_b, &sw_down_b]
+                .iter()
+                .any(|b| b.is_none())
+        {
+            return Err(anyhow!(
+                "{prefix}.switch_mlp is affine-quantized but ships no .biases next to its scales"
+            ));
+        }
 
         let (se_gs, se_bits, se_mode) =
             quant_params_resolve(config, &format!("{prefix}.shared_expert.gate_proj"));
@@ -951,6 +1288,51 @@ mod imp {
             require_clone(weights, &format!("{prefix}.shared_expert.down_proj.weight"))?;
         let se_down_s =
             require_clone(weights, &format!("{prefix}.shared_expert.down_proj.scales"))?;
+        let se_gate_b = bias_of(format!("{prefix}.shared_expert.gate_proj.biases"));
+        let se_up_b = bias_of(format!("{prefix}.shared_expert.up_proj.biases"));
+        let se_down_b = bias_of(format!("{prefix}.shared_expert.down_proj.biases"));
+        if se_mode == MODE_AFFINE
+            && [&se_gate_b, &se_up_b, &se_down_b]
+                .iter()
+                .any(|b| b.is_none())
+        {
+            return Err(anyhow!(
+                "{prefix}.shared_expert is affine-quantized but ships no .biases next to its scales"
+            ));
+        }
+
+        let sw_gate = ExpertTensors {
+            weight: sw_gate_w,
+            scales: sw_gate_s,
+            biases: sw_gate_b,
+        };
+        let sw_up = ExpertTensors {
+            weight: sw_up_w,
+            scales: sw_up_s,
+            biases: sw_up_b,
+        };
+        let stack = stack_requested
+            && (fuse_moe_gate_up::get() || (sw_mode == MODE_AFFINE && sw_bits == 4 && sw_gs == 64));
+        let sw_gate_up = if stack {
+            ResolvedGateUp::Fused(fuse_expert_gate_up(&sw_gate, &sw_up)?)
+        } else {
+            ResolvedGateUp::Split {
+                gate: sw_gate,
+                up: sw_up,
+            }
+        };
+        let decode_views = match &sw_gate_up {
+            ResolvedGateUp::Fused(gate_up) => ExpertViews::new(
+                &gate_up.view(),
+                &SwitchExpertWeights {
+                    weight: &sw_down_w,
+                    scales: &sw_down_s,
+                    biases: sw_down_b.as_ref(),
+                },
+            )
+            .with_context(|| format!("{prefix}: expert views for the decode kernels"))?,
+            ResolvedGateUp::Split { .. } => None,
+        };
 
         Ok(ResolvedMoeWeights {
             gate_w,
@@ -958,12 +1340,10 @@ mod imp {
             gate_b,
             gate_gs,
             gate_bits,
-            sw_gate_w,
-            sw_gate_s,
-            sw_up_w,
-            sw_up_s,
+            sw_gate_up,
             sw_down_w,
             sw_down_s,
+            sw_down_b,
             sw_gs,
             sw_bits,
             sw_mode,
@@ -973,6 +1353,9 @@ mod imp {
             se_up_s,
             se_down_w,
             se_down_s,
+            se_gate_b,
+            se_up_b,
+            se_down_b,
             se_gs,
             se_bits,
             se_mode,
@@ -983,7 +1366,245 @@ mod imp {
             sg_bits,
             top_k: cfg.num_experts_per_tok as i32,
             norm_topk_prob: cfg.norm_topk_prob,
+            decode_kernels_ready: stack,
+            decode_views,
         })
+    }
+
+    /// An affine checkpoint carries a `.biases` next to every `.scales`, and MLX refuses an
+    /// affine `gather_qmm` without them. The loader used to read only `.weight` and `.scales`
+    /// and hand `biases: None` to every expert, so an affine MoE died at its first prefill with
+    /// a bare status code (`Qwen3.6-35B-A3B-MTPLX-Speed`).
+    #[cfg(test)]
+    mod affine_moe_loader_tests {
+        use super::*;
+
+        const PREFIX: &str = "language_model.model.layers.0.mlp";
+
+        fn config(mode: &str) -> NativeModelConfig {
+            let mut raw: serde_json::Value =
+                serde_json::from_str(include_str!("../tests/fixtures/qwen3_5_moe_config.json"))
+                    .expect("fixture parses");
+            raw["quantization_config"] =
+                serde_json::json!({ "mode": mode, "bits": 4, "group_size": 64 });
+            serde_json::from_value(raw).expect("config parses")
+        }
+
+        /// One element per tensor: the loader clones handles and never reads a value. Biases are
+        /// present only for the groups named in `biases_for`.
+        fn bag(biases_for: &[&str]) -> NativeWeights {
+            let mut tensors = HashMap::new();
+            let mut put = |name: String| {
+                tensors.insert(name, Array::from_slice(&[0.0f32], &[1]));
+            };
+            for gate in ["gate", "shared_expert_gate"] {
+                for part in ["weight", "scales", "biases"] {
+                    put(format!("{PREFIX}.{gate}.{part}"));
+                }
+            }
+            for group in ["switch_mlp", "shared_expert"] {
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    for part in ["weight", "scales"] {
+                        put(format!("{PREFIX}.{group}.{proj}.{part}"));
+                    }
+                    if biases_for.contains(&group) {
+                        put(format!("{PREFIX}.{group}.{proj}.biases"));
+                    }
+                }
+            }
+            NativeWeights { tensors }
+        }
+
+        #[test]
+        fn affine_experts_keep_their_biases_and_meet_the_scales_dtype() {
+            let weights = resolve_moe_layer(
+                &bag(&["switch_mlp", "shared_expert"]),
+                &config("affine"),
+                0,
+                false,
+            )
+            .expect("an affine layer with biases resolves");
+            let view = weights.view();
+            let GateUpWeights::Split { gate, up } = &view.switch_glu.gate_up else {
+                panic!("an unfused layer keeps gate and up apart");
+            };
+            for proj in [gate, up, &view.switch_glu.down_proj] {
+                assert!(
+                    proj.biases.is_some(),
+                    "an affine gather needs the experts' biases"
+                );
+            }
+            assert!(view.shared_expert.gate_proj_b.is_some());
+            assert!(view.shared_expert.up_proj_b.is_some());
+            assert!(view.shared_expert.down_proj_b.is_some());
+            assert!(
+                view.experts_in_scale_dtype,
+                "bf16 scales against f32 activations would be cast whole on every gather"
+            );
+        }
+
+        #[test]
+        fn affine_experts_without_biases_fail_at_load_not_at_the_first_prefill() {
+            for (have, missing) in [
+                (&["shared_expert"][..], "switch_mlp"),
+                (&["switch_mlp"][..], "shared_expert"),
+            ] {
+                let err = resolve_moe_layer(&bag(have), &config("affine"), 0, false)
+                    .err()
+                    .expect("a layer without biases must be rejected");
+                assert!(
+                    err.to_string().contains(&format!(
+                        "{missing} is affine-quantized but ships no .biases"
+                    )),
+                    "got: {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn mxfp4_experts_carry_no_biases_and_keep_the_activation_dtype() {
+            let weights = resolve_moe_layer(&bag(&[]), &config("mxfp4"), 0, false)
+                .expect("an mxfp4 layer needs no biases");
+            let view = weights.view();
+            let GateUpWeights::Split { up, .. } = &view.switch_glu.gate_up else {
+                panic!("an unfused layer keeps gate and up apart");
+            };
+            assert!(up.biases.is_none());
+            assert!(view.shared_expert.up_proj_b.is_none());
+            assert!(!view.experts_in_scale_dtype);
+        }
+
+        /// A layer whose experts have real `[E, out, ..]` shapes, so they can be stacked.
+        fn stackable_bag(mode: &str, group: i32) -> NativeWeights {
+            const E: i32 = 3;
+            const HIDDEN: i32 = 64;
+            const INTER: i32 = 64;
+            let affine = mode == "affine";
+            let mut weights = bag(if affine {
+                &["switch_mlp", "shared_expert"]
+            } else {
+                &[]
+            });
+            for (proj, out, inp) in [
+                ("gate_proj", INTER, HIDDEN),
+                ("up_proj", INTER, HIDDEN),
+                ("down_proj", HIDDEN, INTER),
+            ] {
+                let values: Vec<f32> = (0..E * out * inp)
+                    .map(|i| ((i * 37 + out * 11) % 101) as f32 / 50.0 - 1.0)
+                    .collect();
+                let w = Array::from_slice(&values, &[E, out, inp])
+                    .as_dtype(mlx_rs::Dtype::Bfloat16)
+                    .expect("bf16");
+                let (wq, sc, bi) =
+                    quantize_with_mode(&w, group, 4, if affine { MODE_AFFINE } else { MODE_MXFP4 })
+                        .expect("quantize");
+                let base = format!("{PREFIX}.switch_mlp.{proj}");
+                weights.tensors.insert(format!("{base}.weight"), wq);
+                weights.tensors.insert(format!("{base}.scales"), sc);
+                if let Some(bi) = bi {
+                    weights.tensors.insert(format!("{base}.biases"), bi);
+                }
+            }
+            weights
+        }
+
+        fn config_with_group(mode: &str, group: usize) -> NativeModelConfig {
+            let mut cfg = config(mode);
+            if let Some(q) = cfg.quantization_config.as_mut() {
+                q.group_size = group;
+            }
+            cfg
+        }
+
+        /// The stacked tensors hold the gate rows then the up rows of every expert, for
+        /// both quantization modes.
+        #[test]
+        fn stacked_experts_are_the_gate_rows_then_the_up_rows() {
+            for mode in ["affine", "mxfp4"] {
+                let bag = stackable_bag(mode, 32);
+                let cfg = config_with_group(mode, 32);
+                let split = resolve_moe_layer(&bag, &cfg, 0, false).expect("split resolves");
+                let ResolvedGateUp::Split { gate, up } = &split.sw_gate_up else {
+                    panic!("{mode}: stacked without being asked");
+                };
+                let both = &fuse_expert_gate_up(gate, up).expect("stack");
+                // Per expert `e`: the stacked rows are `gate[e]` followed by `up[e]`.
+                let expert_rows = |a: &Array, e: usize| -> Vec<u8> {
+                    let per_expert = a.shape()[1] as usize * a.shape()[2] as usize;
+                    let all = a.as_dtype(mlx_rs::Dtype::Float32).expect("f32");
+                    all.eval().expect("eval");
+                    all.as_slice::<f32>()[e * per_expert..(e + 1) * per_expert]
+                        .iter()
+                        .flat_map(|v| v.to_bits().to_le_bytes())
+                        .collect()
+                };
+                let mut tensors = vec![
+                    (&both.weight, &gate.weight, &up.weight),
+                    (&both.scales, &gate.scales, &up.scales),
+                ];
+                if let (Some(b), Some(g), Some(u)) = (&both.biases, &gate.biases, &up.biases) {
+                    tensors.push((b, g, u));
+                }
+                for (stacked, g, u) in tensors {
+                    assert_eq!(stacked.shape()[1], g.shape()[1] + u.shape()[1], "{mode}");
+                    for e in 0..stacked.shape()[0] as usize {
+                        let expect: Vec<u8> = [expert_rows(g, e), expert_rows(u, e)].concat();
+                        assert_eq!(
+                            expert_rows(stacked, e),
+                            expect,
+                            "{mode}: expert {e} is not [gate rows; up rows]"
+                        );
+                    }
+                }
+                assert_eq!(both.biases.is_some(), mode == "affine");
+            }
+        }
+
+        /// A layer is stacked only when something reads the stack: the decode kernels read affine
+        /// 4-bit group-64 experts, so an mxfp4 or group-32 layer would only pay the load time.
+        #[test]
+        fn only_layers_the_decode_kernels_can_read_are_stacked() {
+            // Without the stack-everything flag the equivalence matrix may turn on.
+            fuse_moe_gate_up::with(false, || {
+                let stacked = |mode: &str, group: i32, requested: bool| {
+                    let resolved = resolve_moe_layer(
+                        &stackable_bag(mode, group),
+                        &config_with_group(mode, group as usize),
+                        0,
+                        requested,
+                    )
+                    .expect("resolves");
+                    let is_stack = matches!(resolved.sw_gate_up, ResolvedGateUp::Fused(_));
+                    assert_eq!(resolved.decode_kernels_ready, is_stack, "{mode} g{group}");
+                    is_stack
+                };
+                assert!(
+                    stacked("affine", 64, true),
+                    "affine 4-bit group 64 is what the kernels read"
+                );
+                assert!(!stacked("affine", 64, false), "nothing asked for a stack");
+                assert!(
+                    !stacked("affine", 32, true),
+                    "the kernels are written for group 64"
+                );
+                assert!(
+                    !stacked("mxfp4", 32, true),
+                    "the kernels read affine experts"
+                );
+            });
+        }
+
+        #[test]
+        fn dropping_the_separate_experts_leaves_the_stacked_ones() {
+            let mut bag = stackable_bag("mxfp4", 32);
+            let down = format!("{PREFIX}.switch_mlp.down_proj.weight");
+            bag.release_expert_gate_up();
+            assert!(bag.keys().all(|k| !k.contains("switch_mlp.gate_proj")));
+            assert!(bag.keys().all(|k| !k.contains("switch_mlp.up_proj")));
+            assert!(bag.get(&down).is_some(), "down_proj must stay");
+            assert!(bag.keys().any(|k| k.contains("shared_expert.gate_proj")));
+        }
     }
 
     // ───────────────────────── model handle ─────────────────────────
@@ -1156,6 +1777,127 @@ mod imp {
             .unwrap_or(false)
     }
 
+    /// Whether any `LUMEN_PROBE_ABLATE` stage is set (its runs never stop at EOS).
+    fn probe_ablate_set() -> bool {
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            std::env::var("LUMEN_PROBE_ABLATE")
+                .is_ok_and(|v| v.split(',').any(|p| !p.trim().is_empty()))
+        })
+    }
+
+    /// Stages `LUMEN_PROBE_ABLATE` removes from every single-token (decode) forward.
+    #[derive(Clone, Copy, Default)]
+    struct Ablate {
+        gdn: bool,
+        attn: bool,
+        moe: bool,
+        lm_head: bool,
+        /// Inside a linear-attention block: the conv + silu + split + q/k norm chain, replaced by
+        /// plain slices of the in-projection.
+        gdn_conv: bool,
+        /// `sigmoid(b)` and `compute_g`, replaced by the raw `b` and `a` projections.
+        gdn_gates: bool,
+        /// The gated-delta recurrence kernel, replaced by `v` and the unchanged state.
+        gdn_ssm: bool,
+        /// The gated RMS norm, replaced by `out * z`.
+        gdn_norm: bool,
+        /// The four in-projections and the out-projection, replaced by the layer input (or the
+        /// gated output) cut or tiled to each one's width (a copy for the two wider than it).
+        gdn_proj: bool,
+        /// Inside a full-attention block: the q/k/v projections, replaced by the layer input cut
+        /// or tiled to each projection's width (at most one copy for q).
+        attn_proj: bool,
+        /// The per-head q and k RMS norms, replaced by the unnormalised views.
+        attn_norm: bool,
+        /// RoPE on q and k, replaced by the unrotated views.
+        attn_rope: bool,
+        /// The KV cache append: attention reads only the new token's own K and V.
+        attn_cache: bool,
+        /// The SDPA kernel, replaced by two tiny adds that still read the last cached K and V (so
+        /// the cache append is not pruned from the graph).
+        attn_sdpa: bool,
+        /// `sigmoid(gate) * attention`, replaced by the attention output.
+        attn_gate: bool,
+        /// The output projection, replaced by zero times a view of the first `hidden` gated
+        /// columns (one elementwise op; unzeroed, the model hits EOS within a few tokens).
+        attn_oproj: bool,
+    }
+
+    /// PROBE (timing only, NOT correct — `LUMEN_PROBE_ABLATE=gdn,attn,moe,lm_head`, any subset):
+    /// replaces a stage of each decode step with a stand-in that costs one elementwise op, so the
+    /// step time that remains is the real pipelined decode without that stage. The linear-attention
+    /// block (`gdn`), the full-attention block (`attn`) and the MoE block (`moe`) become
+    /// `0 * their input` (the layer's norms stay, as does everything that feeds the next stage);
+    /// `lm_head` becomes a broadcast of the normed hidden state's sum over the vocabulary, which
+    /// still depends on every layer. The output is garbage and prefill is untouched. The drop in
+    /// ms/token against the unablated run is that stage's whole cost in the pipeline: bytes,
+    /// dispatches and their gaps together, which a per-stage `eval` timing cannot show.
+    ///
+    /// Inside the linear-attention block, `gdn_conv`, `gdn_gates`, `gdn_ssm` and `gdn_norm` remove
+    /// one sub-stage each. Their stand-ins only slice or multiply, so removing one does not prune
+    /// the work that feeds another; to price the recurrence kernel alone, remove `gdn_conv` and
+    /// `gdn_gates` too (their stand-ins are views) and compare with those two alone.
+    ///
+    /// Inside the full-attention block, `attn_proj`, `attn_norm`, `attn_rope`, `attn_cache`,
+    /// `attn_sdpa`, `attn_gate` and `attn_oproj` do the same for the seven stages between the
+    /// layer input and output. Each stand-in is a view, one tiny elementwise op, or (q's tiled
+    /// input under `attn_proj`) one copy, so a stage's drop is slightly under its true cost.
+    /// `attn_cache` also shortens what the SDPA reads to one key, and `attn_sdpa` keeps the cache
+    /// append alive through two adds on the last cached key and value, so price the SDPA kernel
+    /// with `attn_sdpa` and the append with `attn_cache` minus the SDPA's length-dependent part.
+    fn probe_ablate() -> Ablate {
+        static CELL: std::sync::OnceLock<Ablate> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            let v = std::env::var("LUMEN_PROBE_ABLATE").unwrap_or_default();
+            let has = |k: &str| v.split(',').any(|p| p.trim() == k);
+            Ablate {
+                gdn: has("gdn"),
+                attn: has("attn"),
+                moe: has("moe"),
+                lm_head: has("lm_head"),
+                gdn_conv: has("gdn_conv"),
+                gdn_gates: has("gdn_gates"),
+                gdn_ssm: has("gdn_ssm"),
+                gdn_norm: has("gdn_norm"),
+                gdn_proj: has("gdn_proj"),
+                attn_proj: has("attn_proj"),
+                attn_norm: has("attn_norm"),
+                attn_rope: has("attn_rope"),
+                attn_cache: has("attn_cache"),
+                attn_sdpa: has("attn_sdpa"),
+                attn_gate: has("attn_gate"),
+                attn_oproj: has("attn_oproj"),
+            }
+        })
+    }
+
+    /// The `Ablate` for a forward of `tokens` tokens: decode steps only, like every stage probe.
+    fn probe_ablate_for(tokens: i32) -> Ablate {
+        if tokens == 1 {
+            probe_ablate()
+        } else {
+            Ablate::default()
+        }
+    }
+
+    /// Stand-in for a projection's output under `attn_proj`: the input `[B, L, hidden]` tiled
+    /// along the last axis and cut to `width` columns. A cut is a view; a tile is one copy.
+    fn probe_projection_stand_in(x: &Array, width: i32) -> Result<Array> {
+        use mlx_rs::ops::indexing::TryIndexOp;
+        let hidden = x.shape()[x.ndim() - 1];
+        let tiled = if width > hidden {
+            let copies = vec![x; ((width + hidden - 1) / hidden) as usize];
+            mlx_rs::ops::concatenate_axis(&copies, -1)
+                .context("probe attn_proj: tile the layer input")?
+        } else {
+            x.clone()
+        };
+        tiled
+            .try_index((.., .., 0..width))
+            .context("probe attn_proj: cut the layer input")
+    }
+
     /// PROBE (timing only — `LUMEN_PROBE_SKIP_INPROJ_SMALL=1`, requires
     /// LINCOMPUTE skip too): gate-0 of lever A (in_proj concat). Skips the 3
     /// SMALL in_proj matmuls (z/b/a) and keeps only in_proj_qkv. Combined with
@@ -1168,21 +1910,27 @@ mod imp {
             .unwrap_or(false)
     }
 
-    // M4: fuse the decode (s=1) linear-attn input-side chain (conv1d + silu +
-    // split + q/k RMSNorm) into ONE Metal kernel (`inproj_tail_fused`), cutting
-    // ~5 launches/layer → 1 (the launch-latency lever; gate-0 measured the
-    // non-matmul chain at ~10ms/step). `LUMEN_NATIVE_FUSE_LINATTN_IN=1`,
-    // default OFF. Only valid on the scale-fused alloc-reuse path (it consumes
+    // Fuse everything a decode or verify linear-attention layer does between its in-projections
+    // and the recurrence into ONE Metal kernel (`linattn_prework_fused`): the conv window over the
+    // cached state and the new inputs, SiLU, the q/k/v split, the per-head q/k RMSNorm, the next
+    // conv state, and the two gates. Only valid on the scale-fused alloc-reuse path (it consumes
     // the pre-scaled rms_norm weights `scaled_w_q_dn`/`scaled_w_k_dn`).
     lumen_flags::flag! {
-        /// Fused input-side linear-attn kernel (conv+silu+q/k-norm). Built to
-        /// completion, output bit-identical, measured 0 speedup — MLX async
-        /// already overlaps the small launches. Kept as a reusable artifact;
-        /// default OFF. (Parse note: previously only `=1` enabled this; the
-        /// registry's uniform rule now accepts any non-`"0"` value.)
+        /// One kernel for the linear-attention prework of a decode token or an MTP verify: eight
+        /// dependent dispatches (concat, slice, conv1d, SiLU, two RMS norms, sigmoid, compiled
+        /// `compute_g`) become one.
+        ///
+        /// Bit-identical to the composed ops in f32, the dtype the model runs this in: the kernel
+        /// repeats MLX's own sums in MLX's own order (its `Sigmoid` for SiLU, `rms_single_row`
+        /// for the norm, `precise::rsqrt`, `LogAddExp` for the softplus of `compute_g`), and the
+        /// tests compare bits at the A3B shape, one token and several. M3 Max, ABBA over four runs
+        /// each, generated text byte-identical with the flag on and off: Qwen3.6-35B-A3B affine
+        /// 10.5 -> 10.1 ms/token, A3B mxfp4 11.2 -> 10.4, Qwen3.5-9B 27.9 -> 27.3, Qwen3.6-27B
+        /// 67 -> 63. Forwards of up to [`PREWORK_MAX_TOKENS`] tokens take it (not prefill, not
+        /// under the timing probes). Default on; `=0` restores the composed ops.
         pub(crate) fuse_linattn_in {
             env: "LUMEN_NATIVE_FUSE_LINATTN_IN",
-            default: false,
+            default: true,
             kind: Optimization,
         }
     }
@@ -1190,6 +1938,80 @@ mod imp {
     fn fuse_linattn_in_enabled() -> bool {
         fuse_linattn_in::get()
     }
+
+    lumen_flags::flag! {
+        /// Greedy MTP drafts read a 4-bit copy of an lm_head stored at more bits. A draft reads
+        /// the whole lm_head for one row, so at 8 bits it reads twice the bytes it needs: the
+        /// head's argmax only proposes, and the trunk's verify, which keeps the stored lm_head,
+        /// decides every token. Output-identical; acceptance is the only thing a coarser head
+        /// can cost. Costs the copy's memory (half the stored lm_head) while MTP is on.
+        ///
+        /// Default off: it pays only when cycles draft two or more. Qwen3.8-27B-MTPLX (8-bit
+        /// lm_head, +0.72 GB), M3 Max, greedy, text identical: in-process cycles at one draft
+        /// 83.7 -> 83.0 ms (one draft runs while the host builds the verify graph, so its lm_head
+        /// is hidden), two 107.6 -> 102.5, three 131.5 -> 125.1, acceptance unchanged on that
+        /// prompt; server chat at two drafts 44.3 -> 43.3 ms/token with acceptance 0.665 ->
+        /// 0.637, but with the draft count chosen per cycle (the default) 44.6 -> 45.3, inside
+        /// the runs' spread.
+        pub(crate) mtp_coarse_head {
+            env: "LUMEN_MTP_COARSE_HEAD",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
+    /// A 4-bit copy of `lm` at its group size, built a slab of rows at a time so the
+    /// dequantized weights never exist whole. `None` when `lm` is already at 4 bits or fewer, or
+    /// not affine.
+    fn coarse_lm_head(lm: &ResolvedLinear) -> Result<Option<ResolvedLinear>> {
+        use mlx_rs::ops::indexing::TryIndexOp;
+        const BITS: i32 = 4;
+        // A bf16 slab of this many rows is what building the copy adds to the peak.
+        const SLAB: i32 = 16384;
+        if lm.bits <= BITS || lm.mode != MODE_AFFINE {
+            return Ok(None);
+        }
+        let rows = lm.weight.shape()[0];
+        let (mut ws, mut ss, mut bs) = (Vec::new(), Vec::new(), Vec::new());
+        for start in (0..rows).step_by(SLAB as usize) {
+            let end = (start + SLAB).min(rows);
+            let slab = |a: &Array| a.try_index(start..end);
+            let biases = lm.biases.as_ref().map(slab).transpose()?;
+            let w = dequantize_with_mode(
+                &slab(&lm.weight)?,
+                &slab(&lm.scales)?,
+                biases.as_ref(),
+                lm.group_size,
+                lm.bits,
+                lm.mode,
+            )
+            .and_then(|w| Ok(w.as_dtype(mlx_rs::Dtype::Bfloat16)?))
+            .context("coarse lm_head: dequantize a slab")?;
+            let (w, s, b) = quantize_with_mode(&w, lm.group_size, BITS, MODE_AFFINE)
+                .context("coarse lm_head: quantize a slab")?;
+            let b = b.ok_or_else(|| anyhow!("coarse lm_head: affine quantize gave no biases"))?;
+            mlx_rs::transforms::eval([&w, &s, &b]).context("coarse lm_head: evaluate a slab")?;
+            ws.push(w);
+            ss.push(s);
+            bs.push(b);
+        }
+        let whole = |parts: &[Array]| mlx_rs::ops::concatenate_axis(parts, 0);
+        let (weight, scales, biases) = (whole(&ws)?, whole(&ss)?, whole(&bs)?);
+        mlx_rs::transforms::eval([&weight, &scales, &biases])
+            .context("coarse lm_head: join the slabs")?;
+        Ok(Some(ResolvedLinear {
+            weight,
+            scales,
+            biases: Some(biases),
+            group_size: lm.group_size,
+            bits: BITS,
+            mode: MODE_AFFINE,
+        }))
+    }
+
+    /// The widest forward the fused prework takes: an MTP verify of the deepest exact draft. The
+    /// kernel is measured at these widths only; a prefill chunk keeps the composed ops.
+    const PREWORK_MAX_TOKENS: i32 = crate::mtp_depth::MAX_EXACT_DRAFTS as i32 + 1;
 
     /// Output of one MTP speculative step on the Qwen3.5/3.6 trunk.
     ///
@@ -1206,13 +2028,115 @@ mod imp {
         pub committed: Vec<u32>,
         pub n_attempted: usize,
         pub n_accepted: usize,
-        /// 1-forward path only: the trunk pre-final-norm hidden at verify
-        /// position `n_accepted` (`[1, 1, hidden]`), i.e. the predecessor
-        /// hidden of the correction token. The caller (runner) threads this
-        /// back into the next `mtp_step` as `carried_hidden` so the drafter
-        /// can seed without a separate Step-A forward. `None` on the 2-forward
-        /// path (which re-seeds via Step A every cycle).
-        pub carried_hidden: Option<Array>,
+    }
+
+    /// What the MTP head has seen of one sequence. Its attention cache holds one entry per
+    /// committed pair (trunk hidden `h_j`, token `x_{j+1}`) for `j` in `start .. start +
+    /// kv.offset()`; `pending` holds the trunk hidden rows after those, whose pairs enter with
+    /// the next fold. The 1-forward cycle folds them together with its lead token (the fold's
+    /// last row is the first draft), drafts the rest on a tail it then cuts off, and leaves the
+    /// verify's accepted rows pending; a prefill folds its prompt chunk by chunk.
+    ///
+    /// Positions only have to line up: a fold that does not continue the cache restarts it
+    /// there, which costs acceptance and nothing else.
+    #[derive(Default)]
+    pub struct MtpHistory {
+        pub(crate) kv: NativeKvCache,
+        start: usize,
+        pending: Option<MtpPending>,
+    }
+
+    /// Trunk hidden rows of positions `pos .. pos + n` (`rows`, `[1, n, hidden]`) and the tokens
+    /// at `pos + 1 .. pos + n`: the next token of every row but the last, which is the next lead.
+    #[derive(Clone)]
+    pub(crate) struct MtpPending {
+        rows: Array,
+        tokens: Vec<u32>,
+        pos: usize,
+    }
+
+    impl MtpPending {
+        /// The position of the token after the last row.
+        fn end(&self) -> usize {
+            self.pos + self.tokens.len() + 1
+        }
+
+        /// The last row alone.
+        fn last(self) -> Result<Self> {
+            let n = self.tokens.len() as i32;
+            let rows = if n > 0 {
+                self.rows
+                    .take_axis(Array::from_slice(&[n], &[1]), 1)
+                    .context("mtp history: last pending row")?
+            } else {
+                self.rows
+            };
+            Ok(Self {
+                rows,
+                tokens: Vec::new(),
+                pos: self.pos + n as usize,
+            })
+        }
+    }
+
+    /// Where an [`MtpHistory`] stood, to return to with a sequence's rollback point.
+    #[derive(Clone)]
+    pub(crate) struct MtpMark {
+        start: usize,
+        folded: usize,
+        pending: Option<MtpPending>,
+    }
+
+    impl MtpHistory {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// The position whose pair the cache takes next.
+        fn frontier(&self) -> usize {
+            self.start + self.kv.offset()
+        }
+
+        pub(crate) fn clear(&mut self) {
+            self.kv.clear();
+            self.start = 0;
+            self.pending = None;
+        }
+
+        /// Make the pair of position `pos` the cache's next entry, emptying it if it is not.
+        fn restart_at(&mut self, pos: usize) {
+            if self.frontier() != pos || self.kv.offset() == 0 {
+                self.kv.clear();
+                self.start = pos;
+            }
+        }
+
+        /// The pending rows whose last is the predecessor of the token at `next`, with the cache
+        /// made to continue at their first; `None` if what is pending does not end there.
+        fn take_pending_for(&mut self, next: usize) -> Option<MtpPending> {
+            let pending = self.pending.take().filter(|p| p.end() == next)?;
+            self.restart_at(pending.pos);
+            Some(pending)
+        }
+
+        pub(crate) fn mark(&self) -> MtpMark {
+            MtpMark {
+                start: self.start,
+                folded: self.kv.offset(),
+                pending: self.pending.clone(),
+            }
+        }
+
+        /// Back to `mark`: the cache keeps what it held then, if it still holds it.
+        pub(crate) fn restore(&mut self, mark: &MtpMark) -> Result<()> {
+            if self.start != mark.start || self.kv.offset() < mark.folded {
+                self.clear();
+                return Ok(());
+            }
+            self.kv.truncate_to(mark.folded)?;
+            self.pending = mark.pending.clone();
+            Ok(())
+        }
     }
 
     pub struct NativeQwen3_5MoeModel {
@@ -1250,6 +2174,9 @@ mod imp {
         // `forward()` consuming (embeds, h_pre, mtp_kv, ...) — see
         // `qwen3_5_mtp::Qwen35MtpBlock`.
         mtp: Option<Qwen35MtpBlock>,
+        // The lm_head greedy MTP drafts read when it is not the trunk's: a 4-bit copy of a wider
+        // one (`mtp_coarse_head`). Built by `try_enable_mtp`.
+        mtp_draft_lm_head: Option<ResolvedLinear>,
         // Last-hidden capture slot — written by `forward_impl` at the end of
         // the layer loop (post-MLP residual, pre-final-norm) when
         // `mtp_capture_enabled` is set. Read once per `mtp_step` via
@@ -1404,6 +2331,11 @@ mod imp {
 
             let is_linear_per_layer = config.text_config.is_linear_per_layer();
 
+            // The bank serves gate and up as separate pools and never loads the stacked
+            // tensors, so a stacked copy would only be built to sit unused.
+            let fuse_experts = (fuse_moe_gate_up::get() || fused_moe_decode::get())
+                && expert_budget_bytes.is_none();
+
             // D1 — resolve per-layer weight handles once.
             let num_layers = config.text_config.num_hidden_layers;
             let mut layer_weights = Vec::with_capacity(num_layers);
@@ -1416,9 +2348,12 @@ mod imp {
                     AttnLayerWeights::Full(resolve_full_attn_layer(&weights, &config, layer_idx)?)
                 };
                 let mlp = match mlp_kind {
-                    MlpKind::Moe => {
-                        MlpWeights::Moe(resolve_moe_layer(&weights, &config, layer_idx)?)
-                    }
+                    MlpKind::Moe => MlpWeights::Moe(resolve_moe_layer(
+                        &weights,
+                        &config,
+                        layer_idx,
+                        fuse_experts,
+                    )?),
                     MlpKind::Dense => {
                         MlpWeights::Dense(resolve_dense_mlp_layer(&weights, &config, layer_idx)?)
                     }
@@ -1461,6 +2396,21 @@ mod imp {
                 None => None,
             };
 
+            if widen_scales::get() {
+                weights.release_scales_and_biases();
+            }
+            let stacked_any = layer_weights.iter().any(|l| {
+                matches!(
+                    &l.mlp,
+                    MlpWeights::Moe(m) if matches!(m.sw_gate_up, ResolvedGateUp::Fused(_))
+                )
+            });
+            if stacked_any {
+                weights.release_expert_gate_up();
+                // The sources of each stack were read into buffers that are now idle.
+                let _ = crate::metal_memory::clear_cache();
+            }
+
             Ok(Self {
                 config,
                 weights,
@@ -1470,6 +2420,7 @@ mod imp {
                 vision,
                 offload,
                 mtp: None,
+                mtp_draft_lm_head: None,
                 mtp_capture_slot: Mutex::new(None),
                 mtp_capture_enabled: AtomicBool::new(false),
                 ssm_capture_slot: Mutex::new(Vec::new()),
@@ -1518,6 +2469,11 @@ mod imp {
         /// Same shape and same preference order as the Gemma 4 path, which had
         /// already met this and grown the fallback.
         pub fn eos_tokens(&self) -> &[u32] {
+            // A timing ablation (`LUMEN_PROBE_ABLATE`) turns the output into garbage, which can
+            // reach EOS within a few tokens; its benchmark needs every requested token.
+            if probe_ablate_set() {
+                return &[];
+            }
             let top = &self.config.eos_token_ids;
             if !top.is_empty() {
                 top
@@ -1627,16 +2583,32 @@ mod imp {
             positions: RopePlan<'_>,
         ) -> Result<Array> {
             let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32, positions)?;
+            let ablate = probe_ablate_for(p.l);
             // (5) Append to KV cache and fetch full history. Under bf16 storage
             // the cast happens here, after k_norm and RoPE, so the cache holds
             // exactly what attention will read.
             let k_store = Self::to_kv_dtype(&p.k_rope, "layer_full_attn_forward: k")?;
             let v_store = Self::to_kv_dtype(&p.v_t, "layer_full_attn_forward: v")?;
-            let (k_full, v_full) = cache.update_and_fetch(&k_store, &v_store)?;
+            let (k_full, v_full) = if ablate.attn_cache {
+                (k_store, v_store)
+            } else {
+                cache.update_and_fetch(&k_store, &v_store)?
+            };
             // (6) GQA SDPA. mlx-rs handles the head broadcast internally.
             let q = Self::to_kv_dtype(&p.q_rope, "layer_full_attn_forward: q")?;
             let kv_len = k_full.shape()[2] as usize;
-            let attn_out = if !causal
+            let attn_out = if ablate.attn_sdpa {
+                use mlx_rs::ops::indexing::TryIndexOp;
+                let last = kv_len as i32 - 1;
+                let k_last = k_full
+                    .try_index((.., 0..1, last..(last + 1), ..))
+                    .context("probe attn_sdpa: last key")?;
+                let v_last = v_full
+                    .try_index((.., 0..1, last..(last + 1), ..))
+                    .context("probe attn_sdpa: last value")?;
+                mlx_rs::ops::add(&q, &mlx_rs::ops::add(&k_last, &v_last)?)
+                    .context("probe attn_sdpa: stand-in")?
+            } else if !causal
                 && p.l == 1
                 && kv_len >= SPARSE_DECODE_MIN_KEYS
                 && sparse_decode::get()
@@ -1821,6 +2793,9 @@ mod imp {
             offset: i32,
             positions: RopePlan<'_>,
         ) -> Result<(Array, Array)> {
+            if probe_ablate_for(queries_t.shape()[2]).attn_rope {
+                return Ok((queries_t.clone(), k_t.clone()));
+            }
             // Explicit positions mean MRoPE: an image block's tokens share a
             // `t` and spread over an `h`/`w` grid, which no scalar offset can
             // express. Text-only prompts pass `None` and keep the fused kernel
@@ -1901,12 +2876,28 @@ mod imp {
             // (1) q/k/v projections. MXFP4 matmul output follows activation
             //     dtype — pass f32 in, get f32 out, but cast unconditionally
             //     to keep the contract resilient if MLX changes defaults.
-            let q_proj_raw = lw.q_proj.apply(x)?;
-            let q_proj = Self::to_f32(q_proj_raw, &format!("layer{layer_idx}.q_proj"))?;
-            let k_proj_raw = lw.k_proj.apply(x)?;
-            let k_proj = Self::to_f32(k_proj_raw, &format!("layer{layer_idx}.k_proj"))?;
-            let v_proj_raw = lw.v_proj.apply(x)?;
-            let v_proj = Self::to_f32(v_proj_raw, &format!("layer{layer_idx}.v_proj"))?;
+            let ablate = probe_ablate_for(l);
+            let (q_proj, k_proj, v_proj) = if ablate.attn_proj {
+                (
+                    probe_projection_stand_in(x, num_heads * head_dim * 2)?,
+                    probe_projection_stand_in(x, num_kv * head_dim)?,
+                    probe_projection_stand_in(x, num_kv * head_dim)?,
+                )
+            } else {
+                let [q_proj_raw, k_proj_raw, v_proj_raw] =
+                    match ResolvedLinear::apply_shared(x, [&lw.q_proj, &lw.k_proj, &lw.v_proj])? {
+                        Some(qkv) => qkv,
+                        None => [
+                            lw.q_proj.apply(x)?,
+                            lw.k_proj.apply(x)?,
+                            lw.v_proj.apply(x)?,
+                        ],
+                    };
+                let q_proj = Self::to_f32(q_proj_raw, &format!("layer{layer_idx}.q_proj"))?;
+                let k_proj = Self::to_f32(k_proj_raw, &format!("layer{layer_idx}.k_proj"))?;
+                let v_proj = Self::to_f32(v_proj_raw, &format!("layer{layer_idx}.v_proj"))?;
+                (q_proj, k_proj, v_proj)
+            };
 
             // (2a) Reshape q_proj to [B, L, num_heads, head_dim*2] and split
             //      the last axis into two halves (queries, gate).
@@ -1937,14 +2928,22 @@ mod imp {
             //     q_norm and k_norm.
             let q_norm_w = &lw.q_norm_weight;
             let k_norm_w = &lw.k_norm_weight;
-            let queries_n = rms_norm(&queries, q_norm_w, eps)?;
+            let queries_n = if ablate.attn_norm {
+                queries
+            } else {
+                rms_norm(&queries, q_norm_w, eps)?
+            };
             let queries_t = mlx_rs::ops::transpose_axes(&queries_n, &[0, 2, 1, 3])
                 .context("layer_full_attn_forward: transpose queries failed")?;
 
             // (2b) Reshape k/v to [B, L, num_kv, head_dim] then RMSNorm/transpose.
             let k_4d = mlx_rs::ops::reshape(&k_proj, &[b, l, num_kv, head_dim])
                 .context("layer_full_attn_forward: reshape k_proj failed")?;
-            let k_n = rms_norm(&k_4d, k_norm_w, eps)?;
+            let k_n = if ablate.attn_norm {
+                k_4d
+            } else {
+                rms_norm(&k_4d, k_norm_w, eps)?
+            };
             let k_t = mlx_rs::ops::transpose_axes(&k_n, &[0, 2, 1, 3])
                 .context("layer_full_attn_forward: transpose keys failed")?;
 
@@ -1997,7 +2996,10 @@ mod imp {
                 .context("layer_full_attn_forward: transpose attn_out failed")?;
             let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, num_heads * head_dim])
                 .context("layer_full_attn_forward: reshape attn_out failed")?;
-            let gated = if sigmoid_mul_fuse_enabled_pub() {
+            let ablate = probe_ablate_for(l);
+            let gated = if ablate.attn_gate {
+                attn_flat
+            } else if sigmoid_mul_fuse_enabled_pub() {
                 sigmoid_mul_fused(gate, &attn_flat)
                     .context("layer_full_attn_forward: fused sigmoid_mul failed")?
             } else {
@@ -2008,7 +3010,19 @@ mod imp {
             };
 
             // (8) o_proj: project back to hidden_size.
-            let o_proj_raw = lw.o_proj.apply(&gated)?;
+            let o_proj_raw = if ablate.attn_oproj {
+                use mlx_rs::ops::indexing::TryIndexOp;
+                let hidden = (self.text_config().hidden_size as i32).min(num_heads * head_dim);
+                // Zeroed: the raw cut drives the model to EOS within a few tokens, and the
+                // benchmark needs a fixed number of them.
+                let cut = gated
+                    .try_index((.., .., 0..hidden))
+                    .context("probe attn_oproj: cut the gated attention")?;
+                mlx_rs::ops::multiply(&cut, Array::from_f32(0.0))
+                    .context("probe attn_oproj: zero the cut")?
+            } else {
+                lw.o_proj.apply(&gated)?
+            };
             Self::to_f32(o_proj_raw, &format!("layer{layer_idx}.o_proj"))
         }
 
@@ -2175,6 +3189,7 @@ mod imp {
                 }
             };
             let timing_on = fine_timing_active();
+            let ablate = probe_ablate_for(s);
 
             // (A: in_proj) Four separate in_proj matmuls + reshape z.
             //     The `qwen3_5_moe` checkpoint stores these split (no
@@ -2185,17 +3200,42 @@ mod imp {
             //     returns the input dtype (f32 here) so the casts were
             //     identity ops adding only graph nodes.
             let t_in_proj = timing_on.then(Instant::now);
-            let mixed_qkv = lw.in_proj_qkv.apply(x)?;
             // PROBE lever-A gate-0: skip the 3 small in_proj matmuls (z/b/a).
             // Only valid with LINCOMPUTE skip (which returns early below using
             // only mixed_qkv) — the dummies are never consumed.
             let skip_inproj_small = probe_skip_lincompute() && probe_skip_inproj_small() && s == 1;
+            // A decode step runs the four projections in one kernel launch.
+            let shared = if ablate.gdn_proj || skip_inproj_small {
+                None
+            } else {
+                ResolvedLinear::apply_shared(
+                    x,
+                    [&lw.in_proj_qkv, &lw.in_proj_z, &lw.in_proj_b, &lw.in_proj_a],
+                )?
+            };
+            let (mixed_qkv, shared_zba) = match shared {
+                Some([qkv, z, b, a]) => (qkv, Some((z, b, a))),
+                None if ablate.gdn_proj => (probe_projection_stand_in(x, conv_dim)?, None),
+                None => (lw.in_proj_qkv.apply(x)?, None),
+            };
             let (z_4d, b_pre, a_pre) = if skip_inproj_small {
                 (mixed_qkv.clone(), mixed_qkv.clone(), mixed_qkv.clone())
             } else {
-                let z_flat = lw.in_proj_z.apply(x)?;
-                let b_pre = lw.in_proj_b.apply(x)?;
-                let a_pre = lw.in_proj_a.apply(x)?;
+                let (z_flat, b_pre, a_pre) = if let Some(zba) = shared_zba {
+                    zba
+                } else if ablate.gdn_proj {
+                    (
+                        probe_projection_stand_in(x, value_dim)?,
+                        probe_projection_stand_in(x, nv)?,
+                        probe_projection_stand_in(x, nv)?,
+                    )
+                } else {
+                    (
+                        lw.in_proj_z.apply(x)?,
+                        lw.in_proj_b.apply(x)?,
+                        lw.in_proj_a.apply(x)?,
+                    )
+                };
                 let z_4d = mlx_rs::ops::reshape(&z_flat, &[b, s, nv, dv])
                     .context("layer_linear_attn_forward: reshape z failed")?;
                 (z_4d, b_pre, a_pre)
@@ -2251,230 +3291,325 @@ mod imp {
                 return Self::to_f32(out_proj_raw, &format!("layer{layer_idx}.probe_out_proj"));
             }
 
-            // (B: conv) conv_state load → concat → cache update via take_axis →
-            //           depthwise conv1d → silu → split → reshape into q/k/v.
-            let t_conv = timing_on.then(Instant::now);
-            // G6-G-1: borrow conv_state from cache instead of cloning. The
-            // owned fallback (zeros_dtype) is stashed in `_conv_state_owned`
-            // and a `&Array` is used uniformly downstream. Saves 1 mlx-c
-            // entry call (mlx_array_set) per linear-attn layer × 21 layers
-            // ≈ 21 ops/step on this model.
-            let _conv_state_owned;
-            let conv_state: &Array = match cache.get(0) {
-                Some(arr) => arr,
-                None => {
-                    _conv_state_owned =
-                        mlx_rs::ops::zeros_dtype(&[b, n_keep, conv_dim], mlx_rs::Dtype::Float32)
-                            .context("layer_linear_attn_forward: zero-init conv_state failed")?;
-                    &_conv_state_owned
-                }
-            };
-            let _ = (key_dim, value_dim); // kept for documentation alignment
-            let conv_input = mlx_rs::ops::concatenate_axis(&[conv_state, &mixed_qkv], 1)
-                .context("layer_linear_attn_forward: concat conv_input failed")?;
-            let total_len = s + n_keep;
-            // Layer-A: decode regime (s=1) reuses cached keep_indices_decode.
-            // Prefill (s>1) keeps the dynamic path. Bit-identical: same i32
-            // values, same shape, same dtype.
-            // Divergence #4 fix (2026-05-12): replace `take_axis` (gather kernel)
-            // with `try_index` slice (view/copy). Bit-identical to
-            // `take_axis(conv_input, [s, s+1, ..., total_len-1], axis=1)` but
-            // dispatches to mlx_slice (cheaper than mlx_take_axis on Metal).
-            // Mirrors Python's `mx.contiguous(conv_input[:, -n_keep:, :])`.
-            let new_conv_state = if conv_slice_enabled() && s == 1 {
-                use mlx_rs::ops::indexing::TryIndexOp;
-                conv_input
-                    .try_index((.., s..total_len, ..))
-                    .context("layer_linear_attn_forward: slice(conv_state, decode) failed")?
-            } else if alloc_reuse_enabled() && s == 1 {
-                mlx_rs::ops::indexing::take_axis(
-                    &conv_input,
-                    &self.linear_attn_constants.keep_indices_decode,
-                    1,
-                )
-                .context("layer_linear_attn_forward: take_axis(conv_state, cached) failed")?
-            } else {
-                let keep_indices: Vec<i32> = (s..total_len).collect();
-                let keep_idx_arr = Array::from_slice(&keep_indices, &[n_keep]);
-                mlx_rs::ops::indexing::take_axis(&conv_input, &keep_idx_arr, 1)
-                    .context("layer_linear_attn_forward: take_axis(conv_state) failed")?
-            };
-            cache.set(0, new_conv_state)?;
-
-            // M4 fused input-side path (LUMEN_NATIVE_FUSE_LINATTN_IN): conv+silu
-            // +split+q/k-RMSNorm in ONE kernel (parity: examples/m2c_*). Produces
-            // q_scaled/k_scaled/v_post directly; bypasses the conv+norm blocks.
-            let (q_scaled, k_scaled, v_post) = if fuse_linattn_in_enabled()
-                && s == 1
+            // The whole conv / norm / gate chain of a decode token or a verify in a single kernel
+            // (`LUMEN_NATIVE_FUSE_LINATTN_IN`): eight dependent dispatches become one. Anything
+            // it does not cover takes the composed ops below.
+            let prework = if fuse_linattn_in_enabled()
+                && (1..=PREWORK_MAX_TOKENS).contains(&s)
+                && b == 1
+                && dn <= 128
+                && dn % 4 == 0
+                && dv <= 1024
+                && !timing_on
+                && !ablate.gdn_conv
+                && !ablate.gdn_gates
                 && alloc_reuse_enabled()
                 && linear_attn_scale_fuse_enabled()
+                && [&mixed_qkv, &b_pre, &a_pre]
+                    .iter()
+                    .all(|a| a.dtype() == mlx_rs::Dtype::Float32)
             {
-                let conv_input_2d = mlx_rs::ops::reshape(&conv_input, &[total_len, conv_dim])
-                    .context("fuse_linattn_in: reshape conv_input [K, conv_dim]")?;
-                let conv_w_2d = mlx_rs::ops::reshape(&lw.conv1d_weight, &[conv_dim, kernel_size])
-                    .context("fuse_linattn_in: reshape conv_w [conv_dim, K]")?;
-                let (q2, k2, v2) = crate::native_ssm::inproj_tail_fused(
-                    &conv_input_2d,
-                    &conv_w_2d,
-                    &self.linear_attn_constants.scaled_w_q_dn,
-                    &self.linear_attn_constants.scaled_w_k_dn,
-                    1e-6,
-                    nk,
-                    nv,
-                    dn,
-                    dv,
-                    kernel_size,
-                )?;
-                let q_scaled = mlx_rs::ops::reshape(&q2, &[b, s, nk, dn])
-                    .context("fuse_linattn_in: reshape q_scaled")?;
-                let k_scaled = mlx_rs::ops::reshape(&k2, &[b, s, nk, dn])
-                    .context("fuse_linattn_in: reshape k_scaled")?;
-                let v_post = mlx_rs::ops::reshape(&v2, &[b, s, nv, dv])
-                    .context("fuse_linattn_in: reshape v_post")?;
-                (q_scaled, k_scaled, v_post)
-            } else {
-                let conv_w = &lw.conv1d_weight;
-                // Decode (s=1) depthwise conv as an explicit windowed sum of mlx
-                // elementwise ops instead of the general `conv1d` kernel:
-                //   out[0,c] = Σ_{k} conv_input[k,c] · w[c,0,k]   (cross-correlation)
-                // Folds into the compile graph + skips the general-conv launch.
-                // Bit-identical (same FMA order is not guaranteed, but f32 window=4
-                // sum matches to ~1e-7). `LUMEN_NATIVE_CONV_DECODE_EW=0` reverts.
-                // Default OFF: A/B showed no speedup (mlx conv1d already efficient;
-                // bit-identical, wash). Kept env-gated as a tested-negative.
-                let conv_decode_ew = s == 1
-                    && std::env::var("LUMEN_NATIVE_CONV_DECODE_EW")
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
-                let conv_raw = if conv_decode_ew {
-                    let w2 = mlx_rs::ops::reshape(conv_w, &[conv_dim, kernel_size])
-                        .context("conv decode-ew: reshape weight")?;
-                    let mut acc: Option<Array> = None;
-                    for k in 0..kernel_size {
-                        use mlx_rs::ops::indexing::TryIndexOp;
-                        let xk = conv_input
-                            .try_index((.., k..(k + 1), ..))
-                            .context("conv decode-ew: slice input tap")?; // [b,1,conv_dim]
-                        let wk = w2
-                            .try_index((.., k..(k + 1)))
-                            .context("conv decode-ew: slice weight tap")?
-                            .reshape(&[conv_dim])
-                            .context("conv decode-ew: reshape weight tap")?; // [conv_dim]
-                        let term = xk.multiply(&wk).context("conv decode-ew: tap multiply")?;
-                        acc = Some(match acc {
-                            Some(a) => a.add(&term).context("conv decode-ew: tap add")?,
-                            None => term,
-                        });
-                    }
-                    acc.expect("conv decode-ew: kernel_size >= 1")
-                } else {
-                    conv1d(
-                        &conv_input,
-                        conv_w,
-                        /* stride */ 1,
-                        /* padding */ 0,
-                        conv_dim,
-                    )?
-                };
-                let conv_out = mlx_rs::nn::silu(&conv_raw)
-                    .context("layer_linear_attn_forward: silu(conv1d) failed")?;
-                let conv_parts =
-                    mlx_rs::ops::split_sections(&conv_out, &[key_dim, 2 * key_dim], -1)
-                        .context("layer_linear_attn_forward: split conv_out failed")?;
-                if conv_parts.len() != 3 {
-                    return Err(anyhow!(
-                        "layer_linear_attn_forward: conv split returned {} parts (want 3)",
-                        conv_parts.len()
-                    ));
-                }
-                let q_post = mlx_rs::ops::reshape(&conv_parts[0], &[b, s, nk, dn])
-                    .context("layer_linear_attn_forward: reshape q_post failed")?;
-                let k_post = mlx_rs::ops::reshape(&conv_parts[1], &[b, s, nk, dn])
-                    .context("layer_linear_attn_forward: reshape k_post failed")?;
-                let v_post = mlx_rs::ops::reshape(&conv_parts[2], &[b, s, nv, dv])
-                    .context("layer_linear_attn_forward: reshape v_post failed")?;
-                if let Some(t0) = t_conv {
-                    mlx_rs::transforms::eval([&q_post, &k_post, &v_post])
-                        .context("layer_linear_attn_forward: batched eval(conv) failed")?;
-                    bump_linear_conv_ms(t0.elapsed().as_secs_f64() * 1000.0);
-                }
-
-                // (C: norm_qk) ones-weight rms_norm × 2 + scalar broadcast multiplies.
-                let t_norm_qk = timing_on.then(Instant::now);
-                // Layer-A: cached ones_w + scale_q/k vs per-call construction.
-                // Bit-identical replacement (same dtype/shape/value).
-                let (q_n, k_n, q_scaled, k_scaled) = if alloc_reuse_enabled() {
-                    if linear_attn_scale_fuse_enabled() {
-                        // Fused path (LANDED 2026-05-11): absorb scale_q/k into
-                        // rms_norm weight (`scaled_w_q = ones × scale_q`). Saves
-                        // 2 multiply ops/linear-attn layer × 21 layers = 42 ops/step.
-                        // Bit-identical: rms_norm(x, ones*s) = rms_norm(x, ones) * s.
-                        let q_scaled = mlx_rs::fast::rms_norm(
-                            &q_post,
-                            &self.linear_attn_constants.scaled_w_q_dn,
-                            1e-6,
+                let zero_state;
+                let conv_state: &Array = match cache.get(0) {
+                    Some(arr) => arr,
+                    None => {
+                        zero_state = mlx_rs::ops::zeros_dtype(
+                            &[b, n_keep, conv_dim],
+                            mlx_rs::Dtype::Float32,
                         )
-                        .context("layer_linear_attn_forward: rms_norm(q, scaled_w) failed")?;
-                        let k_scaled = mlx_rs::fast::rms_norm(
-                            &k_post,
+                        .context("layer_linear_attn_forward: zero-init conv_state failed")?;
+                        &zero_state
+                    }
+                };
+                if conv_state.dtype() == mlx_rs::Dtype::Float32 {
+                    let conv_state_2d = mlx_rs::ops::reshape(conv_state, &[n_keep, conv_dim])
+                        .context("prework: reshape conv_state")?;
+                    let mixed_2d = mlx_rs::ops::reshape(&mixed_qkv, &[s, conv_dim])
+                        .context("prework: reshape mixed_qkv")?;
+                    let conv_w_2d =
+                        mlx_rs::ops::reshape(&lw.conv1d_weight, &[conv_dim, kernel_size])
+                            .context("prework: reshape conv_w")?;
+                    // An MTP verify keeps the window for a rollback to any of its positions. The
+                    // kernel does not read it, so it is computed only if a rollback asks for it.
+                    let window = if self.ssm_capture_enabled() {
+                        Some(
+                            mlx_rs::ops::concatenate_axis(&[conv_state, &mixed_qkv], 1)
+                                .context("prework: the window a rollback reads")?,
+                        )
+                    } else {
+                        None
+                    };
+                    Some((
+                        crate::native_ssm::linattn_prework_fused(
+                            &conv_state_2d,
+                            &mixed_2d,
+                            &conv_w_2d,
+                            &self.linear_attn_constants.scaled_w_q_dn,
                             &self.linear_attn_constants.scaled_w_k_dn,
                             1e-6,
-                        )
-                        .context("layer_linear_attn_forward: rms_norm(k, scaled_w) failed")?;
-                        // q_n/k_n unused in fused path — fabricate dummy refs to
-                        // satisfy the tuple return; the `let _ = (q_n, k_n)`
-                        // below silences the unused warning.
-                        (q_scaled.clone(), k_scaled.clone(), q_scaled, k_scaled)
-                    } else {
-                        let ones_w = &self.linear_attn_constants.ones_w_dn;
-                        let q_n = mlx_rs::fast::rms_norm(&q_post, ones_w, 1e-6)
-                            .context("layer_linear_attn_forward: rms_norm(q, cached) failed")?;
-                        let k_n = mlx_rs::fast::rms_norm(&k_post, ones_w, 1e-6)
-                            .context("layer_linear_attn_forward: rms_norm(k, cached) failed")?;
-                        let q_scaled =
-                            mlx_rs::ops::multiply(&q_n, &self.linear_attn_constants.scale_q)
-                                .context(
-                                    "layer_linear_attn_forward: q_scaled multiply (cached) failed",
-                                )?;
-                        let k_scaled =
-                            mlx_rs::ops::multiply(&k_n, &self.linear_attn_constants.scale_k)
-                                .context(
-                                    "layer_linear_attn_forward: k_scaled multiply (cached) failed",
-                                )?;
-                        (q_n, k_n, q_scaled, k_scaled)
-                    }
+                            &b_pre,
+                            &a_pre,
+                            &lw.a_log,
+                            &lw.dt_bias,
+                            nk,
+                            nv,
+                            dn,
+                            dv,
+                            kernel_size,
+                        )?,
+                        window,
+                    ))
                 } else {
-                    let inv_scale = (dn as f32).powf(-0.5);
-                    let ones_w = mlx_rs::ops::ones::<f32>(&[dn])
-                        .context("layer_linear_attn_forward: ones weight failed")?;
-                    let q_n = mlx_rs::fast::rms_norm(&q_post, &ones_w, 1e-6)
-                        .context("layer_linear_attn_forward: rms_norm(q) failed")?;
-                    let k_n = mlx_rs::fast::rms_norm(&k_post, &ones_w, 1e-6)
-                        .context("layer_linear_attn_forward: rms_norm(k) failed")?;
-                    let scale_q = Array::from_f32(inv_scale * inv_scale);
-                    let scale_k = Array::from_f32(inv_scale);
-                    let q_scaled = mlx_rs::ops::multiply(&q_n, &scale_q)
-                        .context("layer_linear_attn_forward: q_scaled multiply failed")?;
-                    let k_scaled = mlx_rs::ops::multiply(&k_n, &scale_k)
-                        .context("layer_linear_attn_forward: k_scaled multiply failed")?;
-                    (q_n, k_n, q_scaled, k_scaled)
-                };
-                let _ = (q_n, k_n); // values consumed only via q_scaled/k_scaled
-                if let Some(t0) = t_norm_qk {
-                    mlx_rs::transforms::eval([&q_scaled, &k_scaled])
-                        .context("layer_linear_attn_forward: batched eval(norm_qk) failed")?;
-                    bump_linear_norm_qk_ms(t0.elapsed().as_secs_f64() * 1000.0);
+                    None
                 }
-                (q_scaled, k_scaled, v_post)
+            } else {
+                None
+            };
+            let (q_scaled, k_scaled, v_post, fused_gates, conv_input) = if let Some((p, window)) =
+                prework
+            {
+                cache.set(
+                    0,
+                    mlx_rs::ops::reshape(&p.new_state, &[b, n_keep, conv_dim])
+                        .context("prework: reshape new conv state")?,
+                )?;
+                let heads = |a: &Array, h: i32, d: i32| mlx_rs::ops::reshape(a, &[b, s, h, d]);
+                (
+                    heads(&p.q, nk, dn)?,
+                    heads(&p.k, nk, dn)?,
+                    heads(&p.v, nv, dv)?,
+                    Some((
+                        mlx_rs::ops::reshape(&p.beta, &[b, s, nv])?,
+                        mlx_rs::ops::reshape(&p.g, &[b, s, nv])?,
+                    )),
+                    window,
+                )
+            } else {
+                // (B: conv) conv_state load → concat → cache update via take_axis →
+                //           depthwise conv1d → silu → split → reshape into q/k/v.
+                let t_conv = timing_on.then(Instant::now);
+                // G6-G-1: borrow conv_state from cache instead of cloning. The
+                // owned fallback (zeros_dtype) is stashed in `_conv_state_owned`
+                // and a `&Array` is used uniformly downstream. Saves 1 mlx-c
+                // entry call (mlx_array_set) per linear-attn layer × 21 layers
+                // ≈ 21 ops/step on this model.
+                let _conv_state_owned;
+                let conv_state: &Array = match cache.get(0) {
+                    Some(arr) => arr,
+                    None => {
+                        _conv_state_owned = mlx_rs::ops::zeros_dtype(
+                            &[b, n_keep, conv_dim],
+                            mlx_rs::Dtype::Float32,
+                        )
+                        .context("layer_linear_attn_forward: zero-init conv_state failed")?;
+                        &_conv_state_owned
+                    }
+                };
+                let _ = (key_dim, value_dim); // kept for documentation alignment
+                let conv_input = mlx_rs::ops::concatenate_axis(&[conv_state, &mixed_qkv], 1)
+                    .context("layer_linear_attn_forward: concat conv_input failed")?;
+                let total_len = s + n_keep;
+                // Layer-A: decode regime (s=1) reuses cached keep_indices_decode.
+                // Prefill (s>1) keeps the dynamic path. Bit-identical: same i32
+                // values, same shape, same dtype.
+                // Divergence #4 fix (2026-05-12): replace `take_axis` (gather kernel)
+                // with `try_index` slice (view/copy). Bit-identical to
+                // `take_axis(conv_input, [s, s+1, ..., total_len-1], axis=1)` but
+                // dispatches to mlx_slice (cheaper than mlx_take_axis on Metal).
+                // Mirrors Python's `mx.contiguous(conv_input[:, -n_keep:, :])`.
+                let new_conv_state = if conv_slice_enabled() && s == 1 {
+                    use mlx_rs::ops::indexing::TryIndexOp;
+                    conv_input
+                        .try_index((.., s..total_len, ..))
+                        .context("layer_linear_attn_forward: slice(conv_state, decode) failed")?
+                } else if alloc_reuse_enabled() && s == 1 {
+                    mlx_rs::ops::indexing::take_axis(
+                        &conv_input,
+                        &self.linear_attn_constants.keep_indices_decode,
+                        1,
+                    )
+                    .context("layer_linear_attn_forward: take_axis(conv_state, cached) failed")?
+                } else {
+                    let keep_indices: Vec<i32> = (s..total_len).collect();
+                    let keep_idx_arr = Array::from_slice(&keep_indices, &[n_keep]);
+                    mlx_rs::ops::indexing::take_axis(&conv_input, &keep_idx_arr, 1)
+                        .context("layer_linear_attn_forward: take_axis(conv_state) failed")?
+                };
+                cache.set(0, new_conv_state)?;
+
+                // M4 fused input-side path (LUMEN_NATIVE_FUSE_LINATTN_IN): conv+silu
+                // +split+q/k-RMSNorm in ONE kernel (parity: examples/m2c_*). Produces
+                // q_scaled/k_scaled/v_post directly; bypasses the conv+norm blocks.
+                let (q_scaled, k_scaled, v_post) = if ablate.gdn_conv {
+                    let parts =
+                        mlx_rs::ops::split_sections(&mixed_qkv, &[key_dim, 2 * key_dim], -1)?;
+                    (
+                        mlx_rs::ops::reshape(&parts[0], &[b, s, nk, dn])?,
+                        mlx_rs::ops::reshape(&parts[1], &[b, s, nk, dn])?,
+                        mlx_rs::ops::reshape(&parts[2], &[b, s, nv, dv])?,
+                    )
+                } else {
+                    let conv_w = &lw.conv1d_weight;
+                    // Decode (s=1) depthwise conv as an explicit windowed sum of mlx
+                    // elementwise ops instead of the general `conv1d` kernel:
+                    //   out[0,c] = Σ_{k} conv_input[k,c] · w[c,0,k]   (cross-correlation)
+                    // Folds into the compile graph + skips the general-conv launch.
+                    // Bit-identical (same FMA order is not guaranteed, but f32 window=4
+                    // sum matches to ~1e-7). `LUMEN_NATIVE_CONV_DECODE_EW=0` reverts.
+                    // Default OFF: A/B showed no speedup (mlx conv1d already efficient;
+                    // bit-identical, wash). Kept env-gated as a tested-negative.
+                    let conv_decode_ew = s == 1
+                        && std::env::var("LUMEN_NATIVE_CONV_DECODE_EW")
+                            .map(|v| v == "1")
+                            .unwrap_or(false);
+                    let conv_raw = if conv_decode_ew {
+                        let w2 = mlx_rs::ops::reshape(conv_w, &[conv_dim, kernel_size])
+                            .context("conv decode-ew: reshape weight")?;
+                        let mut acc: Option<Array> = None;
+                        for k in 0..kernel_size {
+                            use mlx_rs::ops::indexing::TryIndexOp;
+                            let xk = conv_input
+                                .try_index((.., k..(k + 1), ..))
+                                .context("conv decode-ew: slice input tap")?; // [b,1,conv_dim]
+                            let wk = w2
+                                .try_index((.., k..(k + 1)))
+                                .context("conv decode-ew: slice weight tap")?
+                                .reshape(&[conv_dim])
+                                .context("conv decode-ew: reshape weight tap")?; // [conv_dim]
+                            let term = xk.multiply(&wk).context("conv decode-ew: tap multiply")?;
+                            acc = Some(match acc {
+                                Some(a) => a.add(&term).context("conv decode-ew: tap add")?,
+                                None => term,
+                            });
+                        }
+                        acc.expect("conv decode-ew: kernel_size >= 1")
+                    } else {
+                        conv1d(
+                            &conv_input,
+                            conv_w,
+                            /* stride */ 1,
+                            /* padding */ 0,
+                            conv_dim,
+                        )?
+                    };
+                    let conv_out = mlx_rs::nn::silu(&conv_raw)
+                        .context("layer_linear_attn_forward: silu(conv1d) failed")?;
+                    let conv_parts =
+                        mlx_rs::ops::split_sections(&conv_out, &[key_dim, 2 * key_dim], -1)
+                            .context("layer_linear_attn_forward: split conv_out failed")?;
+                    if conv_parts.len() != 3 {
+                        return Err(anyhow!(
+                            "layer_linear_attn_forward: conv split returned {} parts (want 3)",
+                            conv_parts.len()
+                        ));
+                    }
+                    let q_post = mlx_rs::ops::reshape(&conv_parts[0], &[b, s, nk, dn])
+                        .context("layer_linear_attn_forward: reshape q_post failed")?;
+                    let k_post = mlx_rs::ops::reshape(&conv_parts[1], &[b, s, nk, dn])
+                        .context("layer_linear_attn_forward: reshape k_post failed")?;
+                    let v_post = mlx_rs::ops::reshape(&conv_parts[2], &[b, s, nv, dv])
+                        .context("layer_linear_attn_forward: reshape v_post failed")?;
+                    if let Some(t0) = t_conv {
+                        mlx_rs::transforms::eval([&q_post, &k_post, &v_post])
+                            .context("layer_linear_attn_forward: batched eval(conv) failed")?;
+                        bump_linear_conv_ms(t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+
+                    // (C: norm_qk) ones-weight rms_norm × 2 + scalar broadcast multiplies.
+                    let t_norm_qk = timing_on.then(Instant::now);
+                    // Layer-A: cached ones_w + scale_q/k vs per-call construction.
+                    // Bit-identical replacement (same dtype/shape/value).
+                    let (q_n, k_n, q_scaled, k_scaled) = if alloc_reuse_enabled() {
+                        if linear_attn_scale_fuse_enabled() {
+                            // Fused path (LANDED 2026-05-11): absorb scale_q/k into
+                            // rms_norm weight (`scaled_w_q = ones × scale_q`). Saves
+                            // 2 multiply ops/linear-attn layer × 21 layers = 42 ops/step.
+                            // Bit-identical: rms_norm(x, ones*s) = rms_norm(x, ones) * s.
+                            let q_scaled = mlx_rs::fast::rms_norm(
+                                &q_post,
+                                &self.linear_attn_constants.scaled_w_q_dn,
+                                1e-6,
+                            )
+                            .context("layer_linear_attn_forward: rms_norm(q, scaled_w) failed")?;
+                            let k_scaled = mlx_rs::fast::rms_norm(
+                                &k_post,
+                                &self.linear_attn_constants.scaled_w_k_dn,
+                                1e-6,
+                            )
+                            .context("layer_linear_attn_forward: rms_norm(k, scaled_w) failed")?;
+                            // q_n/k_n unused in fused path — fabricate dummy refs to
+                            // satisfy the tuple return; the `let _ = (q_n, k_n)`
+                            // below silences the unused warning.
+                            (q_scaled.clone(), k_scaled.clone(), q_scaled, k_scaled)
+                        } else {
+                            let ones_w = &self.linear_attn_constants.ones_w_dn;
+                            let q_n = mlx_rs::fast::rms_norm(&q_post, ones_w, 1e-6)
+                                .context("layer_linear_attn_forward: rms_norm(q, cached) failed")?;
+                            let k_n = mlx_rs::fast::rms_norm(&k_post, ones_w, 1e-6)
+                                .context("layer_linear_attn_forward: rms_norm(k, cached) failed")?;
+                            let q_scaled = mlx_rs::ops::multiply(
+                                &q_n,
+                                &self.linear_attn_constants.scale_q,
+                            )
+                            .context(
+                                "layer_linear_attn_forward: q_scaled multiply (cached) failed",
+                            )?;
+                            let k_scaled = mlx_rs::ops::multiply(
+                                &k_n,
+                                &self.linear_attn_constants.scale_k,
+                            )
+                            .context(
+                                "layer_linear_attn_forward: k_scaled multiply (cached) failed",
+                            )?;
+                            (q_n, k_n, q_scaled, k_scaled)
+                        }
+                    } else {
+                        let inv_scale = (dn as f32).powf(-0.5);
+                        let ones_w = mlx_rs::ops::ones::<f32>(&[dn])
+                            .context("layer_linear_attn_forward: ones weight failed")?;
+                        let q_n = mlx_rs::fast::rms_norm(&q_post, &ones_w, 1e-6)
+                            .context("layer_linear_attn_forward: rms_norm(q) failed")?;
+                        let k_n = mlx_rs::fast::rms_norm(&k_post, &ones_w, 1e-6)
+                            .context("layer_linear_attn_forward: rms_norm(k) failed")?;
+                        let scale_q = Array::from_f32(inv_scale * inv_scale);
+                        let scale_k = Array::from_f32(inv_scale);
+                        let q_scaled = mlx_rs::ops::multiply(&q_n, &scale_q)
+                            .context("layer_linear_attn_forward: q_scaled multiply failed")?;
+                        let k_scaled = mlx_rs::ops::multiply(&k_n, &scale_k)
+                            .context("layer_linear_attn_forward: k_scaled multiply failed")?;
+                        (q_n, k_n, q_scaled, k_scaled)
+                    };
+                    let _ = (q_n, k_n); // values consumed only via q_scaled/k_scaled
+                    if let Some(t0) = t_norm_qk {
+                        mlx_rs::transforms::eval([&q_scaled, &k_scaled])
+                            .context("layer_linear_attn_forward: batched eval(norm_qk) failed")?;
+                        bump_linear_norm_qk_ms(t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    (q_scaled, k_scaled, v_post)
+                };
+                (q_scaled, k_scaled, v_post, None, Some(conv_input))
             };
 
             // (D: ssm) sigmoid(b) + compute_g + Metal SSM step kernel.
             let t_ssm = timing_on.then(Instant::now);
-            let beta = mlx_rs::ops::sigmoid(&b_pre)
-                .context("layer_linear_attn_forward: sigmoid(b) failed")?;
-            let a_log = &lw.a_log;
-            let dt_bias = &lw.dt_bias;
-            let g = compute_g(a_log, &a_pre, dt_bias)?;
+            let (beta, g) = if let Some(gates) = fused_gates {
+                gates
+            } else {
+                let beta = if ablate.gdn_gates {
+                    b_pre.clone()
+                } else {
+                    mlx_rs::ops::sigmoid(&b_pre)
+                        .context("layer_linear_attn_forward: sigmoid(b) failed")?
+                };
+                let a_log = &lw.a_log;
+                let dt_bias = &lw.dt_bias;
+                let g = if ablate.gdn_gates {
+                    a_pre.clone()
+                } else {
+                    compute_g(a_log, &a_pre, dt_bias)?
+                };
+                (beta, g)
+            };
             // G6-G-1: borrow state_in from cache (same pattern as conv_state
             // above). Saves another ~21 mlx-c entry calls/step.
             let _state_in_owned;
@@ -2487,13 +3622,18 @@ mod imp {
                     &_state_in_owned
                 }
             };
-            let (out_kernel, new_state) = if self.ssm_capture_enabled() {
+            let (out_kernel, new_state) = if ablate.gdn_ssm {
+                (v_post.clone(), state_in.clone())
+            } else if self.ssm_capture_enabled() {
                 // Capture-commit: emit per-position SSM state + stash conv_input
                 // for O(1) speculative rollback in mtp_step Step E.
                 let (y, ns, state_per_pos) = gated_delta_step_kernel_capture(
                     &q_scaled, &k_scaled, &v_post, &g, &beta, state_in,
                 )?;
-                self.push_ssm_capture(layer_idx, state_per_pos, conv_input.clone());
+                let conv_input = conv_input.clone().ok_or_else(|| {
+                    anyhow!("layer_linear_attn_forward: a capture without its conv window")
+                })?;
+                self.push_ssm_capture(layer_idx, state_per_pos, conv_input);
                 (y, ns)
             } else {
                 gated_delta_step_kernel(&q_scaled, &k_scaled, &v_post, &g, &beta, state_in)?
@@ -2510,10 +3650,18 @@ mod imp {
             // (E: out_proj) RMSNormGated → reshape → out_proj matmul → cast.
             let t_out = timing_on.then(Instant::now);
             let norm_w = &lw.norm_weight;
-            let out_normed = rms_norm_gated(&out_kernel, &z_4d, norm_w, eps)?;
+            let out_normed = if ablate.gdn_norm {
+                mlx_rs::ops::multiply(&out_kernel, &z_4d)?
+            } else {
+                rms_norm_gated(&out_kernel, &z_4d, norm_w, eps)?
+            };
             let out_flat = mlx_rs::ops::reshape(&out_normed, &[b, s, value_dim])
                 .context("layer_linear_attn_forward: reshape out_flat failed")?;
-            let out_proj_raw = lw.out_proj.apply(&out_flat)?;
+            let out_proj_raw = if ablate.gdn_proj {
+                probe_projection_stand_in(&out_flat, x.shape()[2])?
+            } else {
+                lw.out_proj.apply(&out_flat)?
+            };
             let out_final = Self::to_f32(out_proj_raw, &format!("layer{layer_idx}.out_proj"))?;
             if let Some(t0) = t_out {
                 out_final
@@ -2565,17 +3713,12 @@ mod imp {
                 let up = it.next().expect("dense mlp: fused split[1] (up)");
                 (gate, up)
             } else {
-                let gate = d
-                    .gate_proj
-                    .as_ref()
-                    .expect("dense mlp: gate_proj missing")
-                    .apply(x)?;
-                let up = d
-                    .up_proj
-                    .as_ref()
-                    .expect("dense mlp: up_proj missing")
-                    .apply(x)?;
-                (gate, up)
+                let gate_proj = d.gate_proj.as_ref().expect("dense mlp: gate_proj missing");
+                let up_proj = d.up_proj.as_ref().expect("dense mlp: up_proj missing");
+                match ResolvedLinear::apply_shared(x, [gate_proj, up_proj])? {
+                    Some([gate, up]) => (gate, up),
+                    None => (gate_proj.apply(x)?, up_proj.apply(x)?),
+                }
             };
             // Reuse the landed mxfp4 SwiGLU fusion (-0.671ms/step, t=-29σ) — the
             // dense path was running raw silu+multiply (2 dispatches). Same
@@ -2892,6 +4035,64 @@ mod imp {
             if input_ids.is_empty() {
                 return Err(anyhow!("forward: input_ids is empty"));
             }
+            let ids_i32: Vec<i32> = input_ids.iter().map(|&u| u as i32).collect();
+            let ids_arr = Array::from_slice(&ids_i32, &[input_ids.len() as i32]);
+            self.forward_ids(
+                &ids_arr,
+                cache,
+                last_only,
+                capture_layer_ids,
+                positions,
+                soft,
+            )
+        }
+
+        /// One decode step whose token is still an unevaluated array — the
+        /// argmax of the step before it ([`Self::argmax_last_token_lazy`]).
+        ///
+        /// This is what lets a decode loop build step N+1 while step N is still
+        /// running on the GPU: nothing here reads the previous token on the
+        /// host. The graph is the one [`Self::forward_decode_shifted`] builds
+        /// for `&[token]`, so the two agree bit for bit.
+        pub fn forward_decode_lazy(
+            &self,
+            token: &Array,
+            cache: &mut NativePromptCache,
+            mrope_delta: i32,
+        ) -> Result<Array> {
+            let plan = if mrope_delta == 0 {
+                RopePlan::Sequential
+            } else {
+                RopePlan::Shifted(mrope_delta)
+            };
+            let ids = mlx_rs::ops::reshape(token, &[1])
+                .context("forward_decode_lazy: token to [1]")?
+                .as_dtype(mlx_rs::Dtype::Int32)
+                .context("forward_decode_lazy: token to int32")?;
+            let (logits, _) =
+                self.forward_ids(&ids, cache, /* last_only */ true, &[], plan, None)?;
+            Ok(logits)
+        }
+
+        /// Whether a decode step can be built before the previous one has
+        /// finished. It cannot when the graph reads a value back mid-way: SSD
+        /// expert offload reads the routing indices on the host to know which
+        /// experts to load, and the MTP capture slot would be overwritten by a
+        /// step whose result nobody asked for yet.
+        pub fn decode_pipelinable(&self) -> bool {
+            self.offload.is_none() && !self.mtp_capture_enabled.load(Ordering::Relaxed)
+        }
+
+        /// The graph itself, from an already-built `[L]` int32 token array.
+        fn forward_ids(
+            &self,
+            ids_arr: &Array,
+            cache: &mut NativePromptCache,
+            last_only: bool,
+            capture_layer_ids: &[usize],
+            positions: RopePlan<'_>,
+            soft: VisionSoft<'_>,
+        ) -> Result<(Array, Vec<Array>)> {
             if cache.len() != self.num_layers() {
                 return Err(anyhow!(
                     "forward: cache.len()={} mismatches num_layers={}",
@@ -2900,7 +4101,8 @@ mod imp {
                 ));
             }
             let cfg = self.text_config();
-            let l = input_ids.len() as i32;
+            let l = ids_arr.shape()[0];
+            let ablate = probe_ablate_for(l);
 
             let timing_on = fine_timing_active();
             let mut fine = FineTimings::default();
@@ -2909,13 +4111,11 @@ mod imp {
             // `embed_tokens` as MXFP4-quantized; the lookup returns bf16,
             // which we cast to f32 for downstream determinism.
             let t_embed = timing_on.then(Instant::now);
-            let ids_i32: Vec<i32> = input_ids.iter().map(|&u| u as i32).collect();
-            let ids_arr = Array::from_slice(&ids_i32, &[l]);
             let embed_raw = quantized_embedding_lookup_with_mode(
                 &self.embed_weight,
                 &self.embed_scales,
                 self.embed_biases.as_ref(),
-                &ids_arr,
+                ids_arr,
                 self.embed_group,
                 self.embed_bits,
                 self.embed_mode,
@@ -2973,7 +4173,9 @@ mod imp {
                     reset_layer_sub_timings();
                 }
                 let t_attn = timing_on.then(Instant::now);
-                let attn = if is_linear {
+                let attn = if (is_linear && ablate.gdn) || (!is_linear && ablate.attn) {
+                    mlx_rs::ops::multiply(&normed, Array::from_f32(0.0))?
+                } else if is_linear {
                     let lin = layer_cache.as_linear_mut()?;
                     self.layer_linear_attn_forward(&normed, layer_idx, lin)?
                 } else if matches!(layer_cache, NativeLayerCache::FullTurboquant(_)) {
@@ -3015,7 +4217,11 @@ mod imp {
                     reset_layer_sub_timings();
                 }
                 let t_moe = timing_on.then(Instant::now);
-                let mlp_out = self.layer_moe_forward(&h_normed, layer_idx)?;
+                let mlp_out = if ablate.moe {
+                    mlx_rs::ops::multiply(&h_normed, Array::from_f32(0.0))?
+                } else {
+                    self.layer_moe_forward(&h_normed, layer_idx)?
+                };
                 if let Some(t0) = t_moe {
                     mlp_out.eval().context("forward: timing eval(moe) failed")?;
                     fine.moe_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -3043,15 +4249,21 @@ mod imp {
                 }
             }
 
-            // MTP capture: stash the post-MLP residual (pre-final-norm hidden)
-            // when the MTP path is active. Consumed by `mtp_step` as the MTP
-            // block's `h_pre` input. Cheap refcount clone — captured even when
-            // the slot already holds a stale value (overwritten). The slot is
-            // drained by `take_captured_h()` after the trunk forward returns.
+            // MTP capture: stash the trunk hidden the head reads (the post-MLP
+            // residual, or that after the final norm: `TrunkHidden`) when the MTP
+            // path is active. Consumed by `mtp_step` as the MTP block's `h_pre`
+            // input; overwritten each forward, drained by `take_captured_h()`.
             if self.mtp_capture_enabled.load(Ordering::Relaxed)
                 && let Ok(mut slot) = self.mtp_capture_slot.lock()
             {
-                *slot = Some(hidden_states.clone());
+                let after_norm = self.mtp.as_ref().is_some_and(|b| {
+                    b.trunk_hidden == crate::qwen3_5_mtp::TrunkHidden::AfterFinalNorm
+                });
+                *slot = Some(if after_norm {
+                    rms_norm(&hidden_states, &self.final_norm_weight, cfg.rms_norm_eps)?
+                } else {
+                    hidden_states.clone()
+                });
             }
 
             // Final RMSNorm + lm_head projection. `tie_word_embeddings = false`
@@ -3081,7 +4293,10 @@ mod imp {
             };
             let t_lm = timing_on.then(Instant::now);
             let normed_out = rms_norm(&hidden_for_head, &self.final_norm_weight, cfg.rms_norm_eps)?;
-            let logits = if let Some(lm_head) = &self.lm_head {
+            let logits = if ablate.lm_head {
+                let total = normed_out.sum_axis(-1, true)?;
+                mlx_rs::ops::broadcast_to(&total, &[1, 1, cfg.vocab_size as i32])?
+            } else if let Some(lm_head) = &self.lm_head {
                 lm_head.apply(&normed_out)?
             } else {
                 // Tied path — fold the embed tensors directly.
@@ -3109,7 +4324,7 @@ mod imp {
                 // barriers inflate absolute ms but the SPLIT is valid.
                 eprintln!(
                     "[native-decode-fine] L={} embed={:.2} full_attn={:.2}/{} lin_attn={:.2}/{} moe={:.2}/{} lm_head={:.2} | lin_sub: in_proj={:.2} conv={:.2} norm_qk={:.2} ssm={:.2} out_proj={:.2}",
-                    input_ids.len(),
+                    l,
                     fine.embed_ms,
                     fine.full_attn_ms,
                     fine.full_attn_count,
@@ -3394,6 +4609,11 @@ mod imp {
                     cfg.head_dim
                 ));
             }
+            self.mtp_draft_lm_head = if mtp_coarse_head::get() {
+                coarse_lm_head(&self.trunk_lm_head_view())?
+            } else {
+                None
+            };
             self.mtp = Some(block);
             Ok(())
         }
@@ -3442,6 +4662,9 @@ mod imp {
             use std::collections::HashMap;
             let cap: HashMap<usize, (&Array, &Array)> =
                 captures.iter().map(|(i, s, c)| (*i, (s, c))).collect();
+            // The selected states, evaluated together at the end. An `eval` per state was a
+            // blocking round trip each, two per linear layer: ~10 ms of a 27B reject.
+            let mut selected: Vec<Array> = Vec::with_capacity(2 * captures.len());
             for (layer_idx, layer) in cache.layers_mut().iter_mut().enumerate() {
                 match layer {
                     NativeLayerCache::Full(kv) => {
@@ -3482,8 +4705,7 @@ mod imp {
                         let idx_arr = Array::from_slice(&idx, &[n_keep as i32]);
                         let conv = mlx_rs::ops::indexing::take_axis(cin, &idx_arr, 1)
                             .context("commit_captured: slice conv state")?;
-                        ssm.eval().ok();
-                        conv.eval().ok();
+                        selected.extend([ssm.clone(), conv.clone()]);
                         arr.set_slot(1, Some(ssm))
                             .context("commit_captured: set ssm slot")?;
                         arr.set_slot(0, Some(conv))
@@ -3492,6 +4714,9 @@ mod imp {
                     }
                 }
             }
+            // Materialized so the per-position captures behind them can go, without waiting.
+            mlx_rs::transforms::async_eval(selected.iter())
+                .context("commit_captured: evaluate the selected states")?;
             Ok(())
         }
 
@@ -3525,12 +4750,17 @@ mod imp {
         /// multiply (Qwen3.6's MTP convention; cf. gemma4 which multiplies by
         /// `sqrt(hidden_size)`).
         fn embed_lookup_single(&self, token_id: u32) -> Result<Array> {
-            let ids_arr = Array::from_slice(&[token_id as i32], &[1]);
+            self.embed_lookup_ids(&Array::from_slice(&[token_id as i32], &[1]))
+        }
+
+        /// [`Self::embed_lookup_single`] of a `[n]` int32 token array, `[1, n, hidden]`; it may
+        /// still be unevaluated (the drafter's own argmax).
+        fn embed_lookup_ids(&self, ids_arr: &Array) -> Result<Array> {
             let raw = quantized_embedding_lookup_with_mode(
                 &self.embed_weight,
                 &self.embed_scales,
                 self.embed_biases.as_ref(),
-                &ids_arr,
+                ids_arr,
                 self.embed_group,
                 self.embed_bits,
                 self.embed_mode,
@@ -3538,8 +4768,8 @@ mod imp {
             .context("mtp_step: embed_lookup_single failed")?;
             let f32 = Self::to_f32(raw, "mtp_step.embed")?;
             let hidden = self.text_config().hidden_size as i32;
-            mlx_rs::ops::reshape(&f32, &[1, 1, hidden])
-                .context("mtp_step: embed reshape [1, 1, hidden] failed")
+            mlx_rs::ops::reshape(&f32, &[1, ids_arr.size() as i32, hidden])
+                .context("mtp_step: embed reshape [1, n, hidden] failed")
         }
 
         /// Pull one position's logit row from a `[1, L, vocab]` array into a
@@ -3599,10 +4829,9 @@ mod imp {
         pub fn mtp_step(
             &self,
             trunk_cache: &mut NativePromptCache,
-            mtp_kv: &mut NativeKvCache,
+            history: &mut MtpHistory,
             committed_token: u32,
             n_draft: usize,
-            carried_hidden: Option<Array>,
             sampling: &SamplingConfig,
         ) -> Result<MtpStepOutput> {
             if n_draft == 0 {
@@ -3642,22 +4871,20 @@ mod imp {
             // committed/correction token is verified as `verify_in[0]` instead
             // of forwarded separately, halving trunk forwards per cycle.
             //
-            // Accept-gated: 1-forward WINS in the high-accept regime and LOSES
-            // below it (removing Step A also removes a guaranteed token). A/B:
+            // Removing Step A also removes a guaranteed token, so this pays only
+            // when the verify of K+1 tokens costs little more than one step. A/B:
             // dense 9B (acc 0.63) 32.8->38.1 tok/s +16%, 27B (0.69) 14.8->17.4
-            // +18%; MoE 35B-A3B (0.56) 72.5->69.9 -4%. So DEFAULT 1-forward ON
-            // for Dense models, OFF for MoE. `LUMEN_MTP_ONE_FORWARD=0/1` overrides.
-            let one_forward = match std::env::var("LUMEN_MTP_ONE_FORWARD") {
-                Ok(v) => v != "0",
-                Err(_) => self.config.text_config.mlp_kind() == MlpKind::Dense,
-            };
+            // +18%. MoE 35B-A3B lost 4% once (0.56, 72.5->69.9) and now wins with
+            // the row-exact matvecs' cheaper verify: MTPLX head, K=1, acceptance
+            // 0.45, 68.4 -> 80.6 tok/s. Default ON; `LUMEN_MTP_ONE_FORWARD=0` keeps
+            // the two-forward cycle.
+            let one_forward = std::env::var("LUMEN_MTP_ONE_FORWARD").map_or(true, |v| v != "0");
             if one_forward {
                 return self.mtp_step_one_forward(
                     trunk_cache,
-                    mtp_kv,
+                    history,
                     committed_token,
                     n_draft,
-                    carried_hidden,
                     &cfg,
                 );
             }
@@ -3671,13 +4898,13 @@ mod imp {
             // Sampling vs greedy. Deterministic per-step RNG (seed + cache
             // offset) so the same prompt reproduces the same draws.
             let sampling = cfg.temperature > 0.0;
-            let mut rng = Xorshift64::new(cfg.seed.wrapping_add(m_pre as u64).wrapping_add(0xA5));
+            let mut rng = Xorshift64::at_position(cfg.seed, m_pre as u64, MTP_RNG_STREAM);
 
-            // Reset the MTP block's own KV cache — every mtp_step is a fresh
-            // K-step extrapolation. Cross-call attention context lives in the
-            // TRUNK cache; the drafter only needs intra-step (draft-token)
-            // attention which is what `mtp_kv` carries.
-            mtp_kv.clear();
+            // Reset the MTP block's own KV cache — every 2-forward mtp_step is a
+            // fresh K-step extrapolation (the head history is the 1-forward
+            // cycle's). Cross-call attention context lives in the TRUNK cache.
+            history.clear();
+            let mtp_kv = &mut history.kv;
 
             // === Step A: trunk decode `committed_token` + capture last hidden ===
             self.set_mtp_capture_enabled(true);
@@ -3688,21 +4915,7 @@ mod imp {
             let trunk_h = self
                 .take_captured_h()
                 .ok_or_else(|| anyhow!("mtp_step: Step A failed to capture trunk last hidden"))?;
-            // The MTP head was trained to consume the POST-final-norm trunk
-            // hidden (MTPLX reference defaults hidden_variant="post_norm":
-            // hidden = inner.norm(hidden_states)). The capture stashes the
-            // PRE-final-norm residual, so apply the trunk final norm here to
-            // match the head's training distribution. Gated for A/B.
-            let trunk_h = if std::env::var("LUMEN_MTP_POSTNORM_H")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
-                let eps = self.text_config().rms_norm_eps;
-                rms_norm(&trunk_h, &self.final_norm_weight, eps)
-                    .context("mtp_step: post-final-norm trunk_h")?
-            } else {
-                trunk_h
-            };
+            // The capture is already the trunk hidden the head reads (`TrunkHidden`).
             // `next_token` is the trunk's guaranteed token. Greedy: argmax.
             // Sampling: a genuine sample from the trunk distribution, so the
             // committed stream is a valid sample at temperature T.
@@ -3923,8 +5136,90 @@ mod imp {
                 committed,
                 n_attempted: n_draft,
                 n_accepted,
-                carried_hidden: None,
             })
+        }
+
+        /// Fold a prefill chunk into the MTP head's history: `rows` the trunk hidden the head
+        /// reads at the chunk's positions `pos .. pos + tokens.len()` (the forward's capture),
+        /// `tokens` the chunk. Every pair whose next token the chunk holds enters the head
+        /// cache; the chunk's last row stays pending for the token after it. A no-op without an
+        /// MTP head or with `mtp_history` off.
+        pub(crate) fn mtp_fold_prompt(
+            &self,
+            history: &mut MtpHistory,
+            rows: Array,
+            tokens: &[u32],
+            pos: usize,
+        ) -> Result<()> {
+            let Some(block) = self.mtp.as_ref() else {
+                return Ok(());
+            };
+            if !mtp_history::get() || tokens.is_empty() {
+                return Ok(());
+            }
+            let (rows, next_tokens) = match history.take_pending_for(pos) {
+                Some(p) => {
+                    let rows = mlx_rs::ops::concatenate_axis(&[&p.rows, &rows], 1)
+                        .context("mtp prime: join the pending rows")?;
+                    let mut next = p.tokens;
+                    next.extend_from_slice(tokens);
+                    (rows, next)
+                }
+                None => {
+                    history.restart_at(pos);
+                    (rows, tokens[1..].to_vec())
+                }
+            };
+            let first = history.frontier();
+            let n = next_tokens.len() as i32;
+            if n > 0 {
+                let fold_idx: Vec<i32> = (0..n).collect();
+                let fold_rows = rows
+                    .take_axis(Array::from_slice(&fold_idx, &[n]), 1)
+                    .context("mtp prime: rows to fold")?;
+                let ids: Vec<i32> = next_tokens.iter().map(|&x| x as i32).collect();
+                let embeds = self.embed_lookup_ids(&Array::from_slice(&ids, &[n]))?;
+                block
+                    .forward_last(
+                        &embeds,
+                        &fold_rows,
+                        &mut history.kv,
+                        /* causal */ n > 1,
+                        &self.final_norm_weight,
+                        &self.trunk_lm_head_view(),
+                        /* head */ false,
+                    )
+                    .context("mtp prime: fold forward")?;
+                // Materialized per chunk, so a long prompt holds one chunk's rows.
+                if let (Some(k), Some(v)) = (history.kv.keys(), history.kv.values()) {
+                    mlx_rs::transforms::async_eval([k, v]).context("mtp prime: evaluate")?;
+                }
+            }
+            let last = rows
+                .take_axis(Array::from_slice(&[n], &[1]), 1)
+                .context("mtp prime: last row")?;
+            history.pending = Some(MtpPending {
+                rows: last,
+                tokens: Vec::new(),
+                pos: first + n as usize,
+            });
+            Ok(())
+        }
+
+        /// Whether a prefill should capture its hidden for [`Self::mtp_fold_prompt`].
+        pub(crate) fn mtp_primes(&self) -> bool {
+            self.mtp.is_some() && mtp_history::get()
+        }
+
+        /// Capture the trunk hidden the MTP head reads on the forwards that follow (`on`), or
+        /// stop.
+        pub(crate) fn capture_prompt_rows(&self, on: bool) {
+            self.set_mtp_capture_enabled(on);
+        }
+
+        /// The rows the last forward captured, taken.
+        pub(crate) fn take_prompt_rows(&self) -> Option<Array> {
+            self.take_captured_h()
         }
 
         /// One MTP speculative step, MTPLX-style **single trunk forward** per
@@ -3952,10 +5247,9 @@ mod imp {
         fn mtp_step_one_forward(
             &self,
             trunk_cache: &mut NativePromptCache,
-            mtp_kv: &mut NativeKvCache,
+            history: &mut MtpHistory,
             committed_token: u32,
             n_draft: usize,
-            carried_hidden: Option<Array>,
             cfg: &SamplingConfig,
         ) -> Result<MtpStepOutput> {
             let block = self
@@ -3966,12 +5260,11 @@ mod imp {
             // Sampling vs greedy (see 2-forward `mtp_step` for the rationale).
             let sampling = cfg.temperature > 0.0;
             let entry_off = trunk_cache.full_attn_offset();
-            let mut rng =
-                Xorshift64::new(cfg.seed.wrapping_add(entry_off as u64).wrapping_add(0xA5));
+            let mut rng = Xorshift64::at_position(cfg.seed, entry_off as u64, MTP_RNG_STREAM);
 
-            // Fresh K-step extrapolation each cycle — cross-cycle context lives
-            // in the trunk cache; the drafter only needs intra-step attention.
-            mtp_kv.clear();
+            // The head keeps its history across cycles (`mtp_history`); without
+            // it each cycle drafts from an empty head cache.
+            let keep_history = mtp_history::get();
 
             // Per-stage timing (LUMEN_MTP_STAGE_TIMING=1) — localizes the K>1
             // overhead (drafter head-fwds vs verify forward vs SSM rollback) so
@@ -3998,9 +5291,14 @@ mod imp {
             //   - emit_lead: whether lead_token is new output this cycle
             //     (bootstrap: next_token is new; steady: committed_token was
             //     already emitted last cycle as that cycle's correction).
-            let (lead_token, h_draft, emit_lead) = match carried_hidden {
+            // The rows the first draft folds: the pending verify rows of the last
+            // cycle (steady), or a Step-A forward's (bootstrap: no history ends at
+            // `committed_token`, e.g. the first cycle after a plain decode).
+            let entry = trunk_cache.full_attn_offset();
+            let pending = history.take_pending_for(entry);
+            let (lead_token, fold, emit_lead) = match pending {
                 None => {
-                    // BOOTSTRAP (cycle 0): seed the carry with a Step-A forward.
+                    // BOOTSTRAP: seed the carry with a Step-A forward.
                     self.set_mtp_capture_enabled(true);
                     let logits_a = self
                         .forward_with_opts(
@@ -4022,14 +5320,24 @@ mod imp {
                             .context("mtp_step1: bootstrap argmax")?
                     };
                     // cache: M -> M+1 (committed_token now at M).
-                    (next_token, h0, true)
+                    history.restart_at(entry);
+                    let fold = MtpPending {
+                        rows: h0,
+                        tokens: Vec::new(),
+                        pos: entry,
+                    };
+                    (next_token, fold, true)
                 }
-                Some(h) => {
-                    // STEADY: committed_token = previous cycle's correction
-                    // (already emitted). It enters the cache via verify_in[0];
-                    // h is its predecessor hidden, carried from the prior verify.
-                    (committed_token, h, false)
-                }
+                // STEADY: committed_token = previous cycle's correction (already
+                // emitted). It enters the cache via verify_in[0]; the fold is the
+                // verify rows up to its predecessor.
+                Some(p) => (committed_token, p, false),
+            };
+            let fold = if keep_history {
+                fold
+            } else {
+                history.kv.clear();
+                fold.last()?
             };
 
             // Offset where the verify forward will write `lead_token`.
@@ -4037,30 +5345,85 @@ mod imp {
 
             // === Drafter loop: extrapolate K tokens from (lead_token, h_draft) ===
             let trunk_final_norm_w = self.final_norm_weight.clone();
-            let trunk_lm_head = self.trunk_lm_head_view();
-            let mut last_h = h_draft;
+            // Greedy drafts read the coarse copy when there is one; a sampled draft is drawn from
+            // the head's own distribution, which the acceptance test then divides by.
+            let trunk_lm_head = match (&self.mtp_draft_lm_head, sampling) {
+                (Some(coarse), false) => coarse.clone(),
+                _ => self.trunk_lm_head_view(),
+            };
+            let mut last_h: Option<Array> = None;
             let mut last_tok = lead_token;
+            let mut fold_end = history.kv.offset();
             let mut drafts: Vec<u32> = Vec::with_capacity(n_draft);
             let mut draft_qs: Vec<Vec<f32>> = if sampling {
                 Vec::with_capacity(n_draft)
             } else {
                 Vec::new()
             };
+            // Greedy drafts stay on the GPU: the verify takes them as unevaluated argmaxes, so the
+            // drafter and the verify run back to back and the verify graph is built while the
+            // drafter runs. Its tokens are read with the verify's own argmaxes, one wait a cycle
+            // instead of two. Sampling picks drafts on the host; the stage timer waits per stage.
+            let lazy = !sampling && !st;
+            let mut lazy_drafts: Vec<Array> = Vec::with_capacity(if lazy { n_draft } else { 0 });
             let t_draft0 = st.then(Instant::now);
             for k in 0..n_draft {
-                let embeds = self
-                    .embed_lookup_single(last_tok)
-                    .with_context(|| format!("mtp_step1: drafter embed k={k}"))?;
-                let (logits_b, new_h) = block
-                    .forward(
-                        &embeds,
-                        &last_h,
-                        mtp_kv,
-                        /* causal */ false,
-                        &trunk_final_norm_w,
-                        &trunk_lm_head,
-                    )
-                    .with_context(|| format!("mtp_step1: drafter block.forward k={k}"))?;
+                let (logits_b, new_h) = match last_h.take() {
+                    // The first draft is the fold's last row: every pending pair and
+                    // (h, lead) enter the head cache in one forward.
+                    None => {
+                        let mut ids: Vec<i32> = fold.tokens.iter().map(|&x| x as i32).collect();
+                        ids.push(lead_token as i32);
+                        let ids = Array::from_slice(&ids, &[ids.len() as i32]);
+                        let embeds = self
+                            .embed_lookup_ids(&ids)
+                            .context("mtp_step1: fold embed")?;
+                        let out = block
+                            .forward_last(
+                                &embeds,
+                                &fold.rows,
+                                &mut history.kv,
+                                /* causal */ !fold.tokens.is_empty(),
+                                &trunk_final_norm_w,
+                                &trunk_lm_head,
+                                /* head */ true,
+                            )
+                            .context("mtp_step1: fold forward")?
+                            .ok_or_else(|| anyhow!("mtp_step1: fold returned no head"))?;
+                        fold_end = history.kv.offset();
+                        out
+                    }
+                    // The chained drafts run on a tail of the head cache that is cut
+                    // off below: only committed pairs stay.
+                    Some(h) => {
+                        let embeds = match lazy_drafts.last() {
+                            Some(prev) => self.embed_lookup_ids(prev),
+                            None => self.embed_lookup_single(last_tok),
+                        }
+                        .with_context(|| format!("mtp_step1: drafter embed k={k}"))?;
+                        block
+                            .forward(
+                                &embeds,
+                                &h,
+                                &mut history.kv,
+                                /* causal */ false,
+                                &trunk_final_norm_w,
+                                &trunk_lm_head,
+                            )
+                            .with_context(|| format!("mtp_step1: drafter block.forward k={k}"))?
+                    }
+                };
+                if lazy {
+                    let draft = self
+                        .argmax_last_token_lazy(&logits_b)
+                        .and_then(|d| {
+                            Ok(mlx_rs::ops::reshape(&d, &[1])?.as_dtype(mlx_rs::Dtype::Int32)?)
+                        })
+                        .with_context(|| format!("mtp_step1: drafter lazy argmax k={k}"))?;
+                    lazy_drafts.push(draft);
+                    last_h = Some(new_h);
+                    continue;
+                }
                 let draft_tok = if sampling {
                     let mut row = self.logits_row_to_cpu_f32(&logits_b, -1)?;
                     let q = sampling_distribution(&mut row, &[], cfg);
@@ -4072,9 +5435,13 @@ mod imp {
                         .with_context(|| format!("mtp_step1: drafter argmax k={k}"))?
                 };
                 drafts.push(draft_tok);
-                last_h = new_h;
+                last_h = Some(new_h);
                 last_tok = draft_tok;
             }
+            history
+                .kv
+                .truncate_to(fold_end)
+                .context("mtp_step1: cut the draft tail off the head cache")?;
             if let Some(t) = t_draft0 {
                 t_draft = t.elapsed().as_secs_f64() * 1000.0;
             }
@@ -4092,9 +5459,26 @@ mod imp {
 
             // === Verify [lead_token, drafts]; capture ALL-position trunk hidden
             //     (for the next cycle's carry) + per-position SSM state. ===
-            let mut verify_in: Vec<u32> = Vec::with_capacity(1 + n_draft);
-            verify_in.push(lead_token);
-            verify_in.extend_from_slice(&drafts);
+            let lead = Array::from_slice(&[lead_token as i32], &[1]);
+            let lazy_ids = if lazy {
+                let ids = mlx_rs::ops::concatenate_axis(&lazy_drafts, 0)
+                    .context("mtp_step1: gather the lazy drafts")?;
+                // Start the drafter now: the GPU runs it while the verify graph is built.
+                mlx_rs::transforms::async_eval([&ids]).context("mtp_step1: start the drafter")?;
+                Some(ids)
+            } else {
+                None
+            };
+            let verify_ids = match &lazy_ids {
+                Some(d) => mlx_rs::ops::concatenate_axis(&[&lead, d], 0)
+                    .context("mtp_step1: verify ids")?,
+                None => {
+                    let mut ids: Vec<i32> = Vec::with_capacity(1 + n_draft);
+                    ids.push(lead_token as i32);
+                    ids.extend(drafts.iter().map(|&d| d as i32));
+                    Array::from_slice(&ids, &[ids.len() as i32])
+                }
+            };
             if use_capture {
                 self.set_ssm_capture_enabled(true);
             }
@@ -4102,8 +5486,15 @@ mod imp {
             // slice, so the capture slot holds [1, K+1, hidden].
             self.set_mtp_capture_enabled(true);
             let t_verify0 = st.then(Instant::now);
-            let verify_logits = self
-                .forward(&verify_in, trunk_cache)
+            let (verify_logits, _) = self
+                .forward_ids(
+                    &verify_ids,
+                    trunk_cache,
+                    /* last_only */ false,
+                    &[],
+                    RopePlan::Sequential,
+                    None,
+                )
                 .context("mtp_step1: verify forward")?;
             if st {
                 // Force the whole verify graph (SSM + capture writes are ancestors
@@ -4166,7 +5557,14 @@ mod imp {
                 .context("mtp_step1: accept argmax")?
                 .as_dtype(mlx_rs::Dtype::Int32)
                 .context("mtp_step1: accept cast i32")?;
-                argmax_per_pos.eval().context("mtp_step1: accept eval")?;
+                match &lazy_ids {
+                    Some(d) => {
+                        mlx_rs::transforms::eval([&argmax_per_pos, d])
+                            .context("mtp_step1: accept eval")?;
+                        drafts = d.as_slice::<i32>().iter().map(|&x| x as u32).collect();
+                    }
+                    None => argmax_per_pos.eval().context("mtp_step1: accept eval")?,
+                }
                 let preds_i32: &[i32] = argmax_per_pos.as_slice();
                 let preds: Vec<u32> = preds_i32.iter().map(|x| *x as u32).collect();
                 let mut acc = 0usize;
@@ -4188,20 +5586,23 @@ mod imp {
                 t_accept = t.elapsed().as_secs_f64() * 1000.0;
             }
 
-            // Next cycle's carry: trunk pre-final-norm hidden at verify position
-            // n_accepted = predecessor hidden of the correction token. Same
-            // capture site/distribution as the bootstrap's h_draft.
+            // Next cycle's fold: the verify rows of the lead and the accepted
+            // drafts (positions verify_base ..= verify_base + n_accepted), whose
+            // last is the correction's predecessor.
             let t_carry0 = st.then(Instant::now);
-            let idx = Array::from_slice(&[n_accepted as i32], &[1]);
-            let next_carried = verify_hidden_all
-                .take_axis(&idx, 1)
-                .context("mtp_step1: select verify_hidden[n_accepted]")?;
+            let keep: Vec<i32> = (0..=n_accepted as i32).collect();
+            let rows = verify_hidden_all
+                .take_axis(Array::from_slice(&keep, &[keep.len() as i32]), 1)
+                .context("mtp_step1: select the accepted verify rows")?;
             if st {
-                next_carried
-                    .eval()
-                    .context("mtp_step1: carry timing eval")?;
+                rows.eval().context("mtp_step1: carry timing eval")?;
                 t_carry = t_carry0.unwrap().elapsed().as_secs_f64() * 1000.0;
             }
+            history.pending = Some(MtpPending {
+                rows,
+                tokens: drafts[..n_accepted].to_vec(),
+                pos: verify_base,
+            });
 
             // === Rollback to keep [lead_token, accepted_drafts] ===
             let t_roll0 = st.then(Instant::now);
@@ -4260,7 +5661,6 @@ mod imp {
                 committed,
                 n_attempted: n_draft,
                 n_accepted,
-                carried_hidden: Some(next_carried),
             })
         }
 
@@ -4270,6 +5670,13 @@ mod imp {
         /// Mirrors `int(mx.argmax(logits[0, -1]).item())` from `mlx_runner.py`
         /// for a `[B=1, L, V]` logits tensor.
         pub fn argmax_last_token(&self, logits: &Array) -> Result<u32> {
+            Self::read_token(&self.argmax_last_token_lazy(logits)?)
+        }
+
+        /// [`Self::argmax_last_token`] without the read: the 0-d `u32` argmax,
+        /// still a graph. Evaluate it with `async_eval` and read it later with
+        /// [`Self::read_token`], or feed it to [`Self::forward_decode_lazy`].
+        pub fn argmax_last_token_lazy(&self, logits: &Array) -> Result<Array> {
             if logits.ndim() != 3 {
                 return Err(anyhow!(
                     "argmax_last_token: expected [B, L, V] logits, got ndim={}",
@@ -4284,8 +5691,12 @@ mod imp {
                 .take_axis(&idx_last, 1)
                 .context("argmax_last_token: take_axis(L-1) failed")?;
             // 2) full-reduce argmax over the [B=1, V] view → 0-d scalar (B=1 in runner)
-            let scalar = mlx_rs::ops::indexing::argmax(&last_row, /* keep_dims */ false)
-                .context("argmax_last_token: argmax (full reduce) failed")?;
+            mlx_rs::ops::indexing::argmax(&last_row, /* keep_dims */ false)
+                .context("argmax_last_token: argmax (full reduce) failed")
+        }
+
+        /// Read a 0-d `u32` token array, evaluating it if it is not yet.
+        pub fn read_token(scalar: &Array) -> Result<u32> {
             // Read scalar via try_as_slice (single eval). mlx-rs Array::try_item
             // calls eval() twice (mlx-rs-0.25.3/src/array/mod.rs:317-321), which
             // doubles command-buffer submits on every decode step. try_as_slice
@@ -4297,6 +5708,160 @@ mod imp {
                 .first()
                 .copied()
                 .ok_or_else(|| anyhow!("argmax_last_token: argmax produced empty slice"))
+        }
+    }
+
+    #[cfg(test)]
+    mod coarse_head_tests {
+        use super::{MODE_AFFINE, ResolvedLinear, coarse_lm_head, quantize_with_mode};
+        use crate::native_quant::dequantize_with_mode;
+        use mlx_rs::{Array, Dtype};
+
+        fn bits(a: &Array) -> Vec<u32> {
+            let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
+            a.eval().unwrap();
+            a.as_slice::<f32>().iter().map(|v| v.to_bits()).collect()
+        }
+
+        /// The packed words of quantized weights, as stored.
+        fn words(a: &Array) -> Vec<u32> {
+            let a = a.reshape(&[-1]).unwrap();
+            a.eval().unwrap();
+            a.as_slice::<u32>().to_vec()
+        }
+
+        /// `rows x 128` weights quantized at `b` bits, group 64.
+        fn head(rows: i32, b: i32) -> ResolvedLinear {
+            let n = (rows * 128) as usize;
+            let w: Vec<f32> = (0..n)
+                .map(|i| ((i as f32 + 1.0) * 0.37).sin() * 0.1)
+                .collect();
+            let w = Array::from_slice(&w, &[rows, 128])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let (weight, scales, biases) = quantize_with_mode(&w, 64, b, MODE_AFFINE).unwrap();
+            ResolvedLinear {
+                weight,
+                scales,
+                biases,
+                group_size: 64,
+                bits: b,
+                mode: MODE_AFFINE,
+            }
+        }
+
+        /// The copy is what quantizing the whole dequantized head to 4 bits gives, bit for bit,
+        /// across a slab boundary: rows quantize on their own, so slabs change nothing.
+        #[test]
+        fn the_copy_is_the_whole_head_at_four_bits() {
+            let lm = head(16384 + 77, 8);
+            let copy = coarse_lm_head(&lm)
+                .unwrap()
+                .expect("an 8-bit head gets a copy");
+            let whole = dequantize_with_mode(
+                &lm.weight,
+                &lm.scales,
+                lm.biases.as_ref(),
+                64,
+                8,
+                MODE_AFFINE,
+            )
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+            let (w, s, b) = quantize_with_mode(&whole, 64, 4, MODE_AFFINE).unwrap();
+            assert_eq!((copy.bits, copy.group_size), (4, 64));
+            assert_eq!(copy.weight.shape(), w.shape());
+            assert_eq!(words(&copy.weight), words(&w), "weights");
+            assert_eq!(bits(&copy.scales), bits(&s), "scales");
+            assert_eq!(
+                bits(copy.biases.as_ref().unwrap()),
+                bits(b.as_ref().unwrap()),
+                "biases"
+            );
+        }
+
+        /// A head at 4 bits is what the drafts read already.
+        #[test]
+        fn a_four_bit_head_gets_no_copy() {
+            assert!(coarse_lm_head(&head(64, 4)).unwrap().is_none());
+        }
+    }
+
+    #[cfg(test)]
+    mod mtp_history_tests {
+        use super::{MtpHistory, MtpPending};
+
+        /// `n` pairs into the head cache, as a fold would put them.
+        fn fold(h: &mut MtpHistory, n: i32) {
+            let kv = mlx_rs::ops::zeros::<f32>(&[1, 1, n, 4]).expect("kv");
+            h.kv.update_and_fetch(&kv, &kv).expect("append");
+        }
+
+        fn pending(pos: usize, rows: usize) -> MtpPending {
+            MtpPending {
+                rows: mlx_rs::ops::zeros::<f32>(&[1, rows as i32, 4]).expect("rows"),
+                tokens: vec![7; rows - 1],
+                pos,
+            }
+        }
+
+        /// A cycle continues the history only from rows that end at its lead and start where
+        /// the cache ends; anything else starts the cache over at the rows (acceptance is all
+        /// a wrong history costs, but it must never shift positions).
+        #[test]
+        fn a_fold_continues_the_cache_only_where_it_ends() {
+            let mut h = MtpHistory::new();
+            h.restart_at(0);
+            fold(&mut h, 9);
+            h.pending = Some(pending(9, 3));
+            // Rows 9, 10, 11: the lead is at 12.
+            assert!(
+                h.take_pending_for(11).is_none(),
+                "a lead before the rows' end"
+            );
+            h.pending = Some(pending(9, 3));
+            let p = h.take_pending_for(12).expect("rows ending at the lead");
+            assert_eq!((p.pos, p.tokens.len()), (9, 2));
+            assert_eq!((h.start, h.kv.offset()), (0, 9), "the cache continues");
+            // Rows after a gap (the cache ends at 9, the rows start at 20) restart it.
+            h.pending = Some(pending(20, 2));
+            let _ = h.take_pending_for(22).expect("rows ending at the lead");
+            assert_eq!(
+                (h.start, h.kv.offset()),
+                (20, 0),
+                "the cache restarts at the rows"
+            );
+        }
+
+        /// A rollback point brings back what the cache held and what was pending at the mark,
+        /// and an empty history when the cache restarted since.
+        #[test]
+        fn a_rollback_returns_the_history_of_its_mark() {
+            let mut h = MtpHistory::new();
+            h.restart_at(0);
+            fold(&mut h, 5);
+            h.pending = Some(pending(5, 1));
+            let mark = h.mark();
+            fold(&mut h, 4);
+            h.pending = Some(pending(9, 2));
+            h.restore(&mark).expect("restore");
+            assert_eq!(h.kv.offset(), 5);
+            let p = h.pending.as_ref().expect("pending at the mark");
+            assert_eq!((p.pos, p.end()), (5, 6));
+            // Restarted elsewhere after the mark: nothing of it is left to return to.
+            h.restart_at(40);
+            fold(&mut h, 3);
+            h.restore(&mark).expect("restore");
+            assert_eq!((h.kv.offset(), h.pending.is_none()), (0, true));
+        }
+
+        /// Without history a cycle folds the last pending row alone, at its own position.
+        #[test]
+        fn the_last_row_of_the_pending_is_the_lead_predecessor() {
+            let p = pending(30, 3).last().expect("last");
+            assert_eq!((p.pos, p.tokens.len(), p.end()), (32, 0, 33));
+            assert_eq!(p.rows.shape(), &[1, 1, 4]);
         }
     }
 }
@@ -4332,11 +5897,25 @@ pub(crate) use imp::{ResolvedLinear, argmax_rows};
 #[cfg(feature = "mlx-native")]
 pub use imp::MtpStepOutput;
 
+/// The MTP head's history of a sequence and a point to return it to (runner seq state).
+#[cfg(feature = "mlx-native")]
+pub(crate) use imp::{MtpHistory, MtpMark};
+
 /// bf16 KV storage toggle. Public so an A/B harness can flip it between runs in
 /// one process rather than relying on a per-process env read — see
 /// `examples/kv_bf16_ab.rs`.
 #[cfg(feature = "mlx-native")]
 pub use imp::set_kv_store_bf16;
+
+/// bf16 activation cast toggle, for the same kind of harness — see
+/// `examples/kv_bf16_quality.rs --act-bf16`.
+#[cfg(feature = "mlx-native")]
+pub use imp::set_act_bf16;
+
+/// Decode-kernel toggle for the same kind of harness — see
+/// `examples/kv_bf16_quality.rs --fused-moe-decode`.
+#[cfg(feature = "mlx-native")]
+pub use imp::set_fused_moe_decode;
 
 // ───────────────────────── unit tests ─────────────────────────
 //
@@ -4843,6 +6422,13 @@ mod config_tests {
 
 /// Serving the routed experts from an SSD-backed slot pool must not change a
 /// single bit of the model's output (task 023).
+///
+/// These tests are written for the A3B mxfp4 checkpoint, and hold on the A3B affine one as well.
+/// An affine 4-bit group-64 checkpoint's resident decode steps run the MoE decode kernels
+/// (`LUMEN_NATIVE_FUSED_MOE_DECODE`), which the offload path cannot (it gathers from the bank's
+/// per-role pools, not from stacked tensors); the kernels equal the composed ops in every bit, so
+/// the offloaded output still equals the resident one. Run them on the affine checkpoint with
+/// `LUMEN_QWEN35_MODEL_DIR` pointing at it.
 #[cfg(all(test, feature = "mlx-native"))]
 mod offload_tests {
     use super::imp::NativeQwen3_5MoeModel;

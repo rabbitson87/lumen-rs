@@ -406,7 +406,11 @@ fn source_mentions(var: &str) -> Result<bool, String> {
 /// three-way mode for the contiguous expert pack. None is a boolean; the first two change
 /// which tokens are drafted (the output can differ at near-ties, documented in
 /// `docs/flash-next.md`), the third only the layout the same bytes are read from.
-const UNMANAGED_BASELINE: usize = 194;
+/// 194 -> 195 with `LUMEN_PROBE_ABLATE`: a comma list of decode stages to replace with a
+/// stand-in, so the timing that remains prices the stage. It carries a value, so `flag!` cannot
+/// hold it, and its output is garbage by design: a profiling probe like the other `LUMEN_PROBE_*`
+/// reads, never a setting.
+const UNMANAGED_BASELINE: usize = 195;
 
 /// Every `LUMEN_*` read via `env::var` in library source, and whether the
 /// registry knows about it.

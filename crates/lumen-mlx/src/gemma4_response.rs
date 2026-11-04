@@ -377,9 +377,13 @@ pub(crate) mod imp {
             // Body string (without the bracket tokens, which we'll add as
             // the special-token boundaries):
             //   call:get_weather{city:<|"|>Seoul<|"|>}
+            // Encoded the way the model writes it — `<|"|>` as its token,
+            // not as text — so not with `encode_plain`.
             let body = tpl
-                .encode_plain(r#"call:get_weather{city:<|"|>Seoul<|"|>}"#)
+                .tokenizer()
+                .encode(r#"call:get_weather{city:<|"|>Seoul<|"|>}"#, false)
                 .expect("encode body");
+            assert!(body.contains(&52), "the delimiters must be <|\"|> tokens");
 
             let mut p = ResponseParser::new(&tpl);
             p.push(TOK_TOOL_CALL_OPEN).expect("open tool");

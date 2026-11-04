@@ -1,0 +1,7 @@
+<tool_call>
+<function=read>
+　<parameter=path>
+x
+</parameter>
+</function>
+</tool_call>

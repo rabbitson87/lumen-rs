@@ -49,8 +49,10 @@ cargo tauri build
 ```
 
 Outputs land in `target/release/bundle/macos/Lumen.app` and `target/release/bundle/dmg/`.
-For distribution you'll need code signing (`signingIdentity` in `tauri.conf.json::bundle.macOS`)
-and notarization via `xcrun notarytool`.
+The bundle is signed ad-hoc (`signingIdentity: "-"` in `tauri.conf.json::bundle.macOS`) and
+not notarized. Releases ship that way; users clear the download's quarantine once
+(`xattr -dr com.apple.quarantine /Applications/Lumen.app`, see the top-level README). See
+[docs/release.md](docs/release.md).
 
 ## Architecture
 

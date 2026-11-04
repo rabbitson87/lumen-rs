@@ -20,7 +20,7 @@ use crate::native_attention::{sdpa, sdpa_with_mask};
 use crate::native_cache::NativeKvCache;
 use crate::native_embedding::quantized_embedding_lookup_with_mode;
 use crate::native_moe::{
-    AffineGateWeights, GateProj, MoeBlockWeights, OffloadLayer, SharedMlpWeights,
+    AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, OffloadLayer, SharedMlpWeights,
     SwitchExpertWeights, SwitchGluWeights, moe_after_routing, moe_block_forward, moe_router,
 };
 use crate::native_quant::MODE_AFFINE;
@@ -493,12 +493,15 @@ impl MoeLayer {
         MoeBlockWeights {
             gate: self.gate.view(),
             switch_glu: SwitchGluWeights {
-                gate_proj: proj(&self.switch_gate),
-                up_proj: proj(&self.switch_up),
+                gate_up: GateUpWeights::Split {
+                    gate: proj(&self.switch_gate),
+                    up: proj(&self.switch_up),
+                },
                 down_proj: proj(&self.switch_down),
                 group_size: self.switch_group_size,
                 bits: self.switch_bits,
                 mode: MODE_AFFINE,
+                decode_views: None,
             },
             shared_expert: SharedMlpWeights {
                 gate_proj_w: &self.shared_gate_proj.weight,
@@ -518,6 +521,7 @@ impl MoeLayer {
             top_k: self.top_k,
             norm_topk_prob: true,
             experts_in_scale_dtype: true,
+            fused_decode: false,
             offload: offload.map(|offload| OffloadLayer {
                 offload,
                 layer: self.layer,

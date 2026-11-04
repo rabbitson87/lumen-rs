@@ -248,6 +248,45 @@ pub struct Qwen35MtpBlock {
     // shared_head_head is **always** the trunk's lm_head on Qwen3.6 —
     // the checkpoint never ships `mtp.shared_head_head.*`. Caller threads
     // the trunk's lm_head through `forward()`.
+    /// Which trunk hidden the head reads.
+    pub trunk_hidden: TrunkHidden,
+}
+
+/// The trunk hidden an MTP head was trained or calibrated on: the last layer's residual, or that
+/// after the trunk's final norm (what vLLM hands Qwen3-Next-style heads, its model output). The
+/// head's own `pre_fc_norm_hidden` follows either way, so the two differ by the final norm's
+/// per-channel gain. MTPLX records it as `mtp_contract.base_hidden_variant`.
+///
+/// Measured, greedy, five prompts paired, Qwen3.6-27B-MTPLX (no contract): after the norm is
+/// ahead by +0.034 acceptance at K=1 and +0.053 at K=2, 4 of 5 prompts each, one tie. The
+/// 35B-A3B head's contract says before, and there the math prompt drops 0.639 -> 0.574 after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrunkHidden {
+    BeforeFinalNorm,
+    AfterFinalNorm,
+}
+
+impl TrunkHidden {
+    /// From a head's `mtplx_runtime.json` (`mtp_contract`, at the top or under
+    /// `forge_provenance`): `pre_norm` / `post_norm`; without a contract, after the norm.
+    fn from_runtime(runtime: Option<&serde_json::Value>) -> Result<Self> {
+        let contract = runtime.and_then(|r| {
+            r.get("mtp_contract").or_else(|| {
+                r.get("forge_provenance")
+                    .and_then(|f| f.get("mtp_contract"))
+            })
+        });
+        match contract.and_then(|c| c.get("base_hidden_variant")) {
+            None => Ok(Self::AfterFinalNorm),
+            Some(v) => match v.as_str() {
+                Some("pre_norm") => Ok(Self::BeforeFinalNorm),
+                Some("post_norm") => Ok(Self::AfterFinalNorm),
+                _ => Err(anyhow!(
+                    "mtplx_runtime.json: base_hidden_variant {v} is neither pre_norm nor post_norm"
+                )),
+            },
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -259,8 +298,8 @@ impl Qwen35MtpBlock {
     ///
     /// * `embeds`     — `embed_tokens(x_{p+1})`, shape `[B, T, hidden]`. Caller
     ///   pre-embeds via the trunk's embedding table.
-    /// * `h_pre`      — trunk's pre-final-norm hidden at the same T positions,
-    ///   shape `[B, T, hidden]`. Same dtype as `embeds`.
+    /// * `h_pre`      — the trunk hidden the head reads ([`TrunkHidden`]) at the
+    ///   same T positions, shape `[B, T, hidden]`. Same dtype as `embeds`.
     /// * `cache`      — the MTP block's own KV cache (lifetime: per seq).
     ///   Position offset is read from `cache.offset()`.
     /// * `causal`     — `true` when `T > 1` (verify-batch or prefill-mirror);
@@ -283,6 +322,18 @@ impl Qwen35MtpBlock {
         trunk_final_norm_weight: &Array,
         trunk_lm_head: &ResolvedLinear,
     ) -> Result<(Array, Array)> {
+        let cur = self.body(embeds, h_pre, cache, causal)?;
+        self.head(cur, trunk_final_norm_weight, trunk_lm_head)
+    }
+
+    /// Steps 1-4 of [`Self::forward`]: the block's output for every row, `[B, T, hidden]`.
+    fn body(
+        &self,
+        embeds: &Array,
+        h_pre: &Array,
+        cache: &mut NativeKvCache,
+        causal: bool,
+    ) -> Result<Array> {
         // ── shape sanity ─────────────────────────────────────────────────
         let e_shape = embeds.shape();
         let h_shape = h_pre.shape();
@@ -371,6 +422,38 @@ impl Qwen35MtpBlock {
         cur = mlx_rs::ops::add(&mlp_out, &res_ffn)
             .context("Qwen35MtpBlock: residual add (ffn) failed")?;
 
+        let _ = hidden; // dims sanity check above already locked it
+        Ok(cur)
+    }
+
+    /// The head of [`Self::forward`] on the block's output `cur`: the head norm, the lm_head, and
+    /// the hidden the next chained draft reads.
+    fn head(
+        &self,
+        cur: Array,
+        trunk_final_norm_weight: &Array,
+        trunk_lm_head: &ResolvedLinear,
+    ) -> Result<(Array, Array)> {
+        let eps = self.dims.rms_norm_eps;
+        let dbg = std::env::var("LUMEN_MTP_DEBUG")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let stat = |tag: &str, a: &Array| {
+            if !dbg {
+                return;
+            }
+            let f = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            let amax = mlx_rs::ops::abs(&f).unwrap().max(None).unwrap();
+            let amean = mlx_rs::ops::abs(&f).unwrap().mean(None).unwrap();
+            amax.eval().ok();
+            amean.eval().ok();
+            eprintln!(
+                "[mtp.block] {tag:<16} shape={:?} |max|={:.4} |mean|={:.4}",
+                a.shape(),
+                amax.as_slice::<f32>()[0],
+                amean.as_slice::<f32>()[0]
+            );
+        };
         // ── (5) stash new_h_pre BEFORE head norm ─────────────────────────
         // The AR draft loop pairs this with the next sampled token id.
         let new_h_pre = cur.clone();
@@ -401,8 +484,36 @@ impl Qwen35MtpBlock {
             new_h_pre
         };
 
-        let _ = hidden; // dims sanity check above already locked it
         Ok((logits, chained_hidden))
+    }
+
+    /// [`Self::forward`] with the head on the last row only: `T` pairs enter the block's cache
+    /// (a fold of the trunk's history), and the logits and chained hidden of the last row come
+    /// back, `[B, 1, ...]`. `head = false` skips the head (a prompt fold reads no logits).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_last(
+        &self,
+        embeds: &Array,
+        h_pre: &Array,
+        cache: &mut NativeKvCache,
+        causal: bool,
+        trunk_final_norm_weight: &Array,
+        trunk_lm_head: &ResolvedLinear,
+        head: bool,
+    ) -> Result<Option<(Array, Array)>> {
+        let cur = self.body(embeds, h_pre, cache, causal)?;
+        if !head {
+            return Ok(None);
+        }
+        let t = cur.shape()[1];
+        let last = if t > 1 {
+            cur.take_axis(Array::from_slice(&[t - 1], &[1]), 1)
+                .context("Qwen35MtpBlock: last row")?
+        } else {
+            cur
+        };
+        self.head(last, trunk_final_norm_weight, trunk_lm_head)
+            .map(Some)
     }
 
     /// Self-attention with the block's own KV cache. Same structure as the
@@ -527,8 +638,8 @@ impl Qwen35MtpBlock {
     /// resolved weights. Matches the trunk's middle-layer MoE dispatch.
     fn moe_mlp_forward(&self, x: &Array, w: &Qwen35MtpMoeMlp) -> Result<Array> {
         use crate::native_moe::{
-            AffineGateWeights, GateProj, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights,
-            SwitchGluWeights, moe_block_forward,
+            AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, SharedMlpWeights,
+            SwitchExpertWeights, SwitchGluWeights, moe_block_forward,
         };
         let view = MoeBlockWeights {
             gate: GateProj::Affine(AffineGateWeights {
@@ -539,15 +650,17 @@ impl Qwen35MtpBlock {
                 bits: w.gate_bits,
             }),
             switch_glu: SwitchGluWeights {
-                gate_proj: SwitchExpertWeights {
-                    weight: &w.sw_gate_w,
-                    scales: &w.sw_gate_s,
-                    biases: w.sw_gate_b.as_ref(),
-                },
-                up_proj: SwitchExpertWeights {
-                    weight: &w.sw_up_w,
-                    scales: &w.sw_up_s,
-                    biases: w.sw_up_b.as_ref(),
+                gate_up: GateUpWeights::Split {
+                    gate: SwitchExpertWeights {
+                        weight: &w.sw_gate_w,
+                        scales: &w.sw_gate_s,
+                        biases: w.sw_gate_b.as_ref(),
+                    },
+                    up: SwitchExpertWeights {
+                        weight: &w.sw_up_w,
+                        scales: &w.sw_up_s,
+                        biases: w.sw_up_b.as_ref(),
+                    },
                 },
                 down_proj: SwitchExpertWeights {
                     weight: &w.sw_down_w,
@@ -557,6 +670,7 @@ impl Qwen35MtpBlock {
                 group_size: w.sw_gs,
                 bits: w.sw_bits,
                 mode: w.sw_mode,
+                decode_views: None,
             },
             shared_expert: SharedMlpWeights {
                 gate_proj_w: &w.se_gate_w,
@@ -582,6 +696,7 @@ impl Qwen35MtpBlock {
             top_k: w.top_k,
             norm_topk_prob: w.norm_topk_prob,
             experts_in_scale_dtype: false,
+            fused_decode: false,
             offload: None,
         };
         moe_block_forward(x, &view)
@@ -731,6 +846,8 @@ impl Qwen35MtpDrafter {
 pub enum MtpLoadQuant {
     /// AFFINE 4-bit, group_size=64 (or 32 to halve scale memory).
     Affine4 { group_size: i32 },
+    /// AFFINE 8-bit: a bf16 head at about half its bytes, closer to it than 4 bits.
+    Affine8 { group_size: i32 },
     /// MXFP4 block-scaled exponents, group_size=32. Production trunk format.
     Mxfp4,
     /// Keep bf16. Slower per step but no quant-time at load.
@@ -740,7 +857,9 @@ pub enum MtpLoadQuant {
 impl MtpLoadQuant {
     fn group_size(&self) -> i32 {
         match self {
-            MtpLoadQuant::Affine4 { group_size } => *group_size,
+            MtpLoadQuant::Affine4 { group_size } | MtpLoadQuant::Affine8 { group_size } => {
+                *group_size
+            }
             MtpLoadQuant::Mxfp4 => 32,
             MtpLoadQuant::Bf16 => 0,
         }
@@ -748,13 +867,14 @@ impl MtpLoadQuant {
     fn bits(&self) -> i32 {
         match self {
             MtpLoadQuant::Affine4 { .. } | MtpLoadQuant::Mxfp4 => 4,
+            MtpLoadQuant::Affine8 { .. } => 8,
             MtpLoadQuant::Bf16 => 16,
         }
     }
     fn mode_cstr(&self) -> Option<&'static std::ffi::CStr> {
         use crate::native_quant::{MODE_AFFINE, MODE_MXFP4};
         match self {
-            MtpLoadQuant::Affine4 { .. } => Some(MODE_AFFINE),
+            MtpLoadQuant::Affine4 { .. } | MtpLoadQuant::Affine8 { .. } => Some(MODE_AFFINE),
             MtpLoadQuant::Mxfp4 => Some(MODE_MXFP4),
             MtpLoadQuant::Bf16 => None,
         }
@@ -875,6 +995,14 @@ pub fn load_block_from_hf(
         .and_then(|v| v.as_object())
         .ok_or_else(|| anyhow!("missing `weight_map` object in {}", index_path.display()))?;
 
+    // MTPLX bundles describe the head in `mtplx_runtime.json` (sidecar file, hidden contract).
+    let runtime: Option<serde_json::Value> =
+        std::fs::read_to_string(hf_dir.join("mtplx_runtime.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+    let trunk_hidden = TrunkHidden::from_runtime(runtime.as_ref())?;
+    eprintln!("[mtp] the head reads the trunk hidden {trunk_hidden:?}");
+
     let mut mtp_to_shard: HashMap<String, String> = HashMap::new();
     for (key, val) in weight_map {
         if key.starts_with("mtp.")
@@ -920,9 +1048,10 @@ pub fn load_block_from_hf(
             hf_dir.join("mtp.safetensors"),
             hf_dir.join("mtp").join("weights.safetensors"),
         ];
-        if let Ok(rt) = std::fs::read_to_string(hf_dir.join("mtplx_runtime.json"))
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&rt)
-            && let Some(f) = v.get("mtp_file").and_then(|x| x.as_str())
+        if let Some(f) = runtime
+            .as_ref()
+            .and_then(|v| v.get("mtp_file"))
+            .and_then(|x| x.as_str())
         {
             candidates.insert(0, hf_dir.join(f));
         }
@@ -1233,6 +1362,114 @@ pub fn load_block_from_hf(
         post_attention_layernorm,
         mlp,
         shared_head_norm,
+        trunk_hidden,
+    })
+}
+
+/// One projection of every routed expert, stacked `[E, out, in_packed]` for `gather_qmm`.
+struct QuantizedExperts {
+    weight: Array,
+    scales: Array,
+    biases: Option<Array>,
+}
+
+/// The routed experts' three projections and their shared quantization.
+struct RoutedExperts {
+    gate: QuantizedExperts,
+    up: QuantizedExperts,
+    down: QuantizedExperts,
+    group_size: i32,
+    bits: i32,
+    mode: &'static CStr,
+}
+
+fn expert_key(expert: i32, proj: &str, part: &str) -> String {
+    format!("mtp.layers.0.mlp.experts.{expert}.{proj}.{part}")
+}
+
+/// The routed experts of a head that ships them quantized one expert at a time
+/// (`mtp.layers.0.mlp.experts.{i}.{gate,up,down}_proj.{weight,scales,biases}`, affine; MTPLX's
+/// Qwen3.6-35B-A3B head is 4-bit group 32), stacked into the layout the bf16 path quantizes to.
+/// Bits and group size are read off the shapes, and every expert and projection must agree on
+/// them: `gather_qmm` takes one of each for the whole stack.
+fn stack_prequantized_experts(
+    tensors: &mut std::collections::HashMap<String, Array>,
+    experts: i32,
+    inter: i32,
+    hidden: i32,
+) -> Result<RoutedExperts> {
+    use crate::native_quant::MODE_AFFINE;
+    let mut layout: Option<(i32, i32)> = None;
+    let mut stack = |proj: &str, out: i32, inputs: i32| -> Result<QuantizedExperts> {
+        let mut parts: [Vec<Array>; 3] = Default::default();
+        for i in 0..experts {
+            let [w, s, b] = ["weight", "scales", "biases"].map(|part| {
+                let key = expert_key(i, proj, part);
+                tensors
+                    .remove(&key)
+                    .ok_or_else(|| anyhow!("MoE MTP loader: missing key `{key}`"))
+            });
+            let (w, s, b) = (w?, s?, b?);
+            let (packed, groups) = (w.shape().get(1).copied(), s.shape().get(1).copied());
+            let (Some(packed), Some(groups)) = (packed, groups) else {
+                return Err(anyhow!("{}: not a matrix", expert_key(i, proj, "weight")));
+            };
+            let found = (32 * packed / inputs.max(1), inputs / groups.max(1));
+            let exact = w.dtype() == mlx_rs::Dtype::Uint32
+                && w.shape() == [out, packed]
+                && s.shape() == [out, groups]
+                && b.shape() == s.shape()
+                && found.0 * inputs == 32 * packed
+                && found.1 * groups == inputs;
+            if !exact {
+                return Err(anyhow!(
+                    "{}: weight {:?} {:?}, scales {:?}, biases {:?} do not quantize [{out}, {inputs}]",
+                    expert_key(i, proj, "*"),
+                    w.dtype(),
+                    w.shape(),
+                    s.shape(),
+                    b.shape()
+                ));
+            }
+            match layout {
+                None => layout = Some(found),
+                Some(l) if l != found => {
+                    return Err(anyhow!(
+                        "{}: {} bits, group {} where the others have {} bits, group {}",
+                        expert_key(i, proj, "*"),
+                        found.0,
+                        found.1,
+                        l.0,
+                        l.1
+                    ));
+                }
+                Some(_) => {}
+            }
+            for (stack, a) in parts.iter_mut().zip([w, s, b]) {
+                stack.push(a);
+            }
+        }
+        let [w, s, b] = parts.map(|p| mlx_rs::ops::stack(&p));
+        let (weight, scales, biases) = (w?, s?, b?);
+        mlx_rs::transforms::eval([&weight, &scales, &biases])
+            .with_context(|| format!("MoE MTP: stack experts.{proj}"))?;
+        Ok(QuantizedExperts {
+            weight,
+            scales,
+            biases: Some(biases),
+        })
+    };
+    let gate = stack("gate_proj", inter, hidden)?;
+    let up = stack("up_proj", inter, hidden)?;
+    let down = stack("down_proj", hidden, inter)?;
+    let (bits, group_size) = layout.ok_or_else(|| anyhow!("MoE MTP loader: no experts"))?;
+    Ok(RoutedExperts {
+        gate,
+        up,
+        down,
+        group_size,
+        bits,
+        mode: MODE_AFFINE,
     })
 }
 
@@ -1247,6 +1484,8 @@ pub fn load_block_from_hf(
 ///   * `mtp.layers.0.mlp.experts.gate_up_proj` — bf16 fused
 ///     `[E, 2*I, H]`; split along axis 1 into 2x `[E, I, H]` then MXFP4 group 32.
 ///   * `mtp.layers.0.mlp.experts.down_proj` — bf16 `[E, H, I]`; MXFP4 group 32.
+///   * or the experts quantized one at a time, kept as they ship
+///     ([`stack_prequantized_experts`]).
 fn load_moe_mlp_from_tensors(
     tensors: &mut std::collections::HashMap<String, Array>,
     hidden: i32,
@@ -1293,40 +1532,54 @@ fn load_moe_mlp_from_tensors(
     let sg_b =
         sg_b_opt.ok_or_else(|| anyhow!("MoE MTP: shared_expert_gate quant must produce biases"))?;
 
-    // ── Switch GLU experts (MXFP4 group 32) ───────────────────────────────
-    // Fused `experts.gate_up_proj` ships as bf16 [E, 2*I, H]. We split along
-    // axis 1 — first I rows are gate_proj, next I rows are up_proj — then
-    // quantize each 3D tile independently. Matches what mlx-lm's
-    // sanitize() + MXFP4 conversion script would have produced for the
-    // trunk's middle layers.
-    let gu_fused_bf16 = take(
-        tensors,
-        "mtp.layers.0.mlp.experts.gate_up_proj",
-        &[e, 2 * i_per_expert, hidden],
-    )?;
-    let halves =
-        mlx_rs::ops::split(&gu_fused_bf16, 2, 1).context("MoE MTP: split fused gate_up_proj")?;
-    if halves.len() != 2 {
-        return Err(anyhow!(
-            "MoE MTP: split(gate_up_proj) returned {} parts (want 2)",
-            halves.len()
-        ));
-    }
-    let mut halves_iter = halves.into_iter();
-    let gate_tile_bf16 = halves_iter.next().expect("gate half present");
-    let up_tile_bf16 = halves_iter.next().expect("up half present");
-    let (sw_gate_w, sw_gate_s, _) = quantize_with_mode(&gate_tile_bf16, 32, 4, MODE_MXFP4)
-        .context("MoE MTP: quantize experts.gate tile (MXFP4)")?;
-    let (sw_up_w, sw_up_s, _) = quantize_with_mode(&up_tile_bf16, 32, 4, MODE_MXFP4)
-        .context("MoE MTP: quantize experts.up tile (MXFP4)")?;
-
-    let down_3d_bf16 = take(
-        tensors,
-        "mtp.layers.0.mlp.experts.down_proj",
-        &[e, hidden, i_per_expert],
-    )?;
-    let (sw_down_w, sw_down_s, _) = quantize_with_mode(&down_3d_bf16, 32, 4, MODE_MXFP4)
-        .context("MoE MTP: quantize experts.down (MXFP4)")?;
+    // ── Switch GLU experts ────────────────────────────────────────────────
+    let experts = if tensors.contains_key(&expert_key(0, "gate_proj", "weight")) {
+        stack_prequantized_experts(tensors, e, i_per_expert, hidden)?
+    } else {
+        // Fused `experts.gate_up_proj` ships as bf16 [E, 2*I, H]. We split along
+        // axis 1 — first I rows are gate_proj, next I rows are up_proj — then
+        // quantize each 3D tile independently (MXFP4 group 32). Matches what
+        // mlx-lm's sanitize() + MXFP4 conversion script would have produced for
+        // the trunk's middle layers.
+        let gu_fused_bf16 = take(
+            tensors,
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            &[e, 2 * i_per_expert, hidden],
+        )?;
+        let halves = mlx_rs::ops::split(&gu_fused_bf16, 2, 1)
+            .context("MoE MTP: split fused gate_up_proj")?;
+        if halves.len() != 2 {
+            return Err(anyhow!(
+                "MoE MTP: split(gate_up_proj) returned {} parts (want 2)",
+                halves.len()
+            ));
+        }
+        let mut halves_iter = halves.into_iter();
+        let gate_tile_bf16 = halves_iter.next().expect("gate half present");
+        let up_tile_bf16 = halves_iter.next().expect("up half present");
+        let mxfp4 = |w: &Array, what: &str| -> Result<QuantizedExperts> {
+            let (weight, scales, _) = quantize_with_mode(w, 32, 4, MODE_MXFP4)
+                .with_context(|| format!("MoE MTP: quantize experts.{what} (MXFP4)"))?;
+            Ok(QuantizedExperts {
+                weight,
+                scales,
+                biases: None,
+            })
+        };
+        let down_3d_bf16 = take(
+            tensors,
+            "mtp.layers.0.mlp.experts.down_proj",
+            &[e, hidden, i_per_expert],
+        )?;
+        RoutedExperts {
+            gate: mxfp4(&gate_tile_bf16, "gate tile")?,
+            up: mxfp4(&up_tile_bf16, "up tile")?,
+            down: mxfp4(&down_3d_bf16, "down")?,
+            group_size: 32,
+            bits: 4,
+            mode: MODE_MXFP4,
+        }
+    };
 
     // ── Shared dense expert (MXFP4 group 32) ──────────────────────────────
     let se_gate_w_bf16 = take(
@@ -1362,18 +1615,18 @@ fn load_moe_mlp_from_tensors(
         sg_b,
         sg_gs: 64,
         sg_bits: 8,
-        sw_gate_w,
-        sw_gate_s,
-        sw_up_w,
-        sw_up_s,
-        sw_down_w,
-        sw_down_s,
-        sw_gate_b: None,
-        sw_up_b: None,
-        sw_down_b: None,
-        sw_gs: 32,
-        sw_bits: 4,
-        sw_mode: MODE_MXFP4,
+        sw_gate_w: experts.gate.weight,
+        sw_gate_s: experts.gate.scales,
+        sw_up_w: experts.up.weight,
+        sw_up_s: experts.up.scales,
+        sw_down_w: experts.down.weight,
+        sw_down_s: experts.down.scales,
+        sw_gate_b: experts.gate.biases,
+        sw_up_b: experts.up.biases,
+        sw_down_b: experts.down.biases,
+        sw_gs: experts.group_size,
+        sw_bits: experts.bits,
+        sw_mode: experts.mode,
         se_gate_w,
         se_gate_s,
         se_up_w,
@@ -1614,6 +1867,7 @@ pub fn run_step_b_synthetic_bench(t_values: &[i32], runs: usize) -> Result<Vec<S
         post_attention_layernorm,
         mlp,
         shared_head_norm,
+        trunk_hidden: TrunkHidden::AfterFinalNorm,
     };
 
     // trunk_lm_head is the largest matmul in Step B's output stage; synth at
@@ -1930,5 +2184,143 @@ mod shape_derivation_tests {
             err.to_string().contains("intermediate_size"),
             "error should name the missing field, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod prequantized_expert_tests {
+    use super::{expert_key, stack_prequantized_experts};
+    use crate::native_quant::{MODE_AFFINE, quantize_with_mode};
+    use mlx_rs::{Array, Dtype, random};
+    use std::collections::HashMap;
+
+    const EXPERTS: i32 = 3;
+    const INTER: i32 = 64;
+    const HIDDEN: i32 = 128;
+
+    /// Evaluated here: MLX's global random key is left as a lazy split of this thread's stream
+    /// until a draw is evaluated, and the next test, on another thread, would inherit it.
+    fn bf16_experts(out: i32, inputs: i32, seed: u64) -> Array {
+        random::seed(seed).expect("seed");
+        let w = random::normal::<f32>(&[EXPERTS, out, inputs], None, None, None).expect("w");
+        let w = w.as_dtype(Dtype::Bfloat16).expect("bf16");
+        w.eval().expect("eval");
+        w
+    }
+
+    /// Each expert of `stack` quantized alone at `group` under the checkpoint's per-expert keys.
+    fn ship(tensors: &mut HashMap<String, Array>, proj: &str, stack: &Array, group: i32) {
+        for i in 0..EXPERTS {
+            let one = stack.take_axis(Array::from_int(i), 0).expect("expert");
+            let (w, s, b) = quantize_with_mode(&one, group, 4, MODE_AFFINE).expect("quantize");
+            tensors.insert(expert_key(i, proj, "weight"), w);
+            tensors.insert(expert_key(i, proj, "scales"), s);
+            tensors.insert(expert_key(i, proj, "biases"), b.expect("affine biases"));
+        }
+    }
+
+    fn same(a: &Array, b: &Array) -> bool {
+        a.shape() == b.shape() && a.array_eq(b, None).expect("eq").item::<bool>()
+    }
+
+    /// Experts shipped quantized one at a time stack into exactly what quantizing the stacked
+    /// experts gives: affine groups run along the input axis, so the expert axis cannot move a
+    /// bit. Bits and group size come off the shapes, and the experts' keys are consumed.
+    #[test]
+    fn experts_quantized_one_at_a_time_stack_as_the_stack_quantizes() {
+        let projections = [
+            ("gate_proj", bf16_experts(INTER, HIDDEN, 1)),
+            ("up_proj", bf16_experts(INTER, HIDDEN, 2)),
+            ("down_proj", bf16_experts(HIDDEN, INTER, 3)),
+        ];
+        let mut tensors = HashMap::new();
+        for (proj, stack) in &projections {
+            ship(&mut tensors, proj, stack, 32);
+        }
+        let got = stack_prequantized_experts(&mut tensors, EXPERTS, INTER, HIDDEN).expect("stack");
+        assert!(tensors.is_empty(), "left over: {:?}", tensors.keys());
+        assert_eq!((got.bits, got.group_size), (4, 32));
+        for ((proj, stack), q) in projections.iter().zip([&got.gate, &got.up, &got.down]) {
+            let (w, s, b) = quantize_with_mode(stack, 32, 4, MODE_AFFINE).expect("quantize");
+            let b = b.expect("affine biases");
+            let qb = q.biases.as_ref().expect("stacked biases");
+            assert!(
+                same(&q.weight, &w) && same(&q.scales, &s) && same(qb, &b),
+                "{proj}: the stacked experts differ from the quantized stack"
+            );
+        }
+    }
+
+    /// One `gather_qmm` call takes one group size for the whole stack: an expert shipped at
+    /// another is an error naming it, not a stack read at the wrong group.
+    #[test]
+    fn an_expert_at_another_group_size_is_an_error() {
+        let mut tensors = HashMap::new();
+        ship(
+            &mut tensors,
+            "gate_proj",
+            &bf16_experts(INTER, HIDDEN, 4),
+            32,
+        );
+        ship(&mut tensors, "up_proj", &bf16_experts(INTER, HIDDEN, 5), 32);
+        let down = bf16_experts(HIDDEN, INTER, 6);
+        ship(&mut tensors, "down_proj", &down, 32);
+        let last = down
+            .take_axis(Array::from_int(EXPERTS - 1), 0)
+            .expect("expert");
+        let (w, s, b) = quantize_with_mode(&last, 64, 4, MODE_AFFINE).expect("quantize");
+        tensors.insert(expert_key(EXPERTS - 1, "down_proj", "weight"), w);
+        tensors.insert(expert_key(EXPERTS - 1, "down_proj", "scales"), s);
+        tensors.insert(
+            expert_key(EXPERTS - 1, "down_proj", "biases"),
+            b.expect("biases"),
+        );
+        let err = stack_prequantized_experts(&mut tensors, EXPERTS, INTER, HIDDEN)
+            .err()
+            .expect("a mixed group size must not stack");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("experts.{}.down_proj", EXPERTS - 1)) && msg.contains("group 64"),
+            "the error should name the expert and its group: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod trunk_hidden_tests {
+    use super::TrunkHidden;
+
+    fn read(json: &str) -> anyhow::Result<TrunkHidden> {
+        TrunkHidden::from_runtime(Some(&serde_json::from_str(json).expect("json")))
+    }
+
+    /// The contract is read wherever MTPLX puts it, and a head without one reads the hidden after
+    /// the final norm, as vLLM feeds Qwen3-Next-style heads.
+    #[test]
+    fn the_contract_decides_and_its_absence_means_after_the_norm() {
+        let top = r#"{"mtp_contract": {"base_hidden_variant": "pre_norm"}}"#;
+        let nested =
+            r#"{"forge_provenance": {"mtp_contract": {"base_hidden_variant": "pre_norm"}}}"#;
+        let post = r#"{"mtp_contract": {"base_hidden_variant": "post_norm"}}"#;
+        assert_eq!(read(top).expect("top"), TrunkHidden::BeforeFinalNorm);
+        assert_eq!(read(nested).expect("nested"), TrunkHidden::BeforeFinalNorm);
+        assert_eq!(read(post).expect("post"), TrunkHidden::AfterFinalNorm);
+        assert_eq!(
+            read(r#"{"mtp_file": "mtp.safetensors"}"#).expect("none"),
+            TrunkHidden::AfterFinalNorm
+        );
+        assert_eq!(
+            TrunkHidden::from_runtime(None).expect("no file"),
+            TrunkHidden::AfterFinalNorm
+        );
+    }
+
+    /// A value it does not know is an error, not a silent default: the wrong hidden costs only
+    /// acceptance, which no output check would catch.
+    #[test]
+    fn an_unknown_variant_is_an_error() {
+        let err = read(r#"{"mtp_contract": {"base_hidden_variant": "mid_norm"}}"#)
+            .expect_err("unknown variant");
+        assert!(err.to_string().contains("mid_norm"), "{err}");
     }
 }

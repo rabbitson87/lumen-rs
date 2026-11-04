@@ -1,0 +1,7 @@
+<tool_call>
+<function=read>
+한국어 😀 <parameter=path>
+x
+</parameter>
+</function>
+</tool_call>

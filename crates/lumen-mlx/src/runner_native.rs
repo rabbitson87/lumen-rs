@@ -14,28 +14,44 @@ mod imp {
 
     use crate::config_serde::deserialize_token_ids;
     use crate::kv_disk::{DiskKvStore, KvManifest};
-    use crate::native_cache::{NativeKvCache, NativePromptCache, SharedPrefixKv};
+    use crate::native_cache::{NativePromptCache, SharedPrefixKv};
     use crate::native_runtime::{FineTimings, take_fine_timings};
     use crate::native_snapshot::{PromptCacheSnapshot, RollbackPoint};
-    use crate::qwen3_5_moe::{MtpStepOutput, NativeQwen3_5MoeModel};
+    use crate::qwen3_5_moe::{MtpHistory, MtpMark, MtpStepOutput, NativeQwen3_5MoeModel};
     use crate::qwen3_5_mtp::Qwen35MtpBlock;
     use std::collections::HashMap;
+
+    lumen_flags::flag! {
+        /// Build each greedy decode step while the one before it is still running.
+        ///
+        /// Blocking decode reads a token, then builds the next step's graph with
+        /// the GPU idle; on a small-active-parameter MoE that build is ~2.5 ms of a
+        /// ~13 ms step. With this on, a loop that feeds every token back as the
+        /// next input (`decode_step_chained`) submits step N+1 -- built from step
+        /// N's unread argmax -- before it reads step N, as mlx-lm's `generate_step`
+        /// does. The same graphs run in the same order, so the tokens are
+        /// bit-identical; the one extra step a loop leaves running when it stops is
+        /// taken back before anything else touches the sequence.
+        ///
+        /// Does nothing (falls back to blocking decode) under SSD expert offload,
+        /// MTP, `LUMEN_NATIVE_TIMING`, or a quantized / TurboQuant KV cache.
+        pub(crate) pipeline_decode {
+            env: "LUMEN_NATIVE_PIPELINE_DECODE",
+            default: true,
+            kind: Optimization,
+        }
+    }
 
     /// Per-sequence runtime state held by the native runner.
     struct NativeSeqState {
         cache: NativePromptCache,
         position: usize,
-        /// MTP block's own KV cache (one full-attention layer; see
-        /// `qwen3_5_mtp::Qwen35MtpBlock`). Cleared at the start of every
-        /// `mtp_step` call (fresh K-step extrapolation). Idle / unused when
-        /// MTP is not enabled.
-        mtp_kv: NativeKvCache,
-        /// 1-forward MTP carry (`LUMEN_MTP_ONE_FORWARD`): the trunk hidden that
-        /// predecessor-seeds the next cycle's drafter. `None` at seq creation
-        /// (forces a bootstrap Step-A on the first `mtp_step`); thereafter holds
-        /// `verify_hidden[n_accepted]` from the prior cycle. Idle on the
-        /// 2-forward path (which always returns `None`).
-        mtp_carried: Option<mlx_rs::Array>,
+        /// What the MTP head has seen of this seq (its own attention cache and
+        /// the trunk rows waiting to enter it): primed by prefill and extend,
+        /// grown by every MTP cycle. Empty when MTP is not enabled.
+        mtp: MtpHistory,
+        /// The head history at the rollback point, returned to with it.
+        mtp_mark: Option<MtpMark>,
         /// Prompt token ids this seq was prefilled with. Used by the batched
         /// scheduler's shared-prefix dedup (Phase 4) to compute the longest
         /// common prompt prefix across the active batch. Empty for seqs created
@@ -55,6 +71,117 @@ mod imp {
         /// beside it: each state holds the whole prefix, so a conversation
         /// would otherwise leave one file per prefill chunk it grew by.
         persisted_key: Option<String>,
+        /// A decode step already built and running on the GPU that the caller
+        /// has not asked for yet -- see [`PendingStep`]. While it is `Some` the
+        /// cache is one token ahead of `position`.
+        pending: Option<PendingStep>,
+    }
+
+    /// The next decode step of a chained greedy loop, built while the one before
+    /// it was still running.
+    ///
+    /// Blocking decode reads each token before it builds the next step's graph,
+    /// so the GPU idles for the whole of that build -- 2.5 ms of a 13 ms step on
+    /// a small-active-parameter MoE. Here the step after the one being returned
+    /// is built from the *unread* argmax and submitted first, so the build
+    /// overlaps the GPU. The price is that the cache runs one token past what the
+    /// caller has been told; `undo` is the way back.
+    struct PendingStep {
+        /// 0-d `u32` argmax of this step, already submitted with `async_eval`.
+        out: Array,
+        /// The token this step consumes. The caller's next call is this step's
+        /// only if it passes exactly this token.
+        input: u32,
+        /// The cache as it was before this step consumed `input`.
+        undo: RollbackPoint,
+    }
+
+    impl NativeSeqState {
+        /// Take back a step that was built ahead and never asked for, so the
+        /// cache is what `position` says it is again. A no-op when none is
+        /// pending.
+        fn settle(&mut self) -> Result<()> {
+            if let Some(step) = self.pending.take() {
+                step.undo
+                    .restore_into(&mut self.cache)
+                    .context("native mlx-rs runner: take back the decode step built ahead")?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Where a built-ahead step gets its token.
+    enum StepInput<'a> {
+        /// Read already.
+        Token(u32),
+        /// The previous step's argmax, not read yet.
+        Lazy(&'a Array),
+    }
+
+    /// The runner's sequences.
+    ///
+    /// A chained decode leaves its sequence's cache one token ahead of its
+    /// position, so any other reader would see a state that is not the
+    /// sequence's. This type makes that unreachable rather than something each
+    /// method must remember: every way to a sequence's state settles it first,
+    /// except [`Self::get_ahead_mut`], which exists for the chained decode
+    /// itself.
+    #[derive(Default)]
+    struct SeqTable(HashMap<u64, NativeSeqState>);
+
+    impl SeqTable {
+        fn clear(&mut self) {
+            self.0.clear();
+        }
+
+        fn contains_key(&self, id: &u64) -> bool {
+            self.0.contains_key(id)
+        }
+
+        fn insert(&mut self, id: u64, state: NativeSeqState) {
+            self.0.insert(id, state);
+        }
+
+        /// Dropping a sequence drops what was built ahead with it; nothing is
+        /// taken back because there is nothing left to be consistent with.
+        fn remove(&mut self, id: &u64) -> Option<NativeSeqState> {
+            self.0.remove(id)
+        }
+
+        /// A sequence's prompt, which a step built ahead does not touch.
+        fn prompt(&self, id: &u64) -> Option<&[u32]> {
+            self.0.get(id).map(|s| s.prompt.as_slice())
+        }
+
+        fn get_mut(&mut self, id: &u64) -> Result<Option<&mut NativeSeqState>> {
+            match self.0.get_mut(id) {
+                Some(state) => {
+                    state.settle()?;
+                    Ok(Some(state))
+                }
+                None => Ok(None),
+            }
+        }
+
+        /// The sequence as it is, step built ahead and all. Only the chained
+        /// decode, which owns that step, may look at it this way.
+        fn get_ahead_mut(&mut self, id: &u64) -> Option<&mut NativeSeqState> {
+            self.0.get_mut(id)
+        }
+
+        fn settle_all(&mut self) -> Result<()> {
+            self.0.values_mut().try_for_each(NativeSeqState::settle)
+        }
+
+        fn values(&mut self) -> Result<impl Iterator<Item = &NativeSeqState>> {
+            self.settle_all()?;
+            Ok(self.0.values())
+        }
+
+        fn iter_mut(&mut self) -> Result<impl Iterator<Item = (&u64, &mut NativeSeqState)>> {
+            self.settle_all()?;
+            Ok(self.0.iter_mut())
+        }
     }
 
     /// process-wide background worker that runs
@@ -156,7 +283,7 @@ mod imp {
 
     pub(crate) struct NativeMlxRunner {
         model: Option<NativeQwen3_5MoeModel>,
-        seqs: HashMap<u64, NativeSeqState>,
+        seqs: SeqTable,
         /// `Some` when `LUMEN_NATIVE_TIMING=1`. Each entry is
         /// `(forward_ms, tail_ms)` for one `decode_step` call. Adds an extra
         /// `eval()` after `forward()` to split the two halves cleanly, so the
@@ -620,8 +747,45 @@ mod imp {
         last_only: bool,
         label: &str,
         vision: Option<(&[[i32; 3]], &[(usize, usize)], &[Array])>,
+        mut prime: Option<&mut MtpHistory>,
     ) -> Result<Array> {
         let n = tokens.len();
+        // One chunk's forward from `start`; with `prime`, its trunk hidden also enters the MTP
+        // head's history (`mtp_fold_prompt`).
+        let mut chunk_forward = |toks: &[u32],
+                                 cache: &mut NativePromptCache,
+                                 lo: bool,
+                                 start: usize|
+         -> Result<Array> {
+            let primes = prime.is_some() && model.mtp_primes();
+            let pos = cache.full_attn_offset();
+            if primes {
+                model.capture_prompt_rows(true);
+            }
+            let out = match vision {
+                Some((positions, runs, soft)) => model.forward_chunk_with_images(
+                    toks,
+                    cache,
+                    lo,
+                    &positions[start..start + toks.len()],
+                    start,
+                    runs,
+                    soft,
+                ),
+                None => model.forward_with_opts(toks, cache, lo),
+            };
+            if primes {
+                model.capture_prompt_rows(false);
+            }
+            let out = out?;
+            if primes
+                && let (Some(history), Some(rows)) =
+                    (prime.as_deref_mut(), model.take_prompt_rows())
+            {
+                model.mtp_fold_prompt(history, rows, toks, pos)?;
+            }
+            Ok(out)
+        };
         // ── Always-chunk invariant: bound full-attn scores per chunk ──
         // Qwen3.x is hybrid: linear-attn layers are O(seq) (cheap), but the
         // full-attention layers (every `full_attention_interval`) form a
@@ -656,12 +820,8 @@ mod imp {
             d.chunk
         };
         if n <= chunk {
-            return match vision {
-                Some((positions, runs, soft)) => model
-                    .forward_chunk_with_images(tokens, cache, last_only, positions, 0, runs, soft),
-                None => model.forward_with_opts(tokens, cache, last_only),
-            }
-            .with_context(|| format!("{label}: forward ({n} tokens)"));
+            return chunk_forward(tokens, cache, last_only, 0)
+                .with_context(|| format!("{label}: forward ({n} tokens)"));
         }
         let n_chunks = n.div_ceil(chunk);
         let report = std::env::var("LUMEN_QWEN35_PREFILL_CHUNK_LOG")
@@ -678,19 +838,7 @@ mod imp {
             // discarded. The final chunk honours the caller's `last_only`.
             let lo = if is_last { last_only } else { true };
             let t0 = report.then(std::time::Instant::now);
-            let out = match vision {
-                Some((positions, runs, soft)) => model.forward_chunk_with_images(
-                    &tokens[start..end],
-                    cache,
-                    lo,
-                    &positions[start..end],
-                    start,
-                    runs,
-                    soft,
-                ),
-                None => model.forward_with_opts(&tokens[start..end], cache, lo),
-            }
-            .with_context(|| {
+            let out = chunk_forward(&tokens[start..end], cache, lo, start).with_context(|| {
                 format!(
                     "{label}: chunk {}/{} ({} tokens)",
                     idx + 1,
@@ -758,7 +906,7 @@ mod imp {
             let any_timing = timing_enabled || stage_only;
             Ok(Self {
                 model: None,
-                seqs: HashMap::new(),
+                seqs: SeqTable::default(),
                 timing_log: if any_timing { Some(Vec::new()) } else { None },
                 fine_timing_log: if timing_enabled {
                     Some(Vec::new())
@@ -898,6 +1046,7 @@ mod imp {
                 .as_ref()
                 .map(|(p, r, s)| (p.as_slice(), r.as_slice(), s.as_slice()));
 
+            let mut mtp = MtpHistory::new();
             let logits = forward_chunked(
                 model,
                 tokens,
@@ -905,6 +1054,7 @@ mod imp {
                 last_only,
                 "native-prefill",
                 vision_ref,
+                Some(&mut mtp),
             )
             .with_context(|| format!("native mlx-rs runner: prefill forward (seq_id={seq_id})"))?;
             if timing_on {
@@ -951,12 +1101,13 @@ mod imp {
                 NativeSeqState {
                     cache,
                     position,
-                    mtp_kv: NativeKvCache::new(),
-                    mtp_carried: None,
+                    mtp,
+                    mtp_mark: None,
                     prompt: tokens.to_vec(),
                     mrope_delta,
                     rollback: None,
                     persisted_key: None,
+                    pending: None,
                 },
             );
             Ok((next_tok, position))
@@ -1031,12 +1182,13 @@ mod imp {
                 NativeSeqState {
                     cache,
                     position,
-                    mtp_kv: NativeKvCache::new(),
-                    mtp_carried: None,
+                    mtp: MtpHistory::new(),
+                    mtp_mark: None,
                     prompt: tokens.to_vec(),
                     mrope_delta: 0,
                     rollback: None,
                     persisted_key: None,
+                    pending: None,
                 },
             );
             Ok((next_tok, position, captured))
@@ -1086,7 +1238,7 @@ mod imp {
                 .model
                 .as_ref()
                 .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
-            let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+            let state = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: decode_step on unknown seq_id {seq_id}")
             })?;
             let next_tok = if self.timing_log.is_some() {
@@ -1173,6 +1325,122 @@ mod imp {
             Ok((next_tok, state.position))
         }
 
+        /// [`Self::decode_step`] for a greedy loop that feeds each token it gets
+        /// back in as the next input.
+        ///
+        /// Returns exactly what `decode_step` returns, one call at a time, but
+        /// keeps the GPU a step ahead: step N+1 is built from step N's unread
+        /// argmax and submitted before step N is read (see [`PendingStep`]). A
+        /// caller that stops leaves one step running; the next thing to touch
+        /// the sequence takes it back ([`SeqTable`]), so the cache it sees is the
+        /// one `decode_step` would have left.
+        ///
+        /// Anything that cannot be built ahead falls back to the blocking step.
+        pub(crate) fn decode_step_chained(
+            &mut self,
+            seq_id: u64,
+            last_token: u32,
+            position: usize,
+        ) -> Result<(u32, usize)> {
+            if !self.can_chain(seq_id) {
+                return self.decode_step(seq_id, last_token, position);
+            }
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
+            let state = self.seqs.get_ahead_mut(&seq_id).ok_or_else(|| {
+                anyhow!("native mlx-rs runner: decode_step on unknown seq_id {seq_id}")
+            })?;
+            // The step the caller is waiting for: the one built ahead if it
+            // consumed this very token, else a fresh one (after taking back a
+            // stale one).
+            let (current, undo_current) = match state.pending.take() {
+                Some(step) if step.input == last_token => (step.out, step.undo),
+                stale => {
+                    if let Some(step) = stale {
+                        step.undo.restore_into(&mut state.cache).context(
+                            "native mlx-rs runner: take back a decode step built from another token",
+                        )?;
+                    }
+                    Self::submit_step(model, state, StepInput::Token(last_token))?
+                }
+            };
+            // The step after it, from the unread token. Whatever goes wrong from
+            // here leaves the sequence where this call found it.
+            let (next_out, undo_next) =
+                match Self::submit_step(model, state, StepInput::Lazy(&current)) {
+                    Ok(built) => built,
+                    Err(e) => {
+                        let _ = undo_current.restore_into(&mut state.cache);
+                        return Err(e);
+                    }
+                };
+            let token = match NativeQwen3_5MoeModel::read_token(&current) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = undo_current.restore_into(&mut state.cache);
+                    return Err(e);
+                }
+            };
+            state.position += 1;
+            state.pending = Some(PendingStep {
+                out: next_out,
+                input: token,
+                undo: undo_next,
+            });
+            Ok((token, state.position))
+        }
+
+        /// Whether `seq_id`'s next step may be built ahead.
+        fn can_chain(&mut self, seq_id: u64) -> bool {
+            static COUNTING_OPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            // Op counting resets a global counter around each `decode_step`; a
+            // chained step would report the wrong step's ops.
+            let counting = *COUNTING_OPS
+                .get_or_init(|| std::env::var("LUMEN_NATIVE_COUNT_OPS").is_ok_and(|v| v == "1"));
+            pipeline_decode::get()
+                && !counting
+                && self.timing_log.is_none()
+                && self.model.as_ref().is_some_and(|m| m.decode_pipelinable())
+                && self
+                    .seqs
+                    .get_ahead_mut(&seq_id)
+                    .is_some_and(|s| s.cache.rewinds_by_truncation())
+        }
+
+        /// Build one decode step for `state` from `input`, hand it to the GPU and
+        /// return its argmax (unread) with the cache as it was before the step.
+        fn submit_step(
+            model: &NativeQwen3_5MoeModel,
+            state: &mut NativeSeqState,
+            input: StepInput<'_>,
+        ) -> Result<(Array, RollbackPoint)> {
+            let undo = RollbackPoint::capture_lazy(&state.cache, state.position)?;
+            let logits = match input {
+                StepInput::Token(token) => model.forward_decode_shifted(
+                    &[token],
+                    &mut state.cache,
+                    /* last_only */ true,
+                    state.mrope_delta,
+                ),
+                StepInput::Lazy(token) => {
+                    model.forward_decode_lazy(token, &mut state.cache, state.mrope_delta)
+                }
+            };
+            let out = logits.and_then(|l| model.argmax_last_token_lazy(&l));
+            let out = match out {
+                Ok(out) => out,
+                Err(e) => {
+                    let _ = undo.restore_into(&mut state.cache);
+                    return Err(e.context("native mlx-rs runner: chained decode forward"));
+                }
+            };
+            mlx_rs::transforms::async_eval([&out])
+                .context("native mlx-rs runner: chained decode async_eval")?;
+            Ok((out, undo))
+        }
+
         /// Phase 1b: batched decode of N sequences in ONE forward. N==1 delegates
         /// to [`Self::decode_step`] (byte-identical single-seq path). N>=2 borrows
         /// the N per-seq caches disjointly out of `self.seqs` and runs
@@ -1196,7 +1464,10 @@ mod imp {
             // Drop a stale shared prefix once the group that used it is gone.
             if let Some(sp) = &self.shared_prefix {
                 let p = sp.prefix_len;
-                let any_attached = self.seqs.values().any(|s| s.cache.shared_prefix_len() == p);
+                let any_attached = self
+                    .seqs
+                    .values()?
+                    .any(|s| s.cache.shared_prefix_len() == p);
                 if !any_attached {
                     self.shared_prefix = None;
                 }
@@ -1206,7 +1477,7 @@ mod imp {
                 None => {
                     let prompts: Vec<&[u32]> = seq_ids
                         .iter()
-                        .filter_map(|id| self.seqs.get(id).map(|s| s.prompt.as_slice()))
+                        .filter_map(|id| self.seqs.prompt(id))
                         .collect();
                     if prompts.len() < 2 {
                         return Ok(());
@@ -1217,7 +1488,7 @@ mod imp {
                     }
                     let donor_id = seq_ids[0];
                     let shared = {
-                        let donor = self.seqs.get(&donor_id).ok_or_else(|| {
+                        let donor = self.seqs.get_mut(&donor_id)?.ok_or_else(|| {
                             anyhow!("shared-prefix: donor seq {donor_id} missing")
                         })?;
                         if donor.cache.shared_prefix_len() != 0 {
@@ -1227,7 +1498,7 @@ mod imp {
                     };
                     // Every seq shares prompt[..p] by construction of the LCP.
                     for id in seq_ids {
-                        if let Some(s) = self.seqs.get_mut(id)
+                        if let Some(s) = self.seqs.get_mut(id)?
                             && s.cache.shared_prefix_len() == 0
                         {
                             s.cache.keep_suffix_from(p)?;
@@ -1245,12 +1516,12 @@ mod imp {
                     // prefix, using an already-attached seq as the reference.
                     let reference: Option<Vec<u32>> = self
                         .seqs
-                        .values()
+                        .values()?
                         .find(|s| s.cache.shared_prefix_len() == p && s.prompt.len() >= p)
                         .map(|s| s.prompt[..p].to_vec());
                     if let Some(refpx) = reference {
                         for id in seq_ids {
-                            if let Some(s) = self.seqs.get_mut(id)
+                            if let Some(s) = self.seqs.get_mut(id)?
                                 && s.cache.shared_prefix_len() == 0
                                 && s.prompt.len() >= p
                                 && s.prompt[..p] == refpx[..]
@@ -1285,7 +1556,7 @@ mod imp {
                 return Ok(Vec::new());
             }
             if n == 1 {
-                return Ok(vec![self.decode_step(
+                return Ok(vec![self.decode_step_chained(
                     seq_ids[0],
                     last_tokens[0],
                     positions[0],
@@ -1308,7 +1579,7 @@ mod imp {
             // Borrow each requested seq's state exactly once (disjoint by key).
             let mut by_id: std::collections::HashMap<u64, &mut NativeSeqState> = self
                 .seqs
-                .iter_mut()
+                .iter_mut()?
                 .filter(|(k, _)| id_set.contains(k))
                 .map(|(k, v)| (*k, v))
                 .collect();
@@ -1393,7 +1664,7 @@ mod imp {
                 .model
                 .as_ref()
                 .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
-            let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+            let state = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: decode_step_pick on unknown seq_id {seq_id}")
             })?;
             let logits = model
@@ -1488,14 +1759,21 @@ mod imp {
                 .model
                 .as_ref()
                 .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
-            let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+            let state = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: extend on unknown seq_id {seq_id}")
             })?;
-            let logits =
-                forward_chunked(model, tokens, &mut state.cache, true, "native-extend", None)
-                    .with_context(|| {
-                        format!("native mlx-rs runner: extend forward (seq_id={seq_id})")
-                    })?;
+            // The head history continues where the seq's last MTP cycle or prefill left it; a
+            // history that does not end here restarts (`MtpHistory`).
+            let logits = forward_chunked(
+                model,
+                tokens,
+                &mut state.cache,
+                true,
+                "native-extend",
+                None,
+                Some(&mut state.mtp),
+            )
+            .with_context(|| format!("native mlx-rs runner: extend forward (seq_id={seq_id})"))?;
             let next_tok = model.argmax_last_token(&logits)?;
             state.position += tokens.len();
             Ok((next_tok, state.position))
@@ -1541,16 +1819,15 @@ mod imp {
                     "native mlx-rs runner: mtp_step called but MTP not enabled (call enable_mtp first)"
                 ));
             }
-            let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+            let state = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: mtp_step on unknown seq_id {seq_id}")
             })?;
-            let mut out = model
+            let out = model
                 .mtp_step(
                     &mut state.cache,
-                    &mut state.mtp_kv,
+                    &mut state.mtp,
                     committed_token,
                     n_draft,
-                    state.mtp_carried.take(),
                     sampling,
                 )
                 .with_context(|| {
@@ -1559,9 +1836,6 @@ mod imp {
             // Position advances by the number of committed tokens — same
             // semantics as a series of `decode_step` calls.
             state.position += out.committed.len();
-            // Stash the 1-forward carry for the next cycle (None on 2-forward).
-            // Moved out of the returned struct — the upper decode loop ignores it.
-            state.mtp_carried = out.carried_hidden.take();
             Ok(out)
         }
 
@@ -1580,7 +1854,7 @@ mod imp {
                 .model
                 .as_ref()
                 .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
-            let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+            let state = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: forward_probe on unknown seq_id {seq_id}")
             })?;
 
@@ -1652,7 +1926,7 @@ mod imp {
         // semantics.
 
         pub(crate) fn snapshot_state(&mut self, seq_id: u64) -> Result<u64> {
-            let seq = self.seqs.get(&seq_id).ok_or_else(|| {
+            let seq = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: snapshot_state — unknown seq_id {seq_id}")
             })?;
             let snap = PromptCacheSnapshot::capture_shallow(&seq.cache, seq.position)
@@ -1671,7 +1945,7 @@ mod imp {
             let snap = self.snapshots.remove(&snapshot_id).ok_or_else(|| {
                 anyhow!("native mlx-rs runner: restore_state — unknown snapshot_id {snapshot_id}")
             })?;
-            let seq = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+            let seq = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: restore_state — unknown seq_id {seq_id}")
             })?;
             snap.restore_into(&mut seq.cache)
@@ -1700,17 +1974,18 @@ mod imp {
         /// returns to, replacing any earlier one. See [`RollbackPoint`] for why
         /// this costs no copy of the KV.
         pub(crate) fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
-            let seq = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+            let seq = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: mark_rollback — unknown seq_id {seq_id}")
             })?;
             seq.rollback = Some(RollbackPoint::capture(&seq.cache, seq.position)?);
+            seq.mtp_mark = Some(seq.mtp.mark());
             Ok(())
         }
 
         /// Put `seq_id` back to its rollback point and return that position.
         /// The point stays, so the same position can be returned to again.
         pub(crate) fn rollback(&mut self, seq_id: u64) -> Result<usize> {
-            let seq = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+            let seq = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: rollback — unknown seq_id {seq_id}")
             })?;
             let point = seq.rollback.as_ref().ok_or_else(|| {
@@ -1718,9 +1993,11 @@ mod imp {
             })?;
             point.restore_into(&mut seq.cache)?;
             seq.position = point.position();
-            // The MTP carry is the trunk hidden at the position just left; a
-            // fresh bootstrap is the only correct seed from here.
-            seq.mtp_carried = None;
+            // The head history goes back with the trunk: what it held at the mark.
+            match &seq.mtp_mark {
+                Some(mark) => seq.mtp.restore(mark)?,
+                None => seq.mtp.clear(),
+            }
             Ok(seq.position)
         }
 
@@ -1751,7 +2028,7 @@ mod imp {
             if disk.contains(&key) {
                 return Ok(false);
             }
-            let Some(seq) = self.seqs.get(&seq_id) else {
+            let Some(seq) = self.seqs.get_mut(&seq_id)? else {
                 return Ok(false);
             };
             let Some(point) = seq
@@ -1795,7 +2072,7 @@ mod imp {
             // the older state (see `DiskKvStore::supersede`).
             let superseded = self
                 .seqs
-                .get_mut(&seq_id)
+                .get_mut(&seq_id)?
                 .and_then(|s| s.persisted_key.replace(key.clone()))
                 .filter(|old| *old != key);
             if let Some(old) = superseded {
@@ -1880,12 +2157,13 @@ mod imp {
                     NativeSeqState {
                         cache,
                         position: at,
-                        mtp_kv: NativeKvCache::new(),
-                        mtp_carried: None,
+                        mtp: MtpHistory::new(),
+                        mtp_mark: None,
                         prompt: Vec::new(),
                         mrope_delta: 0,
                         rollback: Some(rollback),
                         persisted_key: Some(key),
+                        pending: None,
                     },
                 );
                 return Ok(Some(at));
@@ -1985,7 +2263,7 @@ mod imp {
         }
 
         pub(crate) fn snapshot_state_deep(&mut self, seq_id: u64) -> Result<(u64, usize)> {
-            let seq = self.seqs.get(&seq_id).ok_or_else(|| {
+            let seq = self.seqs.get_mut(&seq_id)?.ok_or_else(|| {
                 anyhow!("native mlx-rs runner: snapshot_state_deep — unknown seq_id {seq_id}")
             })?;
             let snap = PromptCacheSnapshot::capture_deep(&seq.cache, seq.position)
@@ -2031,14 +2309,15 @@ mod imp {
                 NativeSeqState {
                     cache: fresh,
                     position,
-                    mtp_kv: NativeKvCache::new(),
-                    mtp_carried: None,
+                    mtp: MtpHistory::new(),
+                    mtp_mark: None,
                     prompt: Vec::new(),
                     // Snapshots are only taken on text prefixes (image requests
                     // bypass the prefix cache), so there is no shift to carry.
                     mrope_delta: 0,
                     rollback: None,
                     persisted_key: None,
+                    pending: None,
                 },
             );
             Ok(position)
@@ -2869,6 +3148,136 @@ mod imp {
             }
             std::fs::create_dir_all(&root)?;
             Ok(root)
+        }
+    }
+
+    /// Gates for [`NativeMlxRunner::decode_step_chained`].
+    ///
+    /// The chained step must be indistinguishable from `decode_step` to anything
+    /// that looks at the sequence afterwards, so each test compares a sequence
+    /// driven through it with one driven through the blocking step, token for
+    /// token. Every test first checks that a step really was built ahead: a
+    /// chained call that silently fell back to the blocking step would pass the
+    /// comparison without exercising anything.
+    ///
+    /// ```sh
+    /// LUMEN_QWEN35_MODEL_DIR=~/models/Qwen3.5-9B-MTPLX-Speed \
+    ///   cargo test -p lumen-mlx --features mlx-native --release \
+    ///   chained_decode_tests -- --ignored --nocapture --test-threads=1
+    /// ```
+    #[cfg(test)]
+    mod chained_decode_tests {
+        use super::*;
+
+        const PROMPT: [u32; 12] = [
+            9707, 11, 4340, 653, 498, 1936, 264, 4285, 1815, 304, 22775, 30,
+        ];
+
+        fn runner() -> Option<NativeMlxRunner> {
+            let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+                eprintln!("skipping: set LUMEN_QWEN35_MODEL_DIR");
+                return None;
+            };
+            let mut r = NativeMlxRunner::new().expect("runner");
+            r.load(&dir).expect("load");
+            Some(r)
+        }
+
+        /// `n` more tokens of `seq` by `step`, starting from its prefill token.
+        fn drive(
+            r: &mut NativeMlxRunner,
+            seq: u64,
+            first: (u32, usize),
+            n: usize,
+            step: fn(&mut NativeMlxRunner, u64, u32, usize) -> Result<(u32, usize)>,
+        ) -> (Vec<u32>, (u32, usize)) {
+            let (mut last, mut pos) = first;
+            let mut out = vec![last];
+            for _ in 0..n {
+                (last, pos) = step(r, seq, last, pos).expect("decode step");
+                out.push(last);
+            }
+            (out, (last, pos))
+        }
+
+        fn blocking(r: &mut NativeMlxRunner, s: u64, t: u32, p: usize) -> Result<(u32, usize)> {
+            r.decode_step(s, t, p)
+        }
+
+        fn chained(r: &mut NativeMlxRunner, s: u64, t: u32, p: usize) -> Result<(u32, usize)> {
+            r.decode_step_chained(s, t, p)
+        }
+
+        fn has_step_ahead(r: &mut NativeMlxRunner, seq: u64) -> bool {
+            r.seqs
+                .get_ahead_mut(&seq)
+                .is_some_and(|s| s.pending.is_some())
+        }
+
+        #[test]
+        #[ignore = "needs a real Qwen3.5/3.6 checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+        fn chained_tokens_equal_blocking_tokens() {
+            let Some(mut r) = runner() else { return };
+            let a = r.prefill(1, &PROMPT).expect("prefill");
+            let b = r.prefill(2, &PROMPT).expect("prefill");
+            let (want, _) = drive(&mut r, 1, a, 48, blocking);
+            let (got, _) = drive(&mut r, 2, b, 48, chained);
+            assert!(
+                has_step_ahead(&mut r, 2),
+                "no step was built ahead -- the chained path did not run"
+            );
+            assert_eq!(got, want);
+        }
+
+        #[test]
+        #[ignore = "needs a real Qwen3.5/3.6 checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+        fn a_sequence_left_mid_chain_continues_as_if_never_chained() {
+            let Some(mut r) = runner() else { return };
+            let a = r.prefill(1, &PROMPT).expect("prefill");
+            let b = r.prefill(2, &PROMPT).expect("prefill");
+            let (want, _) = drive(&mut r, 1, a, 40, blocking);
+            let (mut got, at) = drive(&mut r, 2, b, 16, chained);
+            assert!(has_step_ahead(&mut r, 2), "the chained path did not run");
+            // The blocking step takes the one built ahead back first.
+            let (rest, _) = drive(&mut r, 2, at, 24, blocking);
+            got.extend_from_slice(&rest[1..]);
+            assert_eq!(got, want);
+        }
+
+        #[test]
+        #[ignore = "needs a real Qwen3.5/3.6 checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+        fn a_token_the_chain_did_not_expect_takes_the_step_back() {
+            let Some(mut r) = runner() else { return };
+            let a = r.prefill(1, &PROMPT).expect("prefill");
+            let b = r.prefill(2, &PROMPT).expect("prefill");
+            let (_, (last_a, pos_a)) = drive(&mut r, 1, a, 6, blocking);
+            let (_, (last_b, pos_b)) = drive(&mut r, 2, b, 6, chained);
+            assert_eq!((last_a, pos_a), (last_b, pos_b));
+            assert!(has_step_ahead(&mut r, 2), "the chained path did not run");
+            // A caller that overrides the token: not the one the chain built on.
+            let other = if last_a == 1234 { 4321 } else { 1234 };
+            let (want, _) = drive(&mut r, 1, (other, pos_a), 12, blocking);
+            let (got, _) = drive(&mut r, 2, (other, pos_b), 12, chained);
+            assert_eq!(got, want);
+        }
+
+        #[test]
+        #[ignore = "needs a real Qwen3.5/3.6 checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+        fn another_operation_sees_the_cache_a_blocking_loop_would_have_left() {
+            let Some(mut r) = runner() else { return };
+            let a = r.prefill(1, &PROMPT).expect("prefill");
+            let b = r.prefill(2, &PROMPT).expect("prefill");
+            let (_, (_, pos_a)) = drive(&mut r, 1, a, 10, blocking);
+            let (_, (_, pos_b)) = drive(&mut r, 2, b, 10, chained);
+            assert!(has_step_ahead(&mut r, 2), "the chained path did not run");
+            assert_eq!(pos_a, pos_b);
+            // Extending feeds tokens at the cache's end; a step left running
+            // would put them one token too far.
+            let tail = [11u32, 4340, 653, 498];
+            let want = r.extend(1, &tail).expect("extend");
+            let got = r.extend(2, &tail).expect("extend");
+            assert_eq!(got, want);
+            assert!(!has_step_ahead(&mut r, 2));
         }
     }
 }

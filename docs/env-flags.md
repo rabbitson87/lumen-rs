@@ -10,6 +10,7 @@ value → on.
 
 | Env | Default | Kind | Declared in |
 |---|---|---|---|
+| `LUMEN_CONTENT_AS_TEXT` | on | Behavior | `lumen_mlx::text_tokenizer::content_as_text` |
 | `LUMEN_FASTOKENS` | off | Optimization | `lumen_mlx::text_tokenizer::fastokens_encode` |
 | `LUMEN_GEMMA4_FUSE_DENSE_MLP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_dense_mlp` |
 | `LUMEN_GEMMA4_FUSE_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_experts` |
@@ -35,19 +36,29 @@ value → on.
 | `LUMEN_MOE_OVERLAP` | off | Optimization | `lumen_mlx::offload::overlap` |
 | `LUMEN_MOE_PROBE_LAYER_SYNC` | off | Diagnostic | `lumen_mlx::native_moe::imp::moe_layer_sync_probe` |
 | `LUMEN_MOE_TRACE` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace` |
+| `LUMEN_MTP_COARSE_HEAD` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_coarse_head` |
+| `LUMEN_MTP_HISTORY` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_history` |
+| `LUMEN_NATIVE_ACT_BF16` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::act_bf16` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
-| `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
+| `LUMEN_NATIVE_COMPILE` | on | Behavior | `lumen_mlx::native_ssm::imp::ssm_compile` |
 | `LUMEN_NATIVE_COMPILE_ROUTING` | off | Optimization | `lumen_mlx::native_moe::imp::routing_compile` |
 | `LUMEN_NATIVE_CONV_SLICE` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::conv_slice` |
+| `LUMEN_NATIVE_DECODE_QMV` | on | Optimization | `lumen_mlx::native_qmv::decode_qmv` |
+| `LUMEN_NATIVE_DECODE_QMV_ROWS` | on | Behavior | `lumen_mlx::native_qmv::decode_qmv_rows` |
+| `LUMEN_NATIVE_FUSED_MOE_DECODE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::fused_moe_decode` |
+| `LUMEN_NATIVE_FUSED_MOE_ROUTER` | on | Optimization | `lumen_mlx::native_moe_decode::fused_router` |
 | `LUMEN_NATIVE_FUSE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_gate_up_flag` |
-| `LUMEN_NATIVE_FUSE_LINATTN_IN` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_linattn_in` |
+| `LUMEN_NATIVE_FUSE_LINATTN_IN` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_linattn_in` |
+| `LUMEN_NATIVE_FUSE_MOE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_moe_gate_up` |
 | `LUMEN_NATIVE_FUSE_SIGMOID_MUL` | off | Optimization | `lumen_mlx::native_kernels::imp::sigmoid_mul_fuse` |
 | `LUMEN_NATIVE_FUSE_SWIGLU` | on | Optimization | `lumen_mlx::native_moe::imp::swiglu_fuse` |
 | `LUMEN_NATIVE_KV_STEP_PREALLOC` | on | Optimization | `lumen_mlx::native_cache::imp::kv_step_prealloc` |
 | `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::linear_attn_scale_fuse` |
+| `LUMEN_NATIVE_PIPELINE_DECODE` | on | Optimization | `lumen_mlx::runner_native::imp::pipeline_decode` |
 | `LUMEN_NATIVE_RMS_NORM_GATED_FUSED` | off | Optimization | `lumen_mlx::native_ssm::imp::rms_norm_gated_fused` |
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
+| `LUMEN_NATIVE_WIDEN_SCALES` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::widen_scales` |
 | `LUMEN_PREFIX_EXACT_REUSE` | on | Behavior | `lumen_mlx::prefix_cache::exact_reuse` |
 | `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
@@ -61,6 +72,24 @@ value → on.
 | `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
 
 ## Details
+
+### `LUMEN_CONTENT_AS_TEXT`
+
+*Behavior, default on.*
+
+Encode what a client sent — messages, tool results, tool arguments and
+ definitions — as ordinary text, even where it spells an added token
+ such as `<|im_end|>` or `<tool_call>`; only the chat template's own
+ markers become control tokens. Off, a tool result holding
+ `<|im_end|>\n<|im_start|>system\n…` ends the turn and opens a system
+ turn of its own: HF matches added tokens inside raw text, and its
+ `encode_special_tokens` leaves the ones not marked special matched
+ (Qwen's `<think>`, `<tool_call>`, `<tool_response>`). A prompt whose
+ client text spells no added token encodes to the same ids either way.
+ Covers lumen's own renderers and Gemma's opt-in upstream-template path
+ (`LUMEN_USE_JINJA_RENDERER=1`), where the template sees the client's
+ spellings as plain text and so no longer acts on them; a raw
+ `/v1/completions` prompt is the client's to write.
 
 ### `LUMEN_FASTOKENS`
 
@@ -235,21 +264,22 @@ Reuse a conversation's KV without the client naming a session.
  prefix instead, which needs no cooperation and cannot be wrong: the same
  `starts_with` gate guards the reuse itself.
 
- **`Behavior`, not `Optimization`, and the mechanism is measured rather
- than assumed.** `session_reuse_reproduces_a_cold_prefill` runs three
- arms over the same tokens and localizes it: `extend` reproduces a bulk
- prefill **bit-identically**, so the cache handoff is exact. What is not
- exact is the decode path in between — the tokens between two prompts
- advanced the cache one at a time, and a single-token forward is a
- different matmul shape (M=1, GEMV) from a bulk chunk (M=N, GEMM), so the
- reduction order differs. Measured on Qwen3.8-27B: identical for 43
- tokens, then a near-tie argmax flips at 44. (Chunk invariance does not
- cover this — 256 vs 2048 are both GEMM.)
+ **`Behavior`, not `Optimization`.** `session_reuse_reproduces_a_cold_prefill`
+ runs three arms over the same tokens: `extend` reproduces a bulk prefill
+ **bit-identically**, so the cache handoff is exact. What a session adds
+ is the decode path in between: the tokens between two prompts advanced
+ the cache one at a time (M=1) rather than in a bulk chunk (M=N), a
+ different matmul, so their keys and values need not equal a prefill's in
+ every bit, and a near-tie could flip. Measured with the arms fed the same
+ tokens: all 48 tokens equal a cold prefill's on Qwen3.6-35B-A3B,
+ Qwen3.6-27B and Qwen3.8-27B. (An earlier "flips at 44" was the test
+ leaving out the reply's last token, which the session store also did:
+ see `held_tokens`.)
 
- Each path is deterministic and stable across runs; they just are not
- each other, so the equivalence matrix must never flip this. Not a new
- property — the explicit-`session_id` path has always had it, and this
- output is byte-identical to that path's.
+ Each path is deterministic and stable across runs, but they are not
+ guaranteed to be each other, so the equivalence matrix must never flip
+ this. Not a new property — the explicit-`session_id` path has always had
+ it, and this output is byte-identical to that path's.
 
 ### `LUMEN_MLX_KV_BF16`
 
@@ -398,6 +428,62 @@ Write a binary trace of the expert pool's layer calls (expert ids in request ord
  eviction policies offline. Any value but `0` is the output path. Never changes the output
  or what is resident; costs one `Option` check per layer call when off.
 
+### `LUMEN_MTP_COARSE_HEAD`
+
+*Optimization, default off.*
+
+Greedy MTP drafts read a 4-bit copy of an lm_head stored at more bits. A draft reads
+ the whole lm_head for one row, so at 8 bits it reads twice the bytes it needs: the
+ head's argmax only proposes, and the trunk's verify, which keeps the stored lm_head,
+ decides every token. Output-identical; acceptance is the only thing a coarser head
+ can cost. Costs the copy's memory (half the stored lm_head) while MTP is on.
+
+ Default off: it pays only when cycles draft two or more. Qwen3.8-27B-MTPLX (8-bit
+ lm_head, +0.72 GB), M3 Max, greedy, text identical: in-process cycles at one draft
+ 83.7 -> 83.0 ms (one draft runs while the host builds the verify graph, so its lm_head
+ is hidden), two 107.6 -> 102.5, three 131.5 -> 125.1, acceptance unchanged on that
+ prompt; server chat at two drafts 44.3 -> 43.3 ms/token with acceptance 0.665 ->
+ 0.637, but with the draft count chosen per cycle (the default) 44.6 -> 45.3, inside
+ the runs' spread.
+
+### `LUMEN_MTP_HISTORY`
+
+*Optimization, default on.*
+
+Keep the MTP head's own attention cache across draft cycles and prime it with the
+ prompt ([`MtpHistory`]): every committed pair (trunk hidden, next token) enters it,
+ as MTPLX and oMLX run the head. With it off the cache is emptied every cycle and the
+ head attends to the current cycle's drafts only.
+
+ Output-identical: the head only proposes drafts, the trunk's verify decides every
+ token. MTPLX measured depth-1 acceptance 0.90 with the history against 0.26 without
+ on code; numbers for this repo in the commit that added it.
+
+### `LUMEN_NATIVE_ACT_BF16`
+
+*Behavior, default off.*
+
+Run each quantized projection on a bf16 activation (cast back to f32 after) when the
+ activation is f32 and the scales are bf16/f16, so MLX takes its fast path (276 GB/s on
+ M3 Max against 187 GB/s with an f32 activation, stock MLX 0.32.3, 17408x5120 4-bit).
+
+ **`Behavior`, not `Optimization`: this is a numerics change.** The activation is
+ rounded to bf16 before the matmul (the accumulation stays f32), as mlx-lm does
+ throughout. Applies to every `ResolvedLinear::apply` -- the Qwen trunk and MTP head
+ and Gemma 4 -- whose activation is f32 and scales are bf16/f16. A no-op on scales
+ `LUMEN_NATIVE_WIDEN_SCALES` widened; it does act on the projections that keep bf16
+ scales for `LUMEN_NATIVE_DECODE_QMV` (every trunk projection of a 4-bit group-64
+ checkpoint), where it replaces those kernels.
+
+ Measured on Qwen3.6-27B (M3 Max): 65.9 -> 62.0 ms/step against the widened default,
+ with a cast before and after every matmul eating part of the gain. Teacher-forced
+ top-1 agreement with the f32 activation over 6 seeds x ~675 positions
+ (`examples/kv_bf16_quality.rs --act-bf16`; the f32-vs-f32 control is 100.000%): 27B
+ 99.31%, 9B 99.09%. Every flip is a near-tie (the largest top1-top2 gap sits at the
+ 3.4th / 3.9th percentile) and agreement does not fall with context depth, but it is
+ below the 99.73% that the bf16 KV cache cleared before it became the default.
+ Default off.
+
 ### `LUMEN_NATIVE_ALLOC_REUSE`
 
 *Optimization, default on.*
@@ -422,12 +508,18 @@ Share one `OnceLock` stream + sentinel across FFI quant ops instead
 
 ### `LUMEN_NATIVE_COMPILE`
 
-*Optimization, default on.*
+*Behavior, default on.*
 
 compute_g persistent compile cache. Default ON (LANDED Phase 3):
  wins σ-significantly across a 12-run 4-condition matrix
  (Δp50=−0.33 ms, Δtps=+1.96 vs legacy direct dispatch). `=0` falls
  back to the legacy direct-ops path.
+
+ **`Behavior`, not `Optimization`:** the legacy ops round some gates
+ differently from the compiled function, by one unit in the last place
+ (three of 256 in `linattn_prework_gates_are_the_composed_gates_to_the_bit`
+ at `=0`), so `=0` can change a near-tie. Gates the fused prework kernel
+ computes (decode) are the compiled function's either way.
 
 ### `LUMEN_NATIVE_COMPILE_ROUTING`
 
@@ -444,6 +536,108 @@ Compile-wrap the MoE routing graph. Default OFF (A/B WASH). (Parse
 Conv-state advance via `slice` (view/copy) instead of `take_axis`
  (gather kernel). Bit-identical for the s==1 decode regime — same
  indices, cheaper Metal kernel. Default OFF (A/B WASH).
+
+### `LUMEN_NATIVE_DECODE_QMV`
+
+*Optimization, default on.*
+
+Run the matvecs of an affine 4- or 8-bit, group-32/64 projection whose activation is f32 and
+ whose scales and biases are bf16 or f16 in kernels that read those scales as they are
+ (`native_qmv::matvec`), instead of MLX's `quantized_matmul`, which casts them to f32 on every
+ call, and keep such projections' scales in bf16 under `LUMEN_NATIVE_WIDEN_SCALES`. A
+ single-token step runs the projections of one activation (linear attention's four input
+ projections, attention's q/k/v, a dense MLP's gate and up) in one launch.
+
+ A matvec is up to MLX's batch limit of rows (6 to 33, by GPU and size; 13-15 on an M3 Max):
+ a decode step, a batch of decode steps, an MTP verify. Larger matmuls (prefill) stay on MLX,
+ which casts the bf16 scales per call there; against a matmul that size the cast is noise.
+
+ Bit-identical: the kernels run MLX's own matvec arithmetic for that many rows on this GPU
+ (`qmv_fast` for one; for more, `qmv_wide` or `qmv_fast` as MLX would, or `qmv_fast` row by
+ row under `LUMEN_NATIVE_DECODE_QMV_ROWS`, which this flag's off path then also runs row by
+ row), its lane partition and order of adds, and widening a bf16 or f16 scale to f32 is
+ exact. An `Optimization` flag. Default on; `=0` keeps MLX's matmul (and widens every affine
+ projection's scales again).
+
+ M3 Max, one matvec over projections larger than the system cache, best of 12: 17408x5120
+ 218 -> 200 us, 5120x17408 213 -> 200 us, 248320x2048 (lm_head) 1187 -> 1063 us against MLX
+ on widened scales (MLX on bf16 activations and scales, the bound: 195, 196, 1066 us); a small
+ projection (32x2048) is slower alone, 3.6 -> 6.1 us, which the shared launch removes.
+ Pipelined greedy decode against MLX on the widened copies, alternating runs, text identical
+ in every run: Qwen3.6-27B 61.4 / 61.6 / 61.1 -> 56.6 / 57.2 / 56.7 ms/token, footprint 18.51
+ -> 17.21 GB; Qwen3.6-35B-A3B 9.3 / 9.3 / 9.3 -> 9.2 / 9.2 / 9.2 ms/token, 20.65 -> 20.52 GB.
+ Qwen3.8-27B-MTPLX-Optimized (4-bit group 32, 8-bit group 64 layers), chat: 78.5 -> 70.3
+ ms/token, 24.25 -> 22.0 GB; its 8-bit kernels gain the decode step nothing measurable but
+ let its MTP verify read those layers once (lossless MTP 58.5 -> 47.8 ms/token).
+
+### `LUMEN_NATIVE_DECODE_QMV_ROWS`
+
+*Behavior, default on.*
+
+Run a matvec of two to four vectors (an MTP verify, a few sequences decoded together, a
+ prompt of a few tokens) as `qmv_fast`'s arithmetic for each vector, all of them in the same
+ simdgroups, so each weight block is read once and dotted with every vector. Each row then
+ equals the single-vector matvec of that row in every bit. MLX runs that many vectors as
+ `qmv_wide` from GPU generation 15 on, whose lane partition differs.
+
+ **`Behavior`, not `Optimization`**: the low bits differ from MLX's matvec of that many rows
+ (not from a decode step). In exchange an MTP verify computes exactly what the decode steps it
+ stands in for would, and a sequence decoded beside others exactly what it would alone.
+ A projection the kernels do not read (a checkpoint's 8-bit layers, other group sizes, or
+ every projection under `LUMEN_NATIVE_DECODE_QMV=0`) runs such matvecs on MLX one row at a
+ time, which is what its decode step runs.
+
+ M3 Max, 17408x5120, bench wall time: one vector 183 us; two, three, four 186 / 244 / 320 us
+ here, 258 / 387 / 543 us as `qmv_wide` on the f32 activation. A Qwen3.6-27B forward of two,
+ three, four tokens 66.6 / 89.0 / 108.7 ms, 87.0 / 126.5 / 165.8 off, one token 61.8. MTP K=1
+ (lossless) serves chat at 42.5 ms a token against 56.1 without MTP. Default on; `=0` runs
+ them as MLX would.
+
+### `LUMEN_NATIVE_FUSED_MOE_DECODE`
+
+*Optimization, default on.*
+
+Run a single-token decode step's routed and shared experts in two Metal kernels
+ (`native_moe_decode`) instead of about twenty-five MLX ops. Implies the stacked
+ gate/up layout of `LUMEN_NATIVE_FUSE_MOE_GATE_UP`. Applies to affine 4-bit group-64
+ layers with a top-8 router whose hidden and intermediate sizes are multiples of 512,
+ behind an f32 activation and bf16 expert scales; prefill, SSD expert offload and other
+ layouts keep the composed ops.
+
+ Bit-identical to the composed ops: the kernels run MLX's own quantized matvec arithmetic
+ (its lane partition, `load_vector`'s division and bf16 quad sum, `qdot`'s expression),
+ round to bf16 where the composed block does, and add the eight routed outputs in the
+ composed reduction's order. An `Optimization` flag. Default on; `=0` restores the
+ composed ops.
+
+ SSD expert offload serves the experts through the composed ops. Because the kernels
+ equal them in every bit, an offloaded run equals the resident run on an affine
+ checkpoint too: the weights-gated offload tests pass with the kernels on.
+
+ Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA: 11.2 ms/token composed
+ against 9.5 with the kernels (and the router kernels), the generated text identical
+ byte for byte. Before the kernels were bit-identical they ran at 11.1 ms against 12.0
+ with 814 of 819 bytes the same.
+
+### `LUMEN_NATIVE_FUSED_MOE_ROUTER`
+
+*Optimization, default on.*
+
+Route a single-token step with a logits kernel (the expert and shared-gate logits) and the
+ select (softmax, top-8, renormalisation, the shared sigmoid) inside the experts' gate/up
+ kernel, instead of the twelve MLX ops, when `LUMEN_NATIVE_FUSED_MOE_DECODE` runs the experts
+ in kernels and the router is an 8-bit group-64 gate over a multiple of 128 experts.
+
+ Bit-identical to the composed router: the logits run MLX's matvec arithmetic, the softmax
+ adds as MLX's kernel does, and the eight experts come in the order the composed sort leaves
+ them (ascending probability, equal ones by index), so the routing, the scores and the
+ block's output equal the composed ones in every bit. An `Optimization` flag. Default on;
+ `=0` keeps the composed router.
+
+ Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA: 11.9 ms composed, 11.1 ms
+ with the expert kernels only, 10.5 ms with the router kernels too (-0.6 ms; the router alone
+ is 31 us a layer, 1.24 ms a token, in the composed ops); folding the select into the
+ gate/up kernel took another 0.1 ms.
 
 ### `LUMEN_NATIVE_FUSE_GATE_UP`
 
@@ -462,13 +656,40 @@ Fuse `gate_proj` + `up_proj` into one QMV when their quant params
 
 ### `LUMEN_NATIVE_FUSE_LINATTN_IN`
 
+*Optimization, default on.*
+
+One kernel for the linear-attention prework of a decode token or an MTP verify: eight
+ dependent dispatches (concat, slice, conv1d, SiLU, two RMS norms, sigmoid, compiled
+ `compute_g`) become one.
+
+ Bit-identical to the composed ops in f32, the dtype the model runs this in: the kernel
+ repeats MLX's own sums in MLX's own order (its `Sigmoid` for SiLU, `rms_single_row`
+ for the norm, `precise::rsqrt`, `LogAddExp` for the softplus of `compute_g`), and the
+ tests compare bits at the A3B shape, one token and several. M3 Max, ABBA over four runs
+ each, generated text byte-identical with the flag on and off: Qwen3.6-35B-A3B affine
+ 10.5 -> 10.1 ms/token, A3B mxfp4 11.2 -> 10.4, Qwen3.5-9B 27.9 -> 27.3, Qwen3.6-27B
+ 67 -> 63. Forwards of up to [`PREWORK_MAX_TOKENS`] tokens take it (not prefill, not
+ under the timing probes). Default on; `=0` restores the composed ops.
+
+### `LUMEN_NATIVE_FUSE_MOE_GATE_UP`
+
 *Optimization, default off.*
 
-Fused input-side linear-attn kernel (conv+silu+q/k-norm). Built to
- completion, output bit-identical, measured 0 speedup — MLX async
- already overlaps the small launches. Kept as a reusable artifact;
- default OFF. (Parse note: previously only `=1` enabled this; the
- registry's uniform rule now accepts any non-`"0"` value.)
+Stack each MoE layer's routed-expert `gate_proj` and `up_proj` along the output axis
+ at load, so the experts' gate and up outputs come from one `gather_qmm` (split in
+ half afterwards) instead of two.
+
+ Every output row is the same reduction either way, so the result is bit-identical.
+ It saves one gather launch per MoE layer per step. The stacked copy replaces the
+ separate tensors (the model drops them), so memory does not grow (footprint 19 GB
+ either way; the load takes ~4 s longer). Not used with SSD expert offload, whose pool
+ serves gate and up as separate roles, nor by the MTP block.
+
+ Default OFF and **tested null**: Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy
+ decode, ABBA over four server runs: 12.0 / 11.8 ms/token off against 11.9 / 11.9 on,
+ 819 generated bytes identical in all four. Decode is GPU-bound, so a launch saved
+ between matmuls that already queue behind each other buys nothing. Kept as the layout a
+ fused gate+up+SwiGLU routed-expert kernel would read.
 
 ### `LUMEN_NATIVE_FUSE_SIGMOID_MUL`
 
@@ -515,6 +736,24 @@ Absorb `scale_q/k` into the rms_norm weight (bit-identical by
  thermal-clean A/B (n=10, STEPS=100) Δ=−0.315 ms, Welch t=−3.33σ.
  Only active when `LUMEN_NATIVE_ALLOC_REUSE` is also on.
 
+### `LUMEN_NATIVE_PIPELINE_DECODE`
+
+*Optimization, default on.*
+
+Build each greedy decode step while the one before it is still running.
+
+ Blocking decode reads a token, then builds the next step's graph with
+ the GPU idle; on a small-active-parameter MoE that build is ~2.5 ms of a
+ ~13 ms step. With this on, a loop that feeds every token back as the
+ next input (`decode_step_chained`) submits step N+1 -- built from step
+ N's unread argmax -- before it reads step N, as mlx-lm's `generate_step`
+ does. The same graphs run in the same order, so the tokens are
+ bit-identical; the one extra step a loop leaves running when it stops is
+ taken back before anything else touches the sequence.
+
+ Does nothing (falls back to blocking decode) under SSD expert offload,
+ MTP, `LUMEN_NATIVE_TIMING`, or a quantized / TurboQuant KV cache.
+
 ### `LUMEN_NATIVE_RMS_NORM_GATED_FUSED`
 
 *Optimization, default off.*
@@ -531,6 +770,33 @@ Per-step decode timing capture (`take_native_decode_timing_log`).
  Costs an eval barrier per timed stage; default OFF. (Parse note:
  previously a truthy list `1|true|TRUE|yes`; the uniform rule now
  accepts any non-`"0"`.)
+
+### `LUMEN_NATIVE_WIDEN_SCALES`
+
+*Optimization, default on.*
+
+Keep the affine projections' scales and biases in f32 so a matmul on the f32 residual
+ stream stops re-casting them on every call.
+
+ MLX gives `quantized_matmul` the common dtype of the activations and the scales and
+ biases and casts whichever differs on every call. The trunk's activations are f32 and
+ the checkpoint's scales bf16, so each of a decode step's ~500 matmuls re-widened its
+ scales and biases before reading the weights. On stock MLX 0.32.3 (M3 Max, 17408x5120
+ 4-bit group 64) that is 187 GB/s against 276 GB/s with bf16 activations; pre-widened
+ scales recover most of it (237-250 GB/s). The widening is exact (bf16 -> f32), so the
+ output is bit-identical; the cost is the f32 copy minus the bf16 original the model
+ drops (`NativeWeights::release_scales_and_biases`): +1.45 GB of GPU memory on the 27B
+ (16.0 -> 17.5 GB footprint, `footprint`; `ps` RSS does not see GPU buffers).
+ Affine projections only (mxfp4/nvfp4 scales are integer exponents). Applies to
+ `resolve_linear`, i.e. the Qwen 3.5/3.6 trunk and lm_head. Measured on Qwen3.6-27B
+ (4-bit group 64, M3 Max): decode 84.3 -> 67.1 ms/step, 192 greedy tokens identical.
+ `=0` restores the per-call cast.
+
+ A projection whose matvecs `LUMEN_NATIVE_DECODE_QMV` runs (4-bit group 64, inputs a
+ multiple of 512, outputs a multiple of 8) keeps its bf16 scales instead: those
+ kernels read them as they are, faster than MLX reads the f32 copy, and only a
+ prefill-sized matmul still casts them. On the 4-bit Qwen checkpoints that is every
+ trunk projection, so the copy, and its memory, is gone there.
 
 ### `LUMEN_PREFIX_EXACT_REUSE`
 
