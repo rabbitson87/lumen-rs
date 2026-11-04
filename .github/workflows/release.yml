@@ -9,6 +9,10 @@ name: Release
 # Flip the release from draft to published once the job finishes to
 # expose the new version to the in-app updater.
 #
+# The build needs no Apple certificate: the app is signed ad-hoc and not
+# notarized, and the release notes tell users the one Terminal command that
+# lets macOS open it (see "macOS signing" below).
+#
 # Maintainer setup (one-time): see crates/lumen-app/docs/release.md for
 # how to generate the signing keypair + register the secrets on the repo.
 
@@ -155,52 +159,21 @@ jobs:
         run: npm ci
 
       # ── Tauri build + sign + upload ───────────────────────────────
-      # ── macOS code signing and notarization ───────────────────────
-      # Only what is configured reaches Tauri: an unset secret would arrive as
-      # an empty string, which is not the same as no identity.
+      # ── macOS signing: ad-hoc, no Apple certificate ───────────────
+      # Releases are built without a Developer ID certificate and are not
+      # notarized, so cutting one needs no Apple Developer Program membership
+      # (a lapsed one failed the v0.12.0 job at notarization, HTTP 401, after a
+      # good build and signature). Tauri signs the bundle ad-hoc
+      # (`signingIdentity: "-"` in tauri.conf.json), which seals it: a bundle
+      # with only the linker's signature is reported as "damaged", with no way
+      # to open it.
       #
-      # * Signing: the Developer ID certificate when its secrets are set, else
-      #   ad-hoc (`signingIdentity: "-"` in tauri.conf.json). Either way the
-      #   bundle's signature is valid; an unsigned one makes macOS report the
-      #   download as "damaged", with no way to open it from the Finder.
-      # * Notarization is opt-in with the repository variable
-      #   MACOS_NOTARIZE=true. It needs an *active* Apple Developer Program
-      #   membership — a lapsed one is what failed the v0.12.0 job (401) even
-      #   though the certificate was still valid. Without it users open the app
-      #   once via System Settings → Privacy & Security → Open Anyway.
-      - name: Configure macOS signing
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          MACOS_NOTARIZE: ${{ vars.MACOS_NOTARIZE }}
-        run: |
-          put() {
-            if [ -n "$2" ]; then
-              { echo "$1<<__LUMEN_EOF__"; echo "$2"; echo "__LUMEN_EOF__"; } >> "$GITHUB_ENV"
-            fi
-          }
-          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
-            put APPLE_CERTIFICATE "$APPLE_CERTIFICATE"
-            put APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD"
-            put APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY"
-            echo "signing: Developer ID"
-          else
-            echo "signing: ad-hoc (no Developer ID certificate secrets)"
-          fi
-          if [ "$MACOS_NOTARIZE" = "true" ]; then
-            put APPLE_ID "$APPLE_ID"
-            put APPLE_PASSWORD "$APPLE_PASSWORD"
-            put APPLE_TEAM_ID "$APPLE_TEAM_ID"
-            echo "notarization: on"
-          else
-            echo "notarization: off (repository variable MACOS_NOTARIZE is not true)"
-          fi
-
+      # macOS still blocks the first launch of a downloaded copy. The release
+      # notes below give the one command that clears the download's quarantine;
+      # after it the app opens normally, and in-app updates install without it,
+      # since the updater's own downloads are not quarantined.
       - name: Build, sign + upload (.app, .dmg, latest.json)
+        id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
           # Automatically provisioned by Actions — needed for the action to
@@ -208,7 +181,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # The Apple signing / notarization variables come from the step above.
+          # No Apple credentials reach the build: the bundle is signed ad-hoc.
         with:
           projectPath: crates/lumen-app
           # Tag push → use the pushed tag (e.g. v0.2.0). Manual dispatch →
@@ -222,3 +195,35 @@ jobs:
           args: >-
             --target ${{ matrix.target }}
             --config '{"bundle":{"externalBin":["binaries/lumen-server"],"resources":{"binaries/mlx.metallib":"mlx.metallib"}}}'
+
+      # ── Install notes on the release page ─────────────────────────
+      # How to open a build that is not notarized. Written to the release after
+      # the upload rather than as tauri-action's `releaseBody`: that body also
+      # becomes the `notes` of latest.json, which the app shows when it offers
+      # an update, and an updating user has nothing to install by hand. Notes
+      # added to the draft before publishing go below these. The command must
+      # match README.md (a test in crates/lumen-server/tests/packaging.rs
+      # checks).
+      - name: Put the install notes on the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.tauri.outputs.releaseId }}
+        run: |
+          notes="$RUNNER_TEMP/install-notes.md"
+          cat > "$notes" <<'__LUMEN_NOTES__'
+          Apple Silicon (M1 or later), macOS 14 or later.
+
+          **Install**
+
+          1. Download the `.dmg` below, open it, and drag **Lumen** to **Applications**.
+          2. This build is not signed with an Apple Developer ID or notarized, so macOS blocks its first launch. Clear the download's quarantine once, in Terminal:
+
+             ```sh
+             xattr -dr com.apple.quarantine /Applications/Lumen.app
+             ```
+
+          3. Open Lumen. From then on it opens normally, and updates from inside the app install without this step.
+
+          Without Terminal: open Lumen once, then System Settings → Privacy & Security → **Open Anyway** (macOS 15 and later), or Control-click Lumen → **Open** (macOS 14).
+          __LUMEN_NOTES__
+          gh api -X PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" -F body=@"$notes" --jq .html_url

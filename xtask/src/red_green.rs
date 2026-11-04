@@ -1857,16 +1857,17 @@ static DEFECTS: &[Defect] = &[
         symptom: "the release job handed the notary credentials to the build on \
                   every run, so with the Apple Developer Program membership \
                   lapsed it failed at notarization (401) after building and \
-                  signing — no release at all. Notarization is now opt-in \
-                  (repository variable MACOS_NOTARIZE)",
+                  signing — no release at all. Releases are now built with no \
+                  Apple credential (ad-hoc signed, not notarized) and tell users \
+                  the one command that clears the download's quarantine",
         revert: &[Mutation {
             path: WORKFLOWS,
-            find: "          # The Apple signing / notarization variables come from the step above.",
+            find: "          # No Apple credentials reach the build: the bundle is signed ad-hoc.",
             replace: "          APPLE_ID: ${{ secrets.APPLE_ID }} # defect: always notarize",
         }],
         guards: &[srv_test(
             "packaging",
-            "the_release_builds_without_notarization_unless_asked",
+            "the_release_builds_without_apple_credentials",
         )],
         ..PLAIN
     },
