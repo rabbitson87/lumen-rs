@@ -36,6 +36,7 @@ value → on.
 | `LUMEN_MOE_OVERLAP` | off | Optimization | `lumen_mlx::offload::overlap` |
 | `LUMEN_MOE_PROBE_LAYER_SYNC` | off | Diagnostic | `lumen_mlx::native_moe::imp::moe_layer_sync_probe` |
 | `LUMEN_MOE_TRACE` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace` |
+| `LUMEN_MTP_COARSE_HEAD` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_coarse_head` |
 | `LUMEN_MTP_HISTORY` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_history` |
 | `LUMEN_NATIVE_ACT_BF16` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::act_bf16` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
@@ -426,6 +427,24 @@ Write a binary trace of the expert pool's layer calls (expert ids in request ord
  per-call timestamps) to the path in this variable, for replaying a workload against other
  eviction policies offline. Any value but `0` is the output path. Never changes the output
  or what is resident; costs one `Option` check per layer call when off.
+
+### `LUMEN_MTP_COARSE_HEAD`
+
+*Optimization, default off.*
+
+Greedy MTP drafts read a 4-bit copy of an lm_head stored at more bits. A draft reads
+ the whole lm_head for one row, so at 8 bits it reads twice the bytes it needs: the
+ head's argmax only proposes, and the trunk's verify, which keeps the stored lm_head,
+ decides every token. Output-identical; acceptance is the only thing a coarser head
+ can cost. Costs the copy's memory (half the stored lm_head) while MTP is on.
+
+ Default off: it pays only when cycles draft two or more. Qwen3.8-27B-MTPLX (8-bit
+ lm_head, +0.72 GB), M3 Max, greedy, text identical: in-process cycles at one draft
+ 83.7 -> 83.0 ms (one draft runs while the host builds the verify graph, so its lm_head
+ is hidden), two 107.6 -> 102.5, three 131.5 -> 125.1, acceptance unchanged on that
+ prompt; server chat at two drafts 44.3 -> 43.3 ms/token with acceptance 0.665 ->
+ 0.637, but with the draft count chosen per cycle (the default) 44.6 -> 45.3, inside
+ the runs' spread.
 
 ### `LUMEN_MTP_HISTORY`
 

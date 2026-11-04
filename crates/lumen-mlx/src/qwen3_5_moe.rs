@@ -1935,6 +1935,76 @@ mod imp {
         fuse_linattn_in::get()
     }
 
+    lumen_flags::flag! {
+        /// Greedy MTP drafts read a 4-bit copy of an lm_head stored at more bits. A draft reads
+        /// the whole lm_head for one row, so at 8 bits it reads twice the bytes it needs: the
+        /// head's argmax only proposes, and the trunk's verify, which keeps the stored lm_head,
+        /// decides every token. Output-identical; acceptance is the only thing a coarser head
+        /// can cost. Costs the copy's memory (half the stored lm_head) while MTP is on.
+        ///
+        /// Default off: it pays only when cycles draft two or more. Qwen3.8-27B-MTPLX (8-bit
+        /// lm_head, +0.72 GB), M3 Max, greedy, text identical: in-process cycles at one draft
+        /// 83.7 -> 83.0 ms (one draft runs while the host builds the verify graph, so its lm_head
+        /// is hidden), two 107.6 -> 102.5, three 131.5 -> 125.1, acceptance unchanged on that
+        /// prompt; server chat at two drafts 44.3 -> 43.3 ms/token with acceptance 0.665 ->
+        /// 0.637, but with the draft count chosen per cycle (the default) 44.6 -> 45.3, inside
+        /// the runs' spread.
+        pub(crate) mtp_coarse_head {
+            env: "LUMEN_MTP_COARSE_HEAD",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
+    /// A 4-bit copy of `lm` at its group size, built a slab of rows at a time so the
+    /// dequantized weights never exist whole. `None` when `lm` is already at 4 bits or fewer, or
+    /// not affine.
+    fn coarse_lm_head(lm: &ResolvedLinear) -> Result<Option<ResolvedLinear>> {
+        use mlx_rs::ops::indexing::TryIndexOp;
+        const BITS: i32 = 4;
+        // A bf16 slab of this many rows is what building the copy adds to the peak.
+        const SLAB: i32 = 16384;
+        if lm.bits <= BITS || lm.mode != MODE_AFFINE {
+            return Ok(None);
+        }
+        let rows = lm.weight.shape()[0];
+        let (mut ws, mut ss, mut bs) = (Vec::new(), Vec::new(), Vec::new());
+        for start in (0..rows).step_by(SLAB as usize) {
+            let end = (start + SLAB).min(rows);
+            let slab = |a: &Array| a.try_index(start..end);
+            let biases = lm.biases.as_ref().map(slab).transpose()?;
+            let w = dequantize_with_mode(
+                &slab(&lm.weight)?,
+                &slab(&lm.scales)?,
+                biases.as_ref(),
+                lm.group_size,
+                lm.bits,
+                lm.mode,
+            )
+            .and_then(|w| Ok(w.as_dtype(mlx_rs::Dtype::Bfloat16)?))
+            .context("coarse lm_head: dequantize a slab")?;
+            let (w, s, b) = quantize_with_mode(&w, lm.group_size, BITS, MODE_AFFINE)
+                .context("coarse lm_head: quantize a slab")?;
+            let b = b.ok_or_else(|| anyhow!("coarse lm_head: affine quantize gave no biases"))?;
+            mlx_rs::transforms::eval([&w, &s, &b]).context("coarse lm_head: evaluate a slab")?;
+            ws.push(w);
+            ss.push(s);
+            bs.push(b);
+        }
+        let whole = |parts: &[Array]| mlx_rs::ops::concatenate_axis(parts, 0);
+        let (weight, scales, biases) = (whole(&ws)?, whole(&ss)?, whole(&bs)?);
+        mlx_rs::transforms::eval([&weight, &scales, &biases])
+            .context("coarse lm_head: join the slabs")?;
+        Ok(Some(ResolvedLinear {
+            weight,
+            scales,
+            biases: Some(biases),
+            group_size: lm.group_size,
+            bits: BITS,
+            mode: MODE_AFFINE,
+        }))
+    }
+
     /// The widest forward the fused prework takes: an MTP verify of the deepest exact draft. The
     /// kernel is measured at these widths only; a prefill chunk keeps the composed ops.
     const PREWORK_MAX_TOKENS: i32 = crate::mtp_depth::MAX_EXACT_DRAFTS as i32 + 1;
@@ -2100,6 +2170,9 @@ mod imp {
         // `forward()` consuming (embeds, h_pre, mtp_kv, ...) — see
         // `qwen3_5_mtp::Qwen35MtpBlock`.
         mtp: Option<Qwen35MtpBlock>,
+        // The lm_head greedy MTP drafts read when it is not the trunk's: a 4-bit copy of a wider
+        // one (`mtp_coarse_head`). Built by `try_enable_mtp`.
+        mtp_draft_lm_head: Option<ResolvedLinear>,
         // Last-hidden capture slot — written by `forward_impl` at the end of
         // the layer loop (post-MLP residual, pre-final-norm) when
         // `mtp_capture_enabled` is set. Read once per `mtp_step` via
@@ -2343,6 +2416,7 @@ mod imp {
                 vision,
                 offload,
                 mtp: None,
+                mtp_draft_lm_head: None,
                 mtp_capture_slot: Mutex::new(None),
                 mtp_capture_enabled: AtomicBool::new(false),
                 ssm_capture_slot: Mutex::new(Vec::new()),
@@ -4531,6 +4605,11 @@ mod imp {
                     cfg.head_dim
                 ));
             }
+            self.mtp_draft_lm_head = if mtp_coarse_head::get() {
+                coarse_lm_head(&self.trunk_lm_head_view())?
+            } else {
+                None
+            };
             self.mtp = Some(block);
             Ok(())
         }
@@ -5263,7 +5342,12 @@ mod imp {
 
             // === Drafter loop: extrapolate K tokens from (lead_token, h_draft) ===
             let trunk_final_norm_w = self.final_norm_weight.clone();
-            let trunk_lm_head = self.trunk_lm_head_view();
+            // Greedy drafts read the coarse copy when there is one; a sampled draft is drawn from
+            // the head's own distribution, which the acceptance test then divides by.
+            let trunk_lm_head = match (&self.mtp_draft_lm_head, sampling) {
+                (Some(coarse), false) => coarse.clone(),
+                _ => self.trunk_lm_head_view(),
+            };
             let mut last_h: Option<Array> = None;
             let mut last_tok = lead_token;
             let mut fold_end = history.kv.offset();
@@ -5621,6 +5705,83 @@ mod imp {
                 .first()
                 .copied()
                 .ok_or_else(|| anyhow!("argmax_last_token: argmax produced empty slice"))
+        }
+    }
+
+    #[cfg(test)]
+    mod coarse_head_tests {
+        use super::{MODE_AFFINE, ResolvedLinear, coarse_lm_head, quantize_with_mode};
+        use crate::native_quant::dequantize_with_mode;
+        use mlx_rs::{Array, Dtype};
+
+        fn bits(a: &Array) -> Vec<u32> {
+            let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
+            a.eval().unwrap();
+            a.as_slice::<f32>().iter().map(|v| v.to_bits()).collect()
+        }
+
+        /// The packed words of quantized weights, as stored.
+        fn words(a: &Array) -> Vec<u32> {
+            let a = a.reshape(&[-1]).unwrap();
+            a.eval().unwrap();
+            a.as_slice::<u32>().to_vec()
+        }
+
+        /// `rows x 128` weights quantized at `b` bits, group 64.
+        fn head(rows: i32, b: i32) -> ResolvedLinear {
+            let n = (rows * 128) as usize;
+            let w: Vec<f32> = (0..n)
+                .map(|i| ((i as f32 + 1.0) * 0.37).sin() * 0.1)
+                .collect();
+            let w = Array::from_slice(&w, &[rows, 128])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let (weight, scales, biases) = quantize_with_mode(&w, 64, b, MODE_AFFINE).unwrap();
+            ResolvedLinear {
+                weight,
+                scales,
+                biases,
+                group_size: 64,
+                bits: b,
+                mode: MODE_AFFINE,
+            }
+        }
+
+        /// The copy is what quantizing the whole dequantized head to 4 bits gives, bit for bit,
+        /// across a slab boundary: rows quantize on their own, so slabs change nothing.
+        #[test]
+        fn the_copy_is_the_whole_head_at_four_bits() {
+            let lm = head(16384 + 77, 8);
+            let copy = coarse_lm_head(&lm)
+                .unwrap()
+                .expect("an 8-bit head gets a copy");
+            let whole = dequantize_with_mode(
+                &lm.weight,
+                &lm.scales,
+                lm.biases.as_ref(),
+                64,
+                8,
+                MODE_AFFINE,
+            )
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+            let (w, s, b) = quantize_with_mode(&whole, 64, 4, MODE_AFFINE).unwrap();
+            assert_eq!((copy.bits, copy.group_size), (4, 64));
+            assert_eq!(copy.weight.shape(), w.shape());
+            assert_eq!(words(&copy.weight), words(&w), "weights");
+            assert_eq!(bits(&copy.scales), bits(&s), "scales");
+            assert_eq!(
+                bits(copy.biases.as_ref().unwrap()),
+                bits(b.as_ref().unwrap()),
+                "biases"
+            );
+        }
+
+        /// A head at 4 bits is what the drafts read already.
+        #[test]
+        fn a_four_bit_head_gets_no_copy() {
+            assert!(coarse_lm_head(&head(64, 4)).unwrap().is_none());
         }
     }
 
