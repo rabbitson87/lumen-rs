@@ -4436,6 +4436,9 @@ mod imp {
             use std::collections::HashMap;
             let cap: HashMap<usize, (&Array, &Array)> =
                 captures.iter().map(|(i, s, c)| (*i, (s, c))).collect();
+            // The selected states, evaluated together at the end. An `eval` per state was a
+            // blocking round trip each, two per linear layer: ~10 ms of a 27B reject.
+            let mut selected: Vec<Array> = Vec::with_capacity(2 * captures.len());
             for (layer_idx, layer) in cache.layers_mut().iter_mut().enumerate() {
                 match layer {
                     NativeLayerCache::Full(kv) => {
@@ -4476,8 +4479,7 @@ mod imp {
                         let idx_arr = Array::from_slice(&idx, &[n_keep as i32]);
                         let conv = mlx_rs::ops::indexing::take_axis(cin, &idx_arr, 1)
                             .context("commit_captured: slice conv state")?;
-                        ssm.eval().ok();
-                        conv.eval().ok();
+                        selected.extend([ssm.clone(), conv.clone()]);
                         arr.set_slot(1, Some(ssm))
                             .context("commit_captured: set ssm slot")?;
                         arr.set_slot(0, Some(conv))
@@ -4486,6 +4488,9 @@ mod imp {
                     }
                 }
             }
+            // Materialized so the per-position captures behind them can go, without waiting.
+            mlx_rs::transforms::async_eval(selected.iter())
+                .context("commit_captured: evaluate the selected states")?;
             Ok(())
         }
 
@@ -4519,12 +4524,17 @@ mod imp {
         /// multiply (Qwen3.6's MTP convention; cf. gemma4 which multiplies by
         /// `sqrt(hidden_size)`).
         fn embed_lookup_single(&self, token_id: u32) -> Result<Array> {
-            let ids_arr = Array::from_slice(&[token_id as i32], &[1]);
+            self.embed_lookup_ids(&Array::from_slice(&[token_id as i32], &[1]))
+        }
+
+        /// [`Self::embed_lookup_single`] of a `[1]` int32 token array, which may still be
+        /// unevaluated (the drafter's own argmax).
+        fn embed_lookup_ids(&self, ids_arr: &Array) -> Result<Array> {
             let raw = quantized_embedding_lookup_with_mode(
                 &self.embed_weight,
                 &self.embed_scales,
                 self.embed_biases.as_ref(),
-                &ids_arr,
+                ids_arr,
                 self.embed_group,
                 self.embed_bits,
                 self.embed_mode,
@@ -5040,11 +5050,19 @@ mod imp {
             } else {
                 Vec::new()
             };
+            // Greedy drafts stay on the GPU: the verify takes them as unevaluated argmaxes, so the
+            // drafter and the verify run back to back and the verify graph is built while the
+            // drafter runs. Its tokens are read with the verify's own argmaxes, one wait a cycle
+            // instead of two. Sampling picks drafts on the host; the stage timer waits per stage.
+            let lazy = !sampling && !st;
+            let mut lazy_drafts: Vec<Array> = Vec::with_capacity(if lazy { n_draft } else { 0 });
             let t_draft0 = st.then(Instant::now);
             for k in 0..n_draft {
-                let embeds = self
-                    .embed_lookup_single(last_tok)
-                    .with_context(|| format!("mtp_step1: drafter embed k={k}"))?;
+                let embeds = match lazy_drafts.last() {
+                    Some(prev) => self.embed_lookup_ids(prev),
+                    None => self.embed_lookup_single(last_tok),
+                }
+                .with_context(|| format!("mtp_step1: drafter embed k={k}"))?;
                 let (logits_b, new_h) = block
                     .forward(
                         &embeds,
@@ -5055,6 +5073,17 @@ mod imp {
                         &trunk_lm_head,
                     )
                     .with_context(|| format!("mtp_step1: drafter block.forward k={k}"))?;
+                if lazy {
+                    let draft = self
+                        .argmax_last_token_lazy(&logits_b)
+                        .and_then(|d| {
+                            Ok(mlx_rs::ops::reshape(&d, &[1])?.as_dtype(mlx_rs::Dtype::Int32)?)
+                        })
+                        .with_context(|| format!("mtp_step1: drafter lazy argmax k={k}"))?;
+                    lazy_drafts.push(draft);
+                    last_h = new_h;
+                    continue;
+                }
                 let draft_tok = if sampling {
                     let mut row = self.logits_row_to_cpu_f32(&logits_b, -1)?;
                     let q = sampling_distribution(&mut row, &[], cfg);
@@ -5086,9 +5115,26 @@ mod imp {
 
             // === Verify [lead_token, drafts]; capture ALL-position trunk hidden
             //     (for the next cycle's carry) + per-position SSM state. ===
-            let mut verify_in: Vec<u32> = Vec::with_capacity(1 + n_draft);
-            verify_in.push(lead_token);
-            verify_in.extend_from_slice(&drafts);
+            let lead = Array::from_slice(&[lead_token as i32], &[1]);
+            let lazy_ids = if lazy {
+                let ids = mlx_rs::ops::concatenate_axis(&lazy_drafts, 0)
+                    .context("mtp_step1: gather the lazy drafts")?;
+                // Start the drafter now: the GPU runs it while the verify graph is built.
+                mlx_rs::transforms::async_eval([&ids]).context("mtp_step1: start the drafter")?;
+                Some(ids)
+            } else {
+                None
+            };
+            let verify_ids = match &lazy_ids {
+                Some(d) => mlx_rs::ops::concatenate_axis(&[&lead, d], 0)
+                    .context("mtp_step1: verify ids")?,
+                None => {
+                    let mut ids: Vec<i32> = Vec::with_capacity(1 + n_draft);
+                    ids.push(lead_token as i32);
+                    ids.extend(drafts.iter().map(|&d| d as i32));
+                    Array::from_slice(&ids, &[ids.len() as i32])
+                }
+            };
             if use_capture {
                 self.set_ssm_capture_enabled(true);
             }
@@ -5096,8 +5142,15 @@ mod imp {
             // slice, so the capture slot holds [1, K+1, hidden].
             self.set_mtp_capture_enabled(true);
             let t_verify0 = st.then(Instant::now);
-            let verify_logits = self
-                .forward(&verify_in, trunk_cache)
+            let (verify_logits, _) = self
+                .forward_ids(
+                    &verify_ids,
+                    trunk_cache,
+                    /* last_only */ false,
+                    &[],
+                    RopePlan::Sequential,
+                    None,
+                )
                 .context("mtp_step1: verify forward")?;
             if st {
                 // Force the whole verify graph (SSM + capture writes are ancestors
@@ -5160,7 +5213,14 @@ mod imp {
                 .context("mtp_step1: accept argmax")?
                 .as_dtype(mlx_rs::Dtype::Int32)
                 .context("mtp_step1: accept cast i32")?;
-                argmax_per_pos.eval().context("mtp_step1: accept eval")?;
+                match &lazy_ids {
+                    Some(d) => {
+                        mlx_rs::transforms::eval([&argmax_per_pos, d])
+                            .context("mtp_step1: accept eval")?;
+                        drafts = d.as_slice::<i32>().iter().map(|&x| x as u32).collect();
+                    }
+                    None => argmax_per_pos.eval().context("mtp_step1: accept eval")?,
+                }
                 let preds_i32: &[i32] = argmax_per_pos.as_slice();
                 let preds: Vec<u32> = preds_i32.iter().map(|x| *x as u32).collect();
                 let mut acc = 0usize;
