@@ -550,10 +550,11 @@ Run a matvec of two to four vectors (an MTP verify, a few sequences decoded toge
  `LUMEN_NATIVE_DECODE_QMV=0` then runs such matvecs on MLX one row at a time, which gives the
  same bits.
 
- M3 Max, GPU time per launch of 17408x5120: one vector 94.9 us; two as `qmv_wide` on the f32
- activation 135.1 us, two here 105.5 us. Qwen3.6-27B MTP K=1 (in-process bench): cycle 96.1
- -> 81.2 ms, 17.4 -> 20.6 tok/s, acceptance unchanged (0.670). Default on; `=0` runs them as
- MLX would.
+ M3 Max, 17408x5120, bench wall time: one vector 183 us; two, three, four 186 / 244 / 320 us
+ here, 258 / 387 / 543 us as `qmv_wide` on the f32 activation. A Qwen3.6-27B forward of two,
+ three, four tokens 66.6 / 89.0 / 108.7 ms, 87.0 / 126.5 / 165.8 off, one token 61.8. MTP K=1
+ (lossless) serves chat at 42.5 ms a token against 56.1 without MTP. Default on; `=0` runs
+ them as MLX would.
 
 ### `LUMEN_NATIVE_FUSED_MOE_DECODE`
 

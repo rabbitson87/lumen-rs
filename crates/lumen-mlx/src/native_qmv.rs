@@ -75,10 +75,11 @@ lumen_flags::flag! {
     /// `LUMEN_NATIVE_DECODE_QMV=0` then runs such matvecs on MLX one row at a time, which gives the
     /// same bits.
     ///
-    /// M3 Max, GPU time per launch of 17408x5120: one vector 94.9 us; two as `qmv_wide` on the f32
-    /// activation 135.1 us, two here 105.5 us. Qwen3.6-27B MTP K=1 (in-process bench): cycle 96.1
-    /// -> 81.2 ms, 17.4 -> 20.6 tok/s, acceptance unchanged (0.670). Default on; `=0` runs them as
-    /// MLX would.
+    /// M3 Max, 17408x5120, bench wall time: one vector 183 us; two, three, four 186 / 244 / 320 us
+    /// here, 258 / 387 / 543 us as `qmv_wide` on the f32 activation. A Qwen3.6-27B forward of two,
+    /// three, four tokens 66.6 / 89.0 / 108.7 ms, 87.0 / 126.5 / 165.8 off, one token 61.8. MTP K=1
+    /// (lossless) serves chat at 42.5 ms a token against 56.1 without MTP. Default on; `=0` runs
+    /// them as MLX would.
     pub(crate) decode_qmv_rows {
         env: "LUMEN_NATIVE_DECODE_QMV_ROWS",
         default: true,
@@ -89,24 +90,75 @@ lumen_flags::flag! {
 /// Output rows one simdgroup owns, and simdgroups to a threadgroup: MLX's `qmv_fast` takes 4 and 2.
 const ROWS: i32 = 4;
 const SIMDGROUPS: i32 = 2;
-/// Vectors one simdgroup dots with each weight block: a `qmv_fast` matvec of up to this many runs
-/// them together (`decode_qmv_rows`, or MLX's choice below GPU generation 15), more one each.
+/// Simdgroups to a threadgroup of [`ROWS_BODY`], which share each block of the activation. M3 Max,
+/// 17408x5120, two vectors: 4 186 us, 8 192 us, 16 233 us (bench wall time).
+const ROWS_SIMDGROUPS: i32 = 4;
+/// Vectors one pass over the weights takes: a `qmv_fast` matvec of up to this many runs them
+/// together (`decode_qmv_rows`, or MLX's choice below GPU generation 15), more one each.
 const MAX_ROW_VECTORS: i32 = 4;
+
+/// Vectors [`ROWS_BODY`] dots with each decoded nibble at a time: all of them up to three, four
+/// in two passes of two. A lane holding four vectors' values spills (M3 Max, 17408x5120, four
+/// vectors: at once 531 us, in two passes 320 us).
+fn vectors_per_pass(vectors: i32) -> i32 {
+    if vectors == 4 { 2 } else { vectors }
+}
 /// Projections one shared launch takes at most: linear attention's four input projections.
 const MAX_SHARED: usize = 4;
 
-/// MLX's `qmv_fast` (`qmv_fast_impl<float, 64, 4>`), one simdgroup per `R` output rows of the `VV`
-/// vectors from `z * VV`: lane `l` takes values `16 l .. 16 l + 16` of every block of 512, each
-/// vector's row sums run block by block in `qdot`'s order, then `simd_sum` adds the lanes. A
-/// weight block is read once and dotted with each vector in turn, so every vector's arithmetic is
-/// `qmv_fast`'s for that vector alone. [`fast_source`] puts in front of it the choice of the
-/// projection (`w`, `sc`, `bi`, `out`, `N`) and the row group `rg` within it.
+/// MLX's `qmv_fast` (`qmv_fast_impl<float, 64, 4>`), one simdgroup per `R` output rows of vector
+/// `z`: lane `l` takes values `16 l .. 16 l + 16` of every block of 512, the rows' sums run block
+/// by block in `qdot`'s order, then `simd_sum` adds the lanes. [`fast_source`] puts in front of it
+/// the choice of the projection (`w`, `sc`, `bi`, `out`, `N`) and the row group `rg` within it.
 const FAST_BODY: &str = r#"
     const int lane = thread_index_in_simdgroup;
-    const int vec0 = thread_position_in_grid.z * VV;
+    const int vec = thread_position_in_grid.z;
     constexpr int G = K / 64;
     constexpr int WPR = K / 8;
     constexpr int BLOCKS = K / 512;
+    const device float* xv = x + (size_t)vec * K;
+    float acc[R];
+    for (int r = 0; r < R; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (int blk = 0; blk < BLOCKS; ++blk) {
+        float x_thread[16];
+        const float sum = load_vector_f32(xv + blk * 512 + lane * 16, x_thread);
+        const int scale_at = blk * 8 + lane / 4;
+        for (int r = 0; r < R; ++r) {
+            const size_t row = (size_t)rg * R + r;
+            const device uint16_t* pw = (const device uint16_t*)(w + row * WPR + blk * 64 + lane * 2);
+            const float s = sc[row * G + scale_at];
+            const float b = bi[row * G + scale_at];
+            acc[r] += qdot4(pw, x_thread, s, b, sum);
+        }
+    }
+    for (int r = 0; r < R; ++r) {
+        const float y = simd_sum(acc[r]);
+        if (lane == 0) {
+            out[(size_t)vec * N + rg * R + r] = y;
+        }
+    }
+"#;
+
+/// [`FAST_BODY`]'s arithmetic for each of `VV` vectors (two to [`MAX_ROW_VECTORS`]) in one pass
+/// over the weights. Per block of 512 the first simdgroups of a threadgroup of `SG` write each
+/// lane's `load_vector` values and sum of every vector to threadgroup memory, once for the
+/// threadgroup rather than once per simdgroup; then each simdgroup decodes every nibble of its rows
+/// once and dots it with `VC` vectors at a time. Each vector's row still adds as `qdot` and
+/// `qmv_fast` do, so it equals that vector's own matvec in every bit.
+///
+/// Read per simdgroup, as [`FAST_BODY`] does, the activation outweighs the weights from three
+/// vectors on (f32, a weight byte is two values), and decoding a nibble per vector made the
+/// matvec ALU-bound.
+const ROWS_BODY: &str = r#"
+    const int lane = thread_index_in_simdgroup;
+    const int sgi = simdgroup_index_in_threadgroup;
+    constexpr int G = K / 64;
+    constexpr int WPR = K / 8;
+    constexpr int BLOCKS = K / 512;
+    threadgroup float xs[VV * 16 * 32];
+    threadgroup float xsum[VV * 32];
     float acc[VV][R];
     for (int v = 0; v < VV; ++v) {
         for (int r = 0; r < R; ++r) {
@@ -114,19 +166,51 @@ const FAST_BODY: &str = r#"
         }
     }
     for (int blk = 0; blk < BLOCKS; ++blk) {
-        float x_thread[VV][16];
-        float sum[VV];
-        for (int v = 0; v < VV; ++v) {
-            sum[v] = load_vector_f32(x + (size_t)(vec0 + v) * K + blk * 512 + lane * 16, x_thread[v]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int v = sgi; v < VV; v += SG) {
+            float xt[16];
+            xsum[v * 32 + lane] = load_vector_f32(x + (size_t)v * K + blk * 512 + lane * 16, xt);
+            for (int i = 0; i < 16; ++i) {
+                xs[(v * 16 + i) * 32 + lane] = xt[i];
+            }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         const int scale_at = blk * 8 + lane / 4;
-        for (int r = 0; r < R; ++r) {
-            const size_t row = (size_t)rg * R + r;
-            const device uint16_t* pw = (const device uint16_t*)(w + row * WPR + blk * 64 + lane * 2);
-            const float s = sc[row * G + scale_at];
-            const float b = bi[row * G + scale_at];
-            for (int v = 0; v < VV; ++v) {
-                acc[v][r] += qdot4(pw, x_thread[v], s, b, sum[v]);
+        for (int c = 0; c < VV; c += VC) {
+            float xt[VC][16];
+            float xsm[VC];
+            for (int v = 0; v < VC; ++v) {
+                for (int i = 0; i < 16; ++i) {
+                    xt[v][i] = xs[((c + v) * 16 + i) * 32 + lane];
+                }
+                xsm[v] = xsum[(c + v) * 32 + lane];
+            }
+            for (int r = 0; r < R; ++r) {
+                const size_t row = (size_t)rg * R + r;
+                const device uint16_t* pw = (const device uint16_t*)(w + row * WPR + blk * 64 + lane * 2);
+                const float s = sc[row * G + scale_at];
+                const float b = bi[row * G + scale_at];
+                float accum[VC];
+                for (int v = 0; v < VC; ++v) {
+                    accum[v] = 0;
+                }
+                for (int i = 0; i < 4; i++) {
+                    const uint16_t q = pw[i];
+                    const float w0 = q & 0x000f;
+                    const float w1 = q & 0x00f0;
+                    const float w2 = q & 0x0f00;
+                    const float w3 = q & 0xf000;
+                    for (int v = 0; v < VC; ++v) {
+                        accum[v] +=
+                            (xt[v][4 * i] * w0 +
+                             xt[v][4 * i + 1] * w1 +
+                             xt[v][4 * i + 2] * w2 +
+                             xt[v][4 * i + 3] * w3);
+                    }
+                }
+                for (int v = 0; v < VC; ++v) {
+                    acc[c + v][r] += s * accum[v] + xsm[v] * b;
+                }
             }
         }
     }
@@ -134,7 +218,7 @@ const FAST_BODY: &str = r#"
         for (int r = 0; r < R; ++r) {
             const float y = simd_sum(acc[v][r]);
             if (lane == 0) {
-                out[(size_t)(vec0 + v) * N + rg * R + r] = y;
+                out[(size_t)v * N + rg * R + r] = y;
             }
         }
     }
@@ -143,7 +227,7 @@ const FAST_BODY: &str = r#"
 /// [`FAST_BODY`] for `projections` projections of one activation (`w0`, `sc0`, `bi0`, `out0`,
 /// `N0`, then `w1`, ...): projection `p` owns the `Np / R` row groups after those of the ones
 /// before it, along the grid's y axis.
-fn fast_source(projections: usize) -> String {
+fn fast_source(projections: usize, body: &str) -> String {
     let mut s = String::from("    int rg = thread_position_in_grid.y;\n    int p = 0;\n");
     for p in 1..projections {
         let q = p - 1;
@@ -163,7 +247,7 @@ fn fast_source(projections: usize) -> String {
     s += &format!("    const auto bi = {};\n", pick("bi"));
     s += &format!("    device float* out = {};\n", pick("out"));
     s += &format!("    const int N = {};\n", pick("N"));
-    s + FAST_BODY
+    s + body
 }
 
 /// MLX's `qmv_wide` (`qmv_wide_impl<float, 64, 4, V, 8>`), `M` vectors in tiles of `V`: eight lanes
@@ -452,6 +536,8 @@ pub(crate) fn row_by_row(
 struct Kernels {
     /// `fast[p - 1]` runs `p` projections of one activation.
     fast: [MetalKernel; MAX_SHARED],
+    /// `rows[p - 1]`: [`ROWS_BODY`] over `p` projections.
+    rows: [MetalKernel; MAX_SHARED],
     wide: MetalKernel,
 }
 
@@ -496,6 +582,7 @@ struct FastSignature {
     inputs: Vec<String>,
     outputs: Vec<String>,
     source: String,
+    rows_source: String,
 }
 
 impl FastSignature {
@@ -507,7 +594,8 @@ impl FastSignature {
         Self {
             inputs,
             outputs: (0..projections).map(|p| format!("out{p}")).collect(),
-            source: fast_source(projections),
+            source: fast_source(projections, FAST_BODY),
+            rows_source: fast_source(projections, ROWS_BODY),
         }
     }
 
@@ -565,6 +653,44 @@ fn with_kernels<R>(f: impl FnOnce(&Kernels) -> Result<R>) -> Result<R> {
                         /* atomic_outputs */ false,
                     )?,
                 ],
+                rows: [
+                    MetalKernel::new_with_header(
+                        "decode_qmv_rows_affine4",
+                        &one.inputs(),
+                        &one.outputs(),
+                        QMV_F32,
+                        &one.rows_source,
+                        /* ensure_row_contiguous */ true,
+                        /* atomic_outputs */ false,
+                    )?,
+                    MetalKernel::new_with_header(
+                        "decode_qmv_rows_affine4_x2",
+                        &two.inputs(),
+                        &two.outputs(),
+                        QMV_F32,
+                        &two.rows_source,
+                        /* ensure_row_contiguous */ true,
+                        /* atomic_outputs */ false,
+                    )?,
+                    MetalKernel::new_with_header(
+                        "decode_qmv_rows_affine4_x3",
+                        &three.inputs(),
+                        &three.outputs(),
+                        QMV_F32,
+                        &three.rows_source,
+                        /* ensure_row_contiguous */ true,
+                        /* atomic_outputs */ false,
+                    )?,
+                    MetalKernel::new_with_header(
+                        "decode_qmv_rows_affine4_x4",
+                        &four.inputs(),
+                        &four.outputs(),
+                        QMV_F32,
+                        &four.rows_source,
+                        /* ensure_row_contiguous */ true,
+                        /* atomic_outputs */ false,
+                    )?,
+                ],
                 wide: MetalKernel::new_with_header(
                     "decode_qmv_wide_affine4",
                     &["x", "w", "sc", "bi"],
@@ -613,26 +739,39 @@ fn run_fast(x: &Array, plans: &[Plan], weights: &[Weights<'_>]) -> Result<Vec<Ar
         inputs,
         outputs,
     };
-    // Every vector's arithmetic is `qmv_fast`'s alone, however many share a simdgroup.
-    let vv = if vectors <= MAX_ROW_VECTORS {
-        vectors
-    } else {
-        1
-    };
+    // Two to four vectors in one pass over the weights; one, or more, a launch row set each.
+    let shared_rows = (2..=MAX_ROW_VECTORS).contains(&vectors);
     let config = config(key, |config| {
         config.add_template_arg_int("K", inputs)?;
         config.add_template_arg_int("R", ROWS)?;
-        config.add_template_arg_int("VV", vv)?;
+        let groups: i32 = plans.iter().map(|p| p.outputs / ROWS).sum();
+        // Whole threadgroups only, as every simdgroup of one loads its share of the activation:
+        // the row groups are even, as each projection's rows are a multiple of `ROWS * SIMDGROUPS`.
+        let sg = if groups % ROWS_SIMDGROUPS == 0 {
+            ROWS_SIMDGROUPS
+        } else {
+            SIMDGROUPS
+        };
+        if shared_rows {
+            config.add_template_arg_int("VV", vectors)?;
+            config.add_template_arg_int("SG", sg)?;
+            config.add_template_arg_int("VC", vectors_per_pass(vectors))?;
+        }
         for (p, plan) in plans.iter().enumerate() {
             config.add_template_arg_int(&format!("N{p}"), plan.outputs)?;
             config.add_output_arg(&[vectors * plan.outputs], Dtype::Float32)?;
         }
-        let groups: i32 = plans.iter().map(|p| p.outputs / ROWS).sum();
-        config.set_grid(32, groups, vectors / vv)?;
-        config.set_thread_group(32, SIMDGROUPS, 1)
+        if shared_rows {
+            config.set_grid(32, groups, 1)?;
+            config.set_thread_group(32, sg, 1)
+        } else {
+            config.set_grid(32, groups, vectors)?;
+            config.set_thread_group(32, SIMDGROUPS, 1)
+        }
     })?;
     let ys = with_kernels(|k| {
-        k.fast[plans.len() - 1]
+        let kernels = if shared_rows { &k.rows } else { &k.fast };
+        kernels[plans.len() - 1]
             .apply(&tensors, &config, plans.len())
             .context("decode matvec kernel failed")
     })?;
@@ -979,7 +1118,8 @@ mod tests {
 
     /// One launch over the projections of one activation gives each projection's own output: the
     /// 35B-A3B's linear-attention input projections (four), attention's q/k/v (three), a dense
-    /// MLP's gate and up (two), and one alone.
+    /// MLP's gate and up (two), and one alone; for one vector and for each count of the row-exact
+    /// range.
     #[test]
     fn a_shared_launch_equals_each_projection_alone_bit_for_bit() {
         // The kernels under test, whatever the equivalence matrix flips.
@@ -997,14 +1137,25 @@ mod tests {
                     .map(|(i, &(rows, inputs))| projection(rows, inputs, (10 * g + i) as u64))
                     .collect();
                 let weights: Vec<Weights<'_>> = ps.iter().map(Projection::weights).collect();
-                let x = activation(&[1, 1, shapes[0].1], 50 + g as u64);
-                let got = matvec_shared(&x, &weights)
-                    .expect("kernel")
-                    .expect("the shared launch must take one vector of these projections");
-                assert_eq!(got.len(), ps.len());
-                for (p, (y, &(rows, inputs))) in ps.iter().zip(got.iter().zip(shapes.iter())) {
-                    let off = differing(&mlx_on_widened_scales(&x, p), y);
-                    assert_eq!(off, 0, "group {g}, {rows}x{inputs}: {off} outputs differ");
+                // A decode step, and the row-exact range's one pass over the weights.
+                for vectors in 1..=MAX_ROW_VECTORS {
+                    let x = activation(&[1, vectors, shapes[0].1], 50 + g as u64);
+                    let got = decode_qmv_rows::with(true, || matvec_shared(&x, &weights))
+                        .expect("kernel")
+                        .expect("the shared launch must take these vectors of these projections");
+                    assert_eq!(got.len(), ps.len());
+                    for (p, (y, &(rows, inputs))) in ps.iter().zip(got.iter().zip(shapes.iter())) {
+                        let want = if vectors == 1 {
+                            mlx_on_widened_scales(&x, p)
+                        } else {
+                            mlx_row_by_row(&x, p)
+                        };
+                        let off = differing(&want, y);
+                        assert_eq!(
+                            off, 0,
+                            "group {g}, {rows}x{inputs}, {vectors} vectors: {off} outputs differ"
+                        );
+                    }
                 }
             }
             // Several vectors share the launch when they run as `qmv_fast` (the row-exact range),
