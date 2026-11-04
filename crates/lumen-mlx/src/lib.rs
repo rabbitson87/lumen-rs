@@ -257,6 +257,9 @@ pub mod native_metal_bridge;
 mod native_moe;
 #[cfg(feature = "mlx-native")]
 mod native_moe_decode;
+// How many drafts each MTP cycle proposes (measured per sequence). Pure bookkeeping, so it
+// builds without MLX too: `decode_tokens` names its type either way.
+mod mtp_depth;
 mod native_norm;
 #[cfg(feature = "mlx-native")]
 mod native_qmv;
@@ -1392,24 +1395,29 @@ fn model_has_mtp_head(dir: &std::path::Path) -> bool {
     dir.join("mtp").join("weights.safetensors").is_file() || dir.join("mtp.safetensors").is_file()
 }
 
-/// Resolve the effective MTP draft count for the streaming decode, assuming the
-/// caller has already confirmed the head is installed (`qwen35_mtp_enabled()`).
-/// `LUMEN_SPEC=mtp` → explicit on (K = `LUMEN_SPEC_K`, default 2). `LUMEN_SPEC`
-/// set to anything else → `None` (defer to that mode). UNSET → AUTO-route
-/// through MTP (K = `LUMEN_SPEC_K`, default 1 — the dense-27B accept sweet spot),
-/// so a self-contained MTP model serves at spec speed with no env vars.
+/// Resolve the MTP draft counts for the streaming decode, assuming the caller has
+/// already confirmed the head is installed (`qwen35_mtp_enabled()`).
+/// `LUMEN_SPEC` UNSET or `mtp` → MTP, `LUMEN_SPEC` set to anything else → `None`
+/// (defer to that mode), so a self-contained MTP model serves at spec speed with no
+/// env vars. The count is chosen per cycle from what the sequence measures
+/// (`mtp_depth`), or fixed by `LUMEN_SPEC_K`; either way at most
+/// `MAX_EXACT_DRAFTS`, the deepest draft the verify checks exactly.
 #[cfg(feature = "mlx-native")]
-fn effective_qwen35_mtp_k() -> Option<usize> {
-    let k_env = || {
-        std::env::var("LUMEN_SPEC_K")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&v| v >= 1)
-    };
+fn effective_qwen35_mtp_depth() -> Option<crate::mtp_depth::MtpDepth> {
+    use crate::mtp_depth::{MAX_EXACT_DRAFTS, MtpDepth};
+    let depth = std::env::var("LUMEN_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+        .map_or(
+            MtpDepth::Auto {
+                max: MAX_EXACT_DRAFTS,
+            },
+            |k| MtpDepth::Fixed(k.min(MAX_EXACT_DRAFTS)),
+        );
     match std::env::var("LUMEN_SPEC") {
-        Ok(s) if s.eq_ignore_ascii_case("mtp") => Some(k_env().unwrap_or(2)),
-        Ok(_) => None,
-        Err(_) => Some(k_env().unwrap_or(1)),
+        Ok(s) if !s.eq_ignore_ascii_case("mtp") => None,
+        _ => Some(depth),
     }
 }
 
@@ -5525,14 +5533,14 @@ impl MlxQwen35Backend {
         if !has_images
             && self.qwen35_mtp_enabled()
             && mtp_sampling_is_supported(self.sampling.as_ref())
-            && let Some(k) = effective_qwen35_mtp_k()
+            && let Some(depth) = effective_qwen35_mtp_depth()
         {
             return self.chat_streaming_qwen35_mtp(
                 messages,
                 max_new_tokens,
                 thinking,
                 seq_id,
-                k,
+                depth,
                 &mut text_only,
                 effort,
             );
@@ -7045,7 +7053,7 @@ impl MlxQwen35Backend {
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
-        k: usize,
+        depth: crate::mtp_depth::MtpDepth,
         mut on_token: F,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
@@ -7060,7 +7068,7 @@ impl MlxQwen35Backend {
         let (last, pos) = self.prefill(seq_id, &prompt_ids)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
-            "[mlx-mtp] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms (K={k}) -> tok={last}",
+            "[mlx-mtp] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms ({depth:?}) -> tok={last}",
             prompt_ids.len(),
         );
 
@@ -7073,7 +7081,7 @@ impl MlxQwen35Backend {
             last,
             pos,
             max_new_tokens,
-            Some(k),
+            Some(depth),
             Some(&mut on_text),
         )?;
         let out = self.decode(&decoded.answer).unwrap_or_default();
@@ -7084,16 +7092,16 @@ impl MlxQwen35Backend {
 
     /// The MTP draft count when this request's decode runs as MTP cycles: a drafter is installed,
     /// the sampling policy is one MTP keeps exact, and `LUMEN_SPEC` leaves it on.
-    fn mtp_draft_count(&self) -> Option<usize> {
+    fn mtp_draft_count(&self) -> Option<crate::mtp_depth::MtpDepth> {
         #[cfg(feature = "mlx-native")]
         if self.qwen35_mtp_enabled() && mtp_sampling_is_supported(self.sampling.as_ref()) {
-            return effective_qwen35_mtp_k();
+            return effective_qwen35_mtp_depth();
         }
         None
     }
 
     /// Decode after `first`, the token a prompt's feed returned with the sequence at `pos`: MTP
-    /// cycles of `mtp_k` drafts when given, else the plain loop (`decode_step_chained`).
+    /// cycles at the draft counts `mtp` gives when given, else the plain loop (`decode_step_chained`).
     ///
     /// `on_text`, when given, gets the reply's text as it becomes ready and may stop the decode.
     /// The answer is `first` and what follows it, cut at EOS, at `max_new_tokens` or at that stop.
@@ -7106,7 +7114,7 @@ impl MlxQwen35Backend {
         first: u32,
         pos: usize,
         max_new_tokens: usize,
-        mtp_k: Option<usize>,
+        mtp: Option<crate::mtp_depth::MtpDepth>,
         mut on_text: Option<&mut dyn FnMut(&str) -> ControlFlow<()>>,
     ) -> Result<DecodedTokens> {
         let mut answer = Vec::with_capacity(max_new_tokens);
@@ -7130,15 +7138,19 @@ impl MlxQwen35Backend {
         };
         let mut stop = take(self, &mut answer, first);
         #[cfg(feature = "mlx-native")]
-        if let Some(k) = mtp_k {
+        if let Some(depth) = mtp {
             let cfg = self.mtp_sampling();
+            let mut control = crate::mtp_depth::DepthController::new(depth);
             let t_decode = std::time::Instant::now();
             let (mut cycles, mut accepted, mut attempted) = (0usize, 0usize, 0usize);
             let mut last = first;
             while !stop && answer.len() < max_new_tokens {
+                let k = control.next();
+                let t_cycle = std::time::Instant::now();
                 let out = self
                     .qwen35_mtp_step(seq_id, last, k, &cfg)
                     .with_context(|| format!("[mlx-mtp] seq {seq_id} cycle {cycles} failed"))?;
+                control.observe(k, out.n_accepted, t_cycle.elapsed().as_secs_f64() * 1000.0);
                 cycles += 1;
                 accepted += out.n_accepted;
                 attempted += out.n_attempted;
@@ -7153,15 +7165,16 @@ impl MlxQwen35Backend {
             let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
                 "[mlx-mtp] seq {seq_id} done: {} tokens in {decode_ms:.0}ms ({:.1} tok/s); \
-                 cycles={cycles} accept={:.3} emit/cycle={:.2}",
+                 cycles={cycles} accept={:.3} emit/cycle={:.2} depths={}",
                 answer.len(),
                 answer.len() as f64 / (decode_ms / 1000.0),
                 accepted as f64 / attempted.max(1) as f64,
                 (fed.len() - 1) as f64 / cycles.max(1) as f64,
+                control.summary(),
             );
             return Ok(DecodedTokens { answer, fed, pos });
         }
-        let _ = mtp_k;
+        let _ = mtp;
         let mut last = first;
         while !stop && answer.len() < max_new_tokens {
             let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
@@ -7250,15 +7263,9 @@ impl MlxQwen35Backend {
 
         // `on_token` ends the decode when the caller has what it needs (a client
         // stop sequence matched): the tokens after it would only be dropped.
-        let mtp_k = self.mtp_draft_count();
-        let decoded = self.decode_tokens(
-            seq_id,
-            last,
-            pos,
-            max_new_tokens,
-            mtp_k,
-            Some(&mut on_token),
-        )?;
+        let mtp = self.mtp_draft_count();
+        let decoded =
+            self.decode_tokens(seq_id, last, pos, max_new_tokens, mtp, Some(&mut on_token))?;
         let generated = decoded.answer;
         let out = self.decode(&generated).unwrap_or_default();
 
@@ -7322,8 +7329,8 @@ impl MlxQwen35Backend {
             " (completion)",
         )?;
 
-        let mtp_k = self.mtp_draft_count();
-        let decoded = self.decode_tokens(seq_id, last, pos, max_new_tokens, mtp_k, None)?;
+        let mtp = self.mtp_draft_count();
+        let decoded = self.decode_tokens(seq_id, last, pos, max_new_tokens, mtp, None)?;
         let generated = decoded.answer;
 
         let prompt_len = prompt_ids.len();
