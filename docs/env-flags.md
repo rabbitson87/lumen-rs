@@ -508,8 +508,8 @@ Conv-state advance via `slice` (view/copy) instead of `take_axis`
 
 *Optimization, default on.*
 
-Run the matvecs of an affine 4-bit group-64 projection whose activation is f32 and whose
- scales and biases are bf16 or f16 in kernels that read those scales as they are
+Run the matvecs of an affine 4-bit group-32/64 projection whose activation is f32 and
+ whose scales and biases are bf16 or f16 in kernels that read those scales as they are
  (`native_qmv::matvec`), instead of MLX's `quantized_matmul`, which casts them to f32 on every
  call, and keep such projections' scales in bf16 under `LUMEN_NATIVE_WIDEN_SCALES`. A
  single-token step runs the projections of one activation (linear attention's four input
