@@ -93,6 +93,10 @@ mod imp {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// The random stream an MTP cycle draws its drafts and acceptances from,
+    /// keyed with the request's seed and the cycle's cache offset.
+    const MTP_RNG_STREAM: u64 = 0xA5;
+
     pub(crate) fn sigmoid_mul_fuse_enabled_pub() -> bool {
         sigmoid_mul_fuse_enabled()
     }
@@ -4894,7 +4898,7 @@ mod imp {
             // Sampling vs greedy. Deterministic per-step RNG (seed + cache
             // offset) so the same prompt reproduces the same draws.
             let sampling = cfg.temperature > 0.0;
-            let mut rng = Xorshift64::new(cfg.seed.wrapping_add(m_pre as u64).wrapping_add(0xA5));
+            let mut rng = Xorshift64::at_position(cfg.seed, m_pre as u64, MTP_RNG_STREAM);
 
             // Reset the MTP block's own KV cache — every 2-forward mtp_step is a
             // fresh K-step extrapolation (the head history is the 1-forward
@@ -5256,8 +5260,7 @@ mod imp {
             // Sampling vs greedy (see 2-forward `mtp_step` for the rationale).
             let sampling = cfg.temperature > 0.0;
             let entry_off = trunk_cache.full_attn_offset();
-            let mut rng =
-                Xorshift64::new(cfg.seed.wrapping_add(entry_off as u64).wrapping_add(0xA5));
+            let mut rng = Xorshift64::at_position(cfg.seed, entry_off as u64, MTP_RNG_STREAM);
 
             // The head keeps its history across cycles (`mtp_history`); without
             // it each cycle drafts from an empty head cache.

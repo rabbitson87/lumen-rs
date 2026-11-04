@@ -112,6 +112,23 @@ impl Xorshift64 {
     pub fn next_f32(&mut self) -> f32 {
         ((self.next_u64() >> 40) as f32) / (1u32 << 24) as f32
     }
+
+    /// The generator for one position of one stream of a seeded request. The
+    /// three are mixed rather than added: with `seed + position`, the request
+    /// seeded `s` at position `p` drew exactly what the one seeded `s + 1`
+    /// drew at `p - 1`.
+    pub fn at_position(seed: u64, position: u64, stream: u64) -> Self {
+        Self::new(splitmix64(splitmix64(splitmix64(seed) ^ position) ^ stream))
+    }
+}
+
+/// SplitMix64's output function: a bijection on `u64` in which every output
+/// bit depends on every input bit.
+fn splitmix64(v: u64) -> u64 {
+    let v = v.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let v = (v ^ (v >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let v = (v ^ (v >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    v ^ (v >> 31)
 }
 
 /// HF-style repeat penalty applied in place: divide positive logits and
@@ -633,6 +650,30 @@ mod tests {
         let mut b = Xorshift64::new(42);
         for _ in 0..16 {
             assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    /// Every `(seed, position, stream)` near the origin opens its own
+    /// sequence, and the same triple always opens the same one. Seeds one
+    /// apart are the case that matters: a client retrying with `seed + 1`
+    /// must not get the earlier draws back one position later.
+    #[test]
+    fn a_position_keyed_generator_is_its_own_sequence() {
+        let opening = |s, p, k| {
+            let mut r = Xorshift64::at_position(s, p, k);
+            [r.next_u64(), r.next_u64()]
+        };
+        let mut seen = std::collections::HashMap::new();
+        for s in 0..24u64 {
+            for p in 0..24u64 {
+                for k in [0u64, 1, 0xA5] {
+                    let o = opening(s, p, k);
+                    assert_eq!(o, opening(s, p, k), "({s}, {p}, {k}) is not reproducible");
+                    if let Some(other) = seen.insert(o, (s, p, k)) {
+                        panic!("({s}, {p}, {k}) draws what {other:?} draws");
+                    }
+                }
+            }
         }
     }
 

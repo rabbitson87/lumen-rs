@@ -862,6 +862,22 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "rng-seed-plus-position",
+        symptom: "an MTP cycle seeded its generator with `seed + offset`, so a \
+                  request seeded `s` drew at position `p` exactly what one \
+                  seeded `s + 1` drew at `p - 1`: a client retrying with the \
+                  next seed got the same draws one token later",
+        revert: &[Mutation {
+            path: CORE,
+            find: "        Self::new(splitmix64(splitmix64(splitmix64(seed) ^ position) ^ stream))",
+            replace: "        Self::new(seed.wrapping_add(position).wrapping_add(stream)) // defect: added, not mixed",
+        }],
+        guards: &[core(
+            "sampling::tests::a_position_keyed_generator_is_its_own_sequence",
+        )],
+        ..PLAIN
+    },
+    Defect {
         name: "greedy-decode-drops-the-grammar",
         symptom: "on Gemma 4 a grammar was applied only by the sampled decode \
                   branch, so a greedy request (temperature 0, penalties off — \
@@ -2184,9 +2200,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "gemma-cached-stream-thought-channel") | (_, "greedy-decode-drops-the-grammar") => {
             "gemma4_backend.rs"
         }
-        (_, "temperature-zero-is-a-coin-flip") | (_, "top-p-draw-ignores-the-kept-mass") => {
-            "sampling.rs"
-        }
+        (_, "temperature-zero-is-a-coin-flip")
+        | (_, "top-p-draw-ignores-the-kept-mass")
+        | (_, "rng-seed-plus-position") => "sampling.rs",
         (_, "gemma-boundary-prefill-unchunked") | (_, "gemma-drop-leaves-boundary-snapshot") => {
             "gemma4_backend.rs"
         }
