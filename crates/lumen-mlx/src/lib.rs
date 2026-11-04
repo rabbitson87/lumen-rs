@@ -1978,6 +1978,17 @@ pub trait MlxBatchedSeqDriver {
     }
 }
 
+/// What [`MlxQwen35Backend::decode_tokens`] decoded after a prompt's feed.
+struct DecodedTokens {
+    /// The reply: the feed's token and what followed it, up to EOS, the token limit or a stop.
+    answer: Vec<u32>,
+    /// Every token decoded after the prompt, in order, including any an MTP cycle fed past the
+    /// end of the reply.
+    fed: Vec<u32>,
+    /// The sequence's position afterwards: the prompt and `fed` up to here are in its cache.
+    pos: usize,
+}
+
 impl MlxBatchedSeqDriver for MlxQwen35Backend {
     fn build_chat_input(
         &self,
@@ -7035,36 +7046,128 @@ impl MlxQwen35Backend {
             return Err(anyhow!("empty prompt after tokenization"));
         }
         let t_prefill = std::time::Instant::now();
-        let (mut last, _pos) = self.prefill(seq_id, &prompt_ids)?;
+        let (last, pos) = self.prefill(seq_id, &prompt_ids)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "[mlx-mtp] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms (K={k}) -> tok={last}",
             prompt_ids.len(),
         );
 
-        let mut generated: Vec<u32> = vec![last];
-        let mut detok = StreamDetok::whole();
-        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
-            on_token(&text);
-        }
-        if self.eos_tokens.contains(&last) {
-            let out = self.decode(&generated).unwrap_or_default();
-            self.remove_seq(seq_id).ok();
-            self.note_stop(&generated, max_new_tokens);
-            return Ok(out);
-        }
+        let mut on_text = |t: &str| {
+            on_token(t);
+            ControlFlow::Continue(())
+        };
+        let decoded = self.decode_tokens(
+            seq_id,
+            last,
+            pos,
+            max_new_tokens,
+            Some(k),
+            Some(&mut on_text),
+        )?;
+        let out = self.decode(&decoded.answer).unwrap_or_default();
+        self.remove_seq(seq_id).ok();
+        self.note_stop(&decoded.answer, max_new_tokens);
+        Ok(out)
+    }
 
-        // MTP acceptance regime. Greedy (temp 0) is exact argmax-match and
-        // lossless; `temperature > 0` switches to Leviathan rejection sampling
-        // (accept `min(1,p/q)` + residual), which keeps the committed stream a
-        // valid sample at that temperature.
-        //
-        // The request's temperature is the default, taken from the sampling
-        // policy the entry point installed. It used to read `LUMEN_MTP_TEMP`
-        // alone and default to 0.0, which meant a client asking for
-        // `temperature: 1.5` got greedy output and no error. The env vars stay
-        // as an operator override for A/B measurement — that is what they were
-        // added for — but they no longer decide the request's regime.
+    /// The MTP draft count when this request's decode runs as MTP cycles: a drafter is installed,
+    /// the sampling policy is one MTP keeps exact, and `LUMEN_SPEC` leaves it on.
+    fn mtp_draft_count(&self) -> Option<usize> {
+        #[cfg(feature = "mlx-native")]
+        if self.qwen35_mtp_enabled() && mtp_sampling_is_supported(self.sampling.as_ref()) {
+            return effective_qwen35_mtp_k();
+        }
+        None
+    }
+
+    /// Decode after `first`, the token a prompt's feed returned with the sequence at `pos`: MTP
+    /// cycles of `mtp_k` drafts when given, else the plain loop (`decode_step_chained`).
+    ///
+    /// `on_text`, when given, gets the reply's text as it becomes ready and may stop the decode.
+    /// The answer is `first` and what follows it, cut at EOS, at `max_new_tokens` or at that stop.
+    /// What the sequence holds is [`DecodedTokens::fed`] up to [`DecodedTokens::pos`]: an MTP
+    /// cycle commits several tokens and feeds every one but the last, so an answer cut inside a
+    /// cycle leaves fed tokens after the cut.
+    fn decode_tokens(
+        &mut self,
+        seq_id: u64,
+        first: u32,
+        pos: usize,
+        max_new_tokens: usize,
+        mtp_k: Option<usize>,
+        mut on_text: Option<&mut dyn FnMut(&str) -> ControlFlow<()>>,
+    ) -> Result<DecodedTokens> {
+        let mut answer = Vec::with_capacity(max_new_tokens);
+        let mut fed = vec![first];
+        let mut pos = pos;
+        let mut detok = StreamDetok::whole();
+        // Adds `tok` to the answer and says whether the decode is over.
+        let mut take = |this: &Self, answer: &mut Vec<u32>, tok: u32| -> bool {
+            // The feed's token is always the reply's first.
+            if answer.len() >= max_new_tokens.max(1) {
+                return true;
+            }
+            answer.push(tok);
+            let halted = match on_text.as_deref_mut() {
+                Some(on_text) => detok
+                    .next(answer, |t| this.decode(t))
+                    .is_some_and(|text| on_text(&text).is_break()),
+                None => false,
+            };
+            halted || this.eos_tokens.contains(&tok)
+        };
+        let mut stop = take(self, &mut answer, first);
+        #[cfg(feature = "mlx-native")]
+        if let Some(k) = mtp_k {
+            let cfg = self.mtp_sampling();
+            let t_decode = std::time::Instant::now();
+            let (mut cycles, mut accepted, mut attempted) = (0usize, 0usize, 0usize);
+            let mut last = first;
+            while !stop && answer.len() < max_new_tokens {
+                let out = self
+                    .qwen35_mtp_step(seq_id, last, k, &cfg)
+                    .with_context(|| format!("[mlx-mtp] seq {seq_id} cycle {cycles} failed"))?;
+                cycles += 1;
+                accepted += out.n_accepted;
+                attempted += out.n_attempted;
+                // The cycle fed `last` and the accepted drafts: one token per committed one.
+                pos += out.committed.len();
+                for &tok in &out.committed {
+                    fed.push(tok);
+                    stop = stop || take(self, &mut answer, tok);
+                }
+                last = *out.committed.last().context("mtp_step committed nothing")?;
+            }
+            let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[mlx-mtp] seq {seq_id} done: {} tokens in {decode_ms:.0}ms ({:.1} tok/s); \
+                 cycles={cycles} accept={:.3} emit/cycle={:.2}",
+                answer.len(),
+                answer.len() as f64 / (decode_ms / 1000.0),
+                accepted as f64 / attempted.max(1) as f64,
+                (fed.len() - 1) as f64 / cycles.max(1) as f64,
+            );
+            return Ok(DecodedTokens { answer, fed, pos });
+        }
+        let _ = mtp_k;
+        let mut last = first;
+        while !stop && answer.len() < max_new_tokens {
+            let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
+            (last, pos) = (next, new_pos);
+            fed.push(next);
+            stop = take(self, &mut answer, next);
+        }
+        Ok(DecodedTokens { answer, fed, pos })
+    }
+
+    /// The acceptance regime of an MTP cycle: the request's sampling policy. Greedy (temp 0) is
+    /// exact argmax-match and lossless; `temperature > 0` is Leviathan rejection sampling (accept
+    /// `min(1,p/q)` + residual), which keeps the committed stream a valid sample at that
+    /// temperature. `LUMEN_MTP_TEMP` / `LUMEN_MTP_TOPP` override it for A/B measurement; they used
+    /// to be the only source, so a client asking for `temperature: 1.5` got greedy output.
+    #[cfg(feature = "mlx-native")]
+    fn mtp_sampling(&self) -> lumen_core::sampling::SamplingConfig {
         let mut mtp_cfg = self.sampling.unwrap_or_default();
         if let Some(t) = std::env::var("LUMEN_MTP_TEMP")
             .ok()
@@ -7078,74 +7181,7 @@ impl MlxQwen35Backend {
         {
             mtp_cfg.top_p = p;
         }
-        let t_decode = std::time::Instant::now();
-        let mut cycles: usize = 0;
-        let mut accepted_total: usize = 0;
-        let mut attempted_total: usize = 0;
-        let mut stop = false;
-        while generated.len() < max_new_tokens && !stop {
-            let t_cycle = std::time::Instant::now();
-            let out = self
-                .qwen35_mtp_step(seq_id, last, k, &mtp_cfg)
-                .with_context(|| {
-                    format!("[mlx-mtp] seq {seq_id} mtp_step cycle {cycles} failed")
-                })?;
-            let cycle_ms = t_cycle.elapsed().as_secs_f64() * 1000.0;
-            cycles += 1;
-            accepted_total += out.n_accepted;
-            attempted_total += out.n_attempted;
-            // Emit committed tokens one-by-one, honoring EOS + max_new_tokens
-            // mid-cycle. We always keep the LAST committed token as `last` for
-            // the next mtp_step call (it's the correction/bonus not yet in
-            // cache), even if EOS was emitted earlier in the cycle.
-            for tok in &out.committed {
-                if generated.len() >= max_new_tokens {
-                    stop = true;
-                    break;
-                }
-                generated.push(*tok);
-                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
-                    on_token(&fresh);
-                }
-                if self.eos_tokens.contains(tok) {
-                    stop = true;
-                    break;
-                }
-            }
-            last = *out.committed.last().expect("mtp_step committed non-empty");
-            if std::env::var("LUMEN_MTP_DEBUG")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
-                eprintln!(
-                    "[mlx-mtp-cycle] seq {seq_id} {cycle_ms:.2} ms  n_acc={}/{}  emitted={}",
-                    out.n_accepted,
-                    out.n_attempted,
-                    out.committed.len(),
-                );
-            }
-        }
-        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
-        let n_gen = generated.len();
-        let accept_rate = if attempted_total > 0 {
-            (accepted_total as f64) / (attempted_total as f64)
-        } else {
-            0.0
-        };
-        let emit_per_cycle = if cycles > 0 {
-            ((n_gen - 1) as f64) / (cycles as f64)
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[mlx-mtp] seq {seq_id} done: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s); \
-             cycles={cycles} accept={accept_rate:.3} emit/cycle={emit_per_cycle:.2}",
-            n_gen as f64 / (decode_ms / 1000.0),
-        );
-        let out = self.decode(&generated).unwrap_or_default();
-        self.remove_seq(seq_id).ok();
-        self.note_stop(&generated, max_new_tokens);
-        Ok(out)
+        mtp_cfg
     }
 
     /// Streaming chat with prompt-cache reuse keyed by `session_id`.
@@ -7192,7 +7228,7 @@ impl MlxQwen35Backend {
                 })?;
         self.make_room_for_session_feed(start.from, prompt_ids.len());
         let seq_id = start.seq_id;
-        let (mut last, mut pos, point) = session::feed(
+        let (last, pos, point) = session::feed(
             &mut self.runner,
             session_id,
             &start,
@@ -7201,36 +7237,24 @@ impl MlxQwen35Backend {
             "",
         )?;
 
-        let mut generated: Vec<u32> = vec![last];
-        let mut detok = StreamDetok::whole();
-        // `on_token` ends the loop when the caller has what it needs (a client
+        // `on_token` ends the decode when the caller has what it needs (a client
         // stop sequence matched): the tokens after it would only be dropped.
-        let mut halted = false;
-        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
-            halted = on_token(&text).is_break();
-        }
-
-        if !halted && !self.eos_tokens.contains(&last) {
-            for _ in 1..max_new_tokens {
-                let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
-                last = next;
-                pos = new_pos;
-                generated.push(next);
-                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
-                    halted = on_token(&fresh).is_break();
-                }
-                if halted || self.eos_tokens.contains(&next) {
-                    break;
-                }
-            }
-        }
-
+        let mtp_k = self.mtp_draft_count();
+        let decoded = self.decode_tokens(
+            seq_id,
+            last,
+            pos,
+            max_new_tokens,
+            mtp_k,
+            Some(&mut on_token),
+        )?;
+        let generated = decoded.answer;
         let out = self.decode(&generated).unwrap_or_default();
 
         // Persist session: what the sequence was fed. Don't remove_seq — the
         // cache state is needed for the next turn.
         let prompt_len = prompt_ids.len();
-        let new_tokens = session::held_tokens(prompt_ids, &generated, pos);
+        let new_tokens = session::held_tokens(prompt_ids, &decoded.fed, decoded.pos);
         session::persist_point(
             &mut self.runner,
             session_id,
@@ -7278,7 +7302,7 @@ impl MlxQwen35Backend {
         )?;
         self.make_room_for_session_feed(start.from, prompt_ids.len());
         let seq_id = start.seq_id;
-        let (mut last, mut pos, point) = session::feed(
+        let (last, pos, point) = session::feed(
             &mut self.runner,
             session_id,
             &start,
@@ -7287,21 +7311,12 @@ impl MlxQwen35Backend {
             " (completion)",
         )?;
 
-        let mut generated: Vec<u32> = vec![last];
-        if !self.eos_tokens.contains(&last) {
-            for _ in 1..max_new_tokens {
-                let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
-                last = next;
-                pos = new_pos;
-                generated.push(next);
-                if self.eos_tokens.contains(&next) {
-                    break;
-                }
-            }
-        }
+        let mtp_k = self.mtp_draft_count();
+        let decoded = self.decode_tokens(seq_id, last, pos, max_new_tokens, mtp_k, None)?;
+        let generated = decoded.answer;
 
         let prompt_len = prompt_ids.len();
-        let new_tokens = session::held_tokens(prompt_ids, &generated, pos);
+        let new_tokens = session::held_tokens(prompt_ids, &decoded.fed, decoded.pos);
         session::persist_point(
             &mut self.runner,
             session_id,
@@ -8501,6 +8516,108 @@ mod tests {
         assert_eq!(
             warm, cold,
             "the extended session must answer as a cold prefill"
+        );
+    }
+
+    /// With an MTP head installed, a chat turn decodes through MTP cycles, answers as the plain
+    /// greedy decode does, and leaves the session holding what the cycles fed: the next turn,
+    /// continuing it, answers as a cold prefill of the same conversation does.
+    ///
+    /// A cycle commits one or two tokens (K=1) and feeds all but the last, so a token limit that
+    /// falls inside a cycle leaves a fed token past the answer, which the session must hold. The
+    /// limits below are swept until one does, and that turn is the one continued.
+    #[test]
+    #[ignore = "needs a Qwen checkpoint with an MTP head; set LUMEN_QWEN35_MODEL_DIR"]
+    fn an_mtp_session_turn_answers_and_holds_as_the_plain_decode() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            return;
+        };
+        let mut backend = MlxBackend::load(&dir).expect("load checkpoint");
+        let MlxBackend::Qwen35Family(m) = &mut backend else {
+            panic!("MTP only concerns the Qwen path");
+        };
+        assert!(
+            m.mtp_draft_count().is_some(),
+            "the checkpoint must carry an MTP head and the request must take MTP"
+        );
+        let msg = |role: &str, text: &str| (role.to_string(), text.to_string());
+        let q1 = [msg("user", "Summarize the history of the printing press.")];
+        let prompt = m.build_chat_input(&q1, false, None).expect("prompt");
+
+        // The plain greedy reply, long enough for every limit below.
+        let seq = m.alloc_seq_id();
+        let (mut last, mut pos) = m.prefill(seq, &prompt).expect("prefill");
+        let mut plain = vec![last];
+        while plain.len() < 40 && !m.eos_tokens.contains(&last) {
+            (last, pos) = m.decode_step(seq, last, pos).expect("decode");
+            plain.push(last);
+        }
+        m.remove_seq(seq).ok();
+        assert_eq!(
+            plain.len(),
+            40,
+            "the reply must not end before the limits swept"
+        );
+
+        let mut overfed = None;
+        for n in 24..=36 {
+            let id = format!("mtp{n}");
+            let reply = m
+                .chat_streaming_session(
+                    &q1,
+                    n,
+                    false,
+                    Some(&id),
+                    |_| ControlFlow::Continue(()),
+                    None,
+                )
+                .expect("turn 1");
+            assert_eq!(
+                reply,
+                m.decode(&plain[..n]).expect("detokenize"),
+                "limit {n}: MTP must answer as the plain greedy decode"
+            );
+            // The answer's last token is never fed; a cycle crossing the limit fed more.
+            let held = m.sessions.get(&id).expect("session").tokens.len();
+            assert!(
+                held >= prompt.len() + n - 1,
+                "limit {n}: the session holds too little"
+            );
+            if held > prompt.len() + n - 1 {
+                overfed = Some((n, reply));
+                break;
+            }
+        }
+        let (n, reply) = overfed.expect("some limit must fall inside a cycle");
+
+        let conversation = [
+            q1[0].clone(),
+            msg("assistant", &reply),
+            msg("user", "Now its effect on science, in two sentences."),
+        ];
+        let warm = m
+            .chat_streaming_session(
+                &conversation,
+                24,
+                false,
+                Some(&format!("mtp{n}")),
+                |_| ControlFlow::Continue(()),
+                None,
+            )
+            .expect("turn 2");
+        let cold = m
+            .chat_streaming_session(
+                &conversation,
+                24,
+                false,
+                Some("cold"),
+                |_| ControlFlow::Continue(()),
+                None,
+            )
+            .expect("cold");
+        assert_eq!(
+            warm, cold,
+            "a session continued after a cycle that crossed the limit must answer as a cold prefill"
         );
     }
 

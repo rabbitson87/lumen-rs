@@ -1751,6 +1751,9 @@ mod imp {
                     })?;
             let next_tok = model.argmax_last_token(&logits)?;
             state.position += tokens.len();
+            // The MTP carry is the trunk hidden of a cycle that ended before these tokens; the
+            // next cycle must bootstrap from where the sequence is now.
+            state.mtp_carried = None;
             Ok((next_tok, state.position))
         }
 
