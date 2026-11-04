@@ -508,7 +508,7 @@ Conv-state advance via `slice` (view/copy) instead of `take_axis`
 
 *Optimization, default on.*
 
-Run the matvecs of an affine 4-bit group-32/64 projection whose activation is f32 and
+Run the matvecs of an affine 4- or 8-bit, group-32/64 projection whose activation is f32 and
  whose scales and biases are bf16 or f16 in kernels that read those scales as they are
  (`native_qmv::matvec`), instead of MLX's `quantized_matmul`, which casts them to f32 on every
  call, and keep such projections' scales in bf16 under `LUMEN_NATIVE_WIDEN_SCALES`. A
@@ -533,6 +533,9 @@ Run the matvecs of an affine 4-bit group-32/64 projection whose activation is f3
  Pipelined greedy decode against MLX on the widened copies, alternating runs, text identical
  in every run: Qwen3.6-27B 61.4 / 61.6 / 61.1 -> 56.6 / 57.2 / 56.7 ms/token, footprint 18.51
  -> 17.21 GB; Qwen3.6-35B-A3B 9.3 / 9.3 / 9.3 -> 9.2 / 9.2 / 9.2 ms/token, 20.65 -> 20.52 GB.
+ Qwen3.8-27B-MTPLX-Optimized (4-bit group 32, 8-bit group 64 layers), chat: 78.5 -> 70.3
+ ms/token, 24.25 -> 22.0 GB; its 8-bit kernels gain the decode step nothing measurable but
+ let its MTP verify read those layers once (lossless MTP 58.5 -> 47.8 ms/token).
 
 ### `LUMEN_NATIVE_DECODE_QMV_ROWS`
 
