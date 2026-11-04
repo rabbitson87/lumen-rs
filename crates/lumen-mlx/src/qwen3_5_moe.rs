@@ -4034,15 +4034,21 @@ mod imp {
                 }
             }
 
-            // MTP capture: stash the post-MLP residual (pre-final-norm hidden)
-            // when the MTP path is active. Consumed by `mtp_step` as the MTP
-            // block's `h_pre` input. Cheap refcount clone — captured even when
-            // the slot already holds a stale value (overwritten). The slot is
-            // drained by `take_captured_h()` after the trunk forward returns.
+            // MTP capture: stash the trunk hidden the head reads (the post-MLP
+            // residual, or that after the final norm: `TrunkHidden`) when the MTP
+            // path is active. Consumed by `mtp_step` as the MTP block's `h_pre`
+            // input; overwritten each forward, drained by `take_captured_h()`.
             if self.mtp_capture_enabled.load(Ordering::Relaxed)
                 && let Ok(mut slot) = self.mtp_capture_slot.lock()
             {
-                *slot = Some(hidden_states.clone());
+                let after_norm = self.mtp.as_ref().is_some_and(|b| {
+                    b.trunk_hidden == crate::qwen3_5_mtp::TrunkHidden::AfterFinalNorm
+                });
+                *slot = Some(if after_norm {
+                    rms_norm(&hidden_states, &self.final_norm_weight, cfg.rms_norm_eps)?
+                } else {
+                    hidden_states.clone()
+                });
             }
 
             // Final RMSNorm + lm_head projection. `tie_word_embeddings = false`

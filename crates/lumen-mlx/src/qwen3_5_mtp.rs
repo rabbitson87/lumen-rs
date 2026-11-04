@@ -248,6 +248,45 @@ pub struct Qwen35MtpBlock {
     // shared_head_head is **always** the trunk's lm_head on Qwen3.6 —
     // the checkpoint never ships `mtp.shared_head_head.*`. Caller threads
     // the trunk's lm_head through `forward()`.
+    /// Which trunk hidden the head reads.
+    pub trunk_hidden: TrunkHidden,
+}
+
+/// The trunk hidden an MTP head was trained or calibrated on: the last layer's residual, or that
+/// after the trunk's final norm (what vLLM hands Qwen3-Next-style heads, its model output). The
+/// head's own `pre_fc_norm_hidden` follows either way, so the two differ by the final norm's
+/// per-channel gain. MTPLX records it as `mtp_contract.base_hidden_variant`.
+///
+/// Measured, greedy, five prompts paired, Qwen3.6-27B-MTPLX (no contract): after the norm is
+/// ahead by +0.034 acceptance at K=1 and +0.053 at K=2, 4 of 5 prompts each, one tie. The
+/// 35B-A3B head's contract says before, and there the math prompt drops 0.639 -> 0.574 after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrunkHidden {
+    BeforeFinalNorm,
+    AfterFinalNorm,
+}
+
+impl TrunkHidden {
+    /// From a head's `mtplx_runtime.json` (`mtp_contract`, at the top or under
+    /// `forge_provenance`): `pre_norm` / `post_norm`; without a contract, after the norm.
+    fn from_runtime(runtime: Option<&serde_json::Value>) -> Result<Self> {
+        let contract = runtime.and_then(|r| {
+            r.get("mtp_contract").or_else(|| {
+                r.get("forge_provenance")
+                    .and_then(|f| f.get("mtp_contract"))
+            })
+        });
+        match contract.and_then(|c| c.get("base_hidden_variant")) {
+            None => Ok(Self::AfterFinalNorm),
+            Some(v) => match v.as_str() {
+                Some("pre_norm") => Ok(Self::BeforeFinalNorm),
+                Some("post_norm") => Ok(Self::AfterFinalNorm),
+                _ => Err(anyhow!(
+                    "mtplx_runtime.json: base_hidden_variant {v} is neither pre_norm nor post_norm"
+                )),
+            },
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -259,8 +298,8 @@ impl Qwen35MtpBlock {
     ///
     /// * `embeds`     — `embed_tokens(x_{p+1})`, shape `[B, T, hidden]`. Caller
     ///   pre-embeds via the trunk's embedding table.
-    /// * `h_pre`      — trunk's pre-final-norm hidden at the same T positions,
-    ///   shape `[B, T, hidden]`. Same dtype as `embeds`.
+    /// * `h_pre`      — the trunk hidden the head reads ([`TrunkHidden`]) at the
+    ///   same T positions, shape `[B, T, hidden]`. Same dtype as `embeds`.
     /// * `cache`      — the MTP block's own KV cache (lifetime: per seq).
     ///   Position offset is read from `cache.offset()`.
     /// * `causal`     — `true` when `T > 1` (verify-batch or prefill-mirror);
@@ -879,6 +918,14 @@ pub fn load_block_from_hf(
         .and_then(|v| v.as_object())
         .ok_or_else(|| anyhow!("missing `weight_map` object in {}", index_path.display()))?;
 
+    // MTPLX bundles describe the head in `mtplx_runtime.json` (sidecar file, hidden contract).
+    let runtime: Option<serde_json::Value> =
+        std::fs::read_to_string(hf_dir.join("mtplx_runtime.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+    let trunk_hidden = TrunkHidden::from_runtime(runtime.as_ref())?;
+    eprintln!("[mtp] the head reads the trunk hidden {trunk_hidden:?}");
+
     let mut mtp_to_shard: HashMap<String, String> = HashMap::new();
     for (key, val) in weight_map {
         if key.starts_with("mtp.")
@@ -924,9 +971,10 @@ pub fn load_block_from_hf(
             hf_dir.join("mtp.safetensors"),
             hf_dir.join("mtp").join("weights.safetensors"),
         ];
-        if let Ok(rt) = std::fs::read_to_string(hf_dir.join("mtplx_runtime.json"))
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&rt)
-            && let Some(f) = v.get("mtp_file").and_then(|x| x.as_str())
+        if let Some(f) = runtime
+            .as_ref()
+            .and_then(|v| v.get("mtp_file"))
+            .and_then(|x| x.as_str())
         {
             candidates.insert(0, hf_dir.join(f));
         }
@@ -1237,6 +1285,7 @@ pub fn load_block_from_hf(
         post_attention_layernorm,
         mlp,
         shared_head_norm,
+        trunk_hidden,
     })
 }
 
@@ -1618,6 +1667,7 @@ pub fn run_step_b_synthetic_bench(t_values: &[i32], runs: usize) -> Result<Vec<S
         post_attention_layernorm,
         mlp,
         shared_head_norm,
+        trunk_hidden: TrunkHidden::AfterFinalNorm,
     };
 
     // trunk_lm_head is the largest matmul in Step B's output stage; synth at
@@ -1934,5 +1984,44 @@ mod shape_derivation_tests {
             err.to_string().contains("intermediate_size"),
             "error should name the missing field, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod trunk_hidden_tests {
+    use super::TrunkHidden;
+
+    fn read(json: &str) -> anyhow::Result<TrunkHidden> {
+        TrunkHidden::from_runtime(Some(&serde_json::from_str(json).expect("json")))
+    }
+
+    /// The contract is read wherever MTPLX puts it, and a head without one reads the hidden after
+    /// the final norm, as vLLM feeds Qwen3-Next-style heads.
+    #[test]
+    fn the_contract_decides_and_its_absence_means_after_the_norm() {
+        let top = r#"{"mtp_contract": {"base_hidden_variant": "pre_norm"}}"#;
+        let nested =
+            r#"{"forge_provenance": {"mtp_contract": {"base_hidden_variant": "pre_norm"}}}"#;
+        let post = r#"{"mtp_contract": {"base_hidden_variant": "post_norm"}}"#;
+        assert_eq!(read(top).expect("top"), TrunkHidden::BeforeFinalNorm);
+        assert_eq!(read(nested).expect("nested"), TrunkHidden::BeforeFinalNorm);
+        assert_eq!(read(post).expect("post"), TrunkHidden::AfterFinalNorm);
+        assert_eq!(
+            read(r#"{"mtp_file": "mtp.safetensors"}"#).expect("none"),
+            TrunkHidden::AfterFinalNorm
+        );
+        assert_eq!(
+            TrunkHidden::from_runtime(None).expect("no file"),
+            TrunkHidden::AfterFinalNorm
+        );
+    }
+
+    /// A value it does not know is an error, not a silent default: the wrong hidden costs only
+    /// acceptance, which no output check would catch.
+    #[test]
+    fn an_unknown_variant_is_an_error() {
+        let err = read(r#"{"mtp_contract": {"base_hidden_variant": "mid_norm"}}"#)
+            .expect_err("unknown variant");
+        assert!(err.to_string().contains("mid_norm"), "{err}");
     }
 }
