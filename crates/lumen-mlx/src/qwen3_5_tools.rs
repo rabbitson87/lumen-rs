@@ -833,6 +833,13 @@ pub enum Qwen35ParseEvent {
     /// `<tool_call>...</tool_call>` block, between the `<function=NAME>`
     /// line and the first `<parameter=>` block.
     ToolCallStart { name: String },
+    /// A piece of the open call's `arguments`, as JSON text. A call's pieces,
+    /// in order, are the arguments the finished response carries (byte for
+    /// byte while no key repeats; with a repeat, the same object once the
+    /// text is parsed, the later value winning, as `finish()` keeps it).
+    ToolCallArgs(String),
+    /// The open call is complete: `</tool_call>` closed it.
+    ToolCallEnd,
 }
 
 /// Incremental parser for the assistant decode stream. Accumulates text,
@@ -857,6 +864,8 @@ pub struct Qwen35ResponseParser {
     /// through [`Self::feed_marker`]; text that spells them is text. Set by
     /// [`Self::markers_by_id`].
     markers_by_id: bool,
+    /// The parameter value being read, as far as it has been streamed.
+    value: ValueStream,
 }
 
 #[derive(Debug)]
@@ -885,6 +894,26 @@ enum State {
 struct PendingCall {
     name: String,
     args: Map<String, JsonValue>,
+    /// Whether this call's `arguments` have started on the stream (`{` sent).
+    args_open: bool,
+}
+
+/// How much of the parameter value being read has gone out as
+/// [`Qwen35ParseEvent::ToolCallArgs`].
+///
+/// A value becomes JSON only when it closes ([`parse_param_value`]), so it
+/// streams early only once its text can no longer be anything but a string:
+/// its first non-blank character is not one JSON can start with, or (for
+/// `t`, `f`, `n`) it has stopped spelling `true`, `false` or `null`. Anything
+/// else goes out whole at its close.
+#[derive(Debug, Default)]
+struct ValueStream {
+    /// Where the value starts in the buffer, past its framing newline. `None`
+    /// until a byte has arrived to tell.
+    start: Option<usize>,
+    /// Bytes of the value already sent, string-escaped, after the opening
+    /// quote. `None` while the value is not known to be a string.
+    sent: Option<usize>,
 }
 
 impl Qwen35ResponseParser {
@@ -898,6 +927,7 @@ impl Qwen35ResponseParser {
             parsed_calls: Vec::new(),
             pending: None,
             markers_by_id: false,
+            value: ValueStream::default(),
         }
     }
 
@@ -921,14 +951,16 @@ impl Qwen35ResponseParser {
         if !self.markers_by_id {
             return self.feed(marker.text());
         }
-        let opens_outside_a_call = match (&self.state, marker) {
-            (State::Visible | State::AfterThink, QwenMarker::ToolCallOpen)
-            | (State::Visible | State::AfterThink, QwenMarker::ThinkOpen)
-            | (State::Visible | State::AfterThink | State::Thinking, QwenMarker::ThinkClose) => {
-                true
-            }
-            _ => false,
-        };
+        let opens_outside_a_call = matches!(
+            (&self.state, marker),
+            (
+                State::Visible | State::AfterThink,
+                QwenMarker::ToolCallOpen | QwenMarker::ThinkOpen
+            ) | (
+                State::Visible | State::AfterThink | State::Thinking,
+                QwenMarker::ThinkClose
+            )
+        );
         if !opens_outside_a_call {
             return self.feed(marker.text());
         }
@@ -1004,8 +1036,8 @@ impl Qwen35ResponseParser {
                 State::Thinking => self.try_advance_thinking(&mut events),
                 State::AfterThink => self.try_advance_after_think(),
                 State::InToolCallHeader => self.try_advance_header(&mut events),
-                State::InToolCallBody => self.try_advance_body(),
-                State::InParameterValue { .. } => self.try_advance_value(),
+                State::InToolCallBody => self.try_advance_body(&mut events),
+                State::InParameterValue { .. } => self.try_advance_value(&mut events),
             };
             if !progressed {
                 break;
@@ -1243,6 +1275,7 @@ impl Qwen35ResponseParser {
                 self.pending = Some(PendingCall {
                     name: name.clone(),
                     args: Map::new(),
+                    args_open: false,
                 });
                 events.push(Qwen35ParseEvent::ToolCallStart { name });
                 self.state = State::InToolCallBody;
@@ -1264,7 +1297,7 @@ impl Qwen35ResponseParser {
         }
     }
 
-    fn try_advance_body(&mut self) -> bool {
+    fn try_advance_body(&mut self, events: &mut Vec<Qwen35ParseEvent>) -> bool {
         // Expected: a sequence of `<parameter=KEY>` openers (which
         // transition into `InParameterValue { key }`) interleaved
         // with `</function>\n</tool_call>` that closes the call.
@@ -1284,6 +1317,16 @@ impl Qwen35ResponseParser {
                 // closing twin in `try_advance_value`, once, wherever the
                 // chunks fall; taking it here too would also take a blank line
                 // that is the value's own.
+                if let Some(pending) = self.pending.as_mut() {
+                    let lead = if std::mem::replace(&mut pending.args_open, true) {
+                        ","
+                    } else {
+                        "{"
+                    };
+                    let key_json = serde_json::to_string(&key).expect("a string serializes");
+                    events.push(Qwen35ParseEvent::ToolCallArgs(format!("{lead}{key_json}:")));
+                }
+                self.value = ValueStream::default();
                 self.state = State::InParameterValue { key };
                 true
             } else {
@@ -1299,6 +1342,9 @@ impl Qwen35ResponseParser {
         } else if self.buffer.starts_with(tool_close) {
             self.buffer.drain(..tool_close.len());
             if let Some(pending) = self.pending.take() {
+                let close = if pending.args_open { "}" } else { "{}" };
+                events.push(Qwen35ParseEvent::ToolCallArgs(close.to_string()));
+                events.push(Qwen35ParseEvent::ToolCallEnd);
                 self.parsed_calls.push(ParsedToolCall {
                     name: pending.name,
                     arguments: JsonValue::Object(pending.args),
@@ -1334,7 +1380,7 @@ impl Qwen35ResponseParser {
     ///   `<parameter=KEY>\nVALUE\n</parameter>`
     /// → captured VALUE excludes the framing `\n`s but preserves any
     /// internal newlines in multi-line values.
-    fn try_advance_value(&mut self) -> bool {
+    fn try_advance_value(&mut self, events: &mut Vec<Qwen35ParseEvent>) -> bool {
         let param_close = "</parameter>";
         if let Some(end) = self.buffer.find(param_close) {
             let mut raw = self.buffer[..end].to_string();
@@ -1353,15 +1399,60 @@ impl Qwen35ResponseParser {
                     return false;
                 }
             };
+            let value = parse_param_value(&raw);
             if let Some(pending) = self.pending.as_mut() {
-                pending.args.insert(key, parse_param_value(&raw));
+                // The rest of the value: its unsent tail and closing quote
+                // when it was streaming as a string, the whole JSON otherwise.
+                let rest = match std::mem::take(&mut self.value).sent {
+                    Some(sent) => format!("{}\"", json_string_body(&raw[sent..])),
+                    None => serde_json::to_string(&value).expect("a JSON value serializes"),
+                };
+                events.push(Qwen35ParseEvent::ToolCallArgs(rest));
+                pending.args.insert(key, value);
             }
             true
         } else {
             // Wait for the close tag to arrive. We do NOT drain — the
-            // accumulated value bytes are needed at close time.
+            // accumulated value bytes are needed at close time — but what of
+            // them is settled can go out already.
+            self.stream_value_prefix(events);
             false
         }
+    }
+
+    /// Send what is settled of a value that can only be a string: the bytes
+    /// that cannot still turn out to be the framing newline or the start of
+    /// `</parameter>`.
+    fn stream_value_prefix(&mut self, events: &mut Vec<Qwen35ParseEvent>) {
+        if self.pending.is_none() || self.buffer.is_empty() {
+            return;
+        }
+        let start = *self
+            .value
+            .start
+            .get_or_insert(usize::from(self.buffer.starts_with('\n')));
+        let held = self
+            .partial_suffix_len("\n</parameter>")
+            .max(self.partial_suffix_len("</parameter>"));
+        let settled_end = self.buffer.len() - held;
+        if settled_end <= start {
+            return;
+        }
+        let settled = &self.buffer[start..settled_end];
+        let sent = match self.value.sent {
+            Some(sent) => sent,
+            None if can_only_be_a_string(settled) => {
+                events.push(Qwen35ParseEvent::ToolCallArgs("\"".to_string()));
+                0
+            }
+            None => return,
+        };
+        if settled.len() > sent {
+            events.push(Qwen35ParseEvent::ToolCallArgs(json_string_body(
+                &settled[sent..],
+            )));
+        }
+        self.value.sent = Some(settled.len());
     }
 
     /// Length of the largest suffix of `self.buffer` that is a prefix of
@@ -1430,6 +1521,36 @@ enum DelimKind {
 /// JSON-shaped values (objects/arrays/numbers/bools/null) are
 /// `serde_json::from_str`-able. We attempt JSON first; on failure we
 /// fall back to the raw string.
+/// Whether a value whose text begins with `prefix` is a string whatever
+/// follows, as [`parse_param_value`] would read the whole: its first non-blank
+/// character cannot start JSON, or it can only have been `true`, `false` or
+/// `null` and is no longer spelling one of them.
+fn can_only_be_a_string(prefix: &str) -> bool {
+    let q = prefix.trim_start();
+    let Some(first) = q.bytes().next() else {
+        return false;
+    };
+    match first {
+        b'{' | b'[' | b'"' | b'-' | b'0'..=b'9' => false,
+        b't' | b'f' | b'n' => !["true", "false", "null"].iter().any(|lit| {
+            if q.len() <= lit.len() {
+                lit.starts_with(q)
+            } else {
+                q.starts_with(lit) && q[lit.len()..].chars().all(char::is_whitespace)
+            }
+        }),
+        _ => true,
+    }
+}
+
+/// `text` as it reads inside a JSON string, without the quotes: escaping is
+/// per character, so the pieces of a string escape to the pieces of its
+/// escape.
+fn json_string_body(text: &str) -> String {
+    let quoted = serde_json::to_string(text).expect("a string serializes");
+    quoted[1..quoted.len() - 1].to_string()
+}
+
 fn parse_param_value(raw: &str) -> JsonValue {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2008,7 +2129,9 @@ mod tests {
                 match ev {
                     Qwen35ParseEvent::Reasoning(t) => reasoning.push_str(&t),
                     Qwen35ParseEvent::Text(t) => text.push_str(&t),
-                    Qwen35ParseEvent::ToolCallStart { .. } => unreachable!("no tools here"),
+                    Qwen35ParseEvent::ToolCallStart { .. }
+                    | Qwen35ParseEvent::ToolCallArgs(_)
+                    | Qwen35ParseEvent::ToolCallEnd => unreachable!("no tools here"),
                 }
             }
         }
@@ -3129,5 +3252,138 @@ mod markers_by_id {
         assert_eq!(all.marker(5), None);
         let split = QwenMarkerIds::resolve(|t| (t != "</think>").then_some(7));
         assert!(!split.complete());
+    }
+}
+
+#[cfg(test)]
+mod streamed_args {
+    use super::{Qwen35ParseEvent, Qwen35ResponseParser};
+
+    /// Feed `chunks` and return, per chunk, the argument pieces it produced,
+    /// plus the finished calls.
+    fn pieces(chunks: &[&str]) -> (Vec<Vec<String>>, Vec<(String, serde_json::Value)>) {
+        let mut p = Qwen35ResponseParser::new();
+        let per_chunk = chunks
+            .iter()
+            .map(|c| {
+                p.feed(c)
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        Qwen35ParseEvent::ToolCallArgs(a) => Some(a),
+                        Qwen35ParseEvent::ToolCallEnd => Some("<END>".into()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        let calls = p
+            .finish()
+            .tool_calls
+            .into_iter()
+            .map(|c| (c.name, c.arguments))
+            .collect();
+        (per_chunk, calls)
+    }
+
+    fn joined(per_chunk: &[Vec<String>]) -> String {
+        per_chunk.concat().concat().replace("<END>", "")
+    }
+
+    #[test]
+    fn a_string_value_streams_before_its_parameter_closes() {
+        let (per_chunk, calls) = pieces(&[
+            "<tool_call>\n<function=write_file>\n<parameter=path>\nnotes/a.txt\n</parameter>\n",
+            "<parameter=content>\nline one\nline",
+            " two\n",
+            "</parameter>\n</function>\n</tool_call>",
+        ]);
+        assert_eq!(per_chunk[1], [",\"content\":", "\"", "line one\\nline"]);
+        assert_eq!(
+            per_chunk[2],
+            [" two"],
+            "the trailing newline may be the framing one"
+        );
+        assert_eq!(per_chunk[3], ["\"", "}", "<END>"]);
+        assert_eq!(
+            joined(&per_chunk),
+            serde_json::to_string(&calls[0].1).unwrap(),
+            "byte for byte"
+        );
+    }
+
+    #[test]
+    fn a_value_json_could_still_read_waits_for_its_close() {
+        for (raw, json) in [
+            ("42", "42"),
+            ("-1.5", "-1.5"),
+            ("true", "true"),
+            ("null ", "null"),
+            ("[1, 2]", "[1,2]"),
+            ("{\"a\": 1}", "{\"a\":1}"),
+            ("\"quoted\"", "\"quoted\""),
+            ("12 Main St", "\"12 Main St\""),
+            ("nul", "\"nul\""),
+            ("   ", "\"\""),
+        ] {
+            let (per_chunk, calls) = pieces(&[
+                &format!("<tool_call>\n<function=f>\n<parameter=k>\n{raw}"),
+                "\n</parameter>\n</function>\n</tool_call>",
+            ]);
+            assert_eq!(per_chunk[0], ["{\"k\":"], "{raw:?} must not stream early");
+            assert_eq!(per_chunk[1], [json, "}", "<END>"], "{raw:?}");
+            assert_eq!(
+                joined(&per_chunk),
+                serde_json::to_string(&calls[0].1).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_that_stops_spelling_a_literal_streams_as_a_string() {
+        let (per_chunk, _) = pieces(&[
+            "<tool_call>\n<function=f>\n<parameter=k>\ntr",
+            "uth be told",
+            "\n</parameter>\n</function>\n</tool_call>",
+        ]);
+        assert_eq!(per_chunk[0], ["{\"k\":"], "`tr` may still be `true`");
+        assert_eq!(per_chunk[1], ["\"", "truth be told"]);
+    }
+
+    #[test]
+    fn a_held_closer_prefix_is_not_sent_as_value_text() {
+        let (per_chunk, calls) = pieces(&[
+            "<tool_call>\n<function=f>\n<parameter=k>\nabc</para",
+            "meter>\n</function>\n</tool_call>",
+        ]);
+        assert_eq!(per_chunk[0], ["{\"k\":", "\"", "abc"]);
+        assert_eq!(calls[0].1, serde_json::json!({"k": "abc"}));
+        assert_eq!(joined(&per_chunk), "{\"k\":\"abc\"}");
+    }
+
+    #[test]
+    fn a_call_without_parameters_streams_an_empty_object() {
+        let (per_chunk, _) = pieces(&["<tool_call>\n<function=f>\n</function>\n</tool_call>"]);
+        assert_eq!(per_chunk[0], ["{}", "<END>"]);
+    }
+
+    /// The pieces of a turn whatever its cuts, through the shared contract
+    /// (the same check the `qwen_parser_feed` fuzz target runs).
+    #[test]
+    fn any_cut_streams_the_same_arguments() {
+        let texts = [
+            "ok <tool_call>\n<function=w>\n<parameter=a>\nx \"q\" \\ é\t\u{1}\n\n</parameter>\n\
+             <parameter=b>\n7\n</parameter>\n</function>\n</tool_call> and\n\
+             <tool_call>\n<function=v>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=w>\n<parameter=a>\n1\n</parameter>\n<parameter=a>\nlater\n\
+             </parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=w>\n<parameter=a>\nnot closed",
+        ];
+        for text in texts {
+            for density in 0..8u8 {
+                let mut data = vec![density];
+                data.extend_from_slice(text.as_bytes());
+                crate::parser_contract::assert_qwen35_parser_contract(&data);
+            }
+        }
     }
 }
