@@ -836,8 +836,7 @@ fn qwen35_lark_grammar_string(tools: &[Value], calls: ToolCalls) -> Result<Strin
         // Indexed rule name — see `lark_grammar_string` for why the tool name
         // itself may not be an identifier.
         let body_rule_name = format!("q_{i}_body");
-        let body_rule_rhs = qwen35_body_for_object_schema(&parameters)?;
-        body_rules.push((body_rule_name.clone(), body_rule_rhs));
+        body_rules.extend(qwen35_body_rules(&body_rule_name, &parameters)?);
         // One alternative per tool so the `<function=NAME>` literal binds to
         // THAT tool's parameter set, not any tool's.
         call_alts.push(format!(
@@ -877,63 +876,90 @@ fn qwen35_lark_grammar_string(tools: &[Value], calls: ToolCalls) -> Result<Strin
     Ok(grammar)
 }
 
-/// Render the per-tool body RHS for the Qwen35 XML grammar: a dup-free,
-/// required-enforcing sequence of `<parameter=KEY>\nVALUE\n</parameter>\n`
-/// blocks. Required keys (canonical/schema order) are mandatory and appear
-/// first; optional keys follow, each `?`-gated. No Kleene star over the key
-/// alternation ⇒ no duplicate-parameter n-gram cycle.
-fn qwen35_body_for_object_schema(schema: &Value) -> Result<String> {
+/// A tool body whose parameters may come in any order, up to this many: one
+/// grammar rule per subset of keys already written, so `2^N` rules.
+const ANY_ORDER_MAX_KEYS: usize = 6;
+
+/// The grammar rules of one tool's body for the Qwen35 XML grammar, the first
+/// named `body`: a sequence of `<parameter=KEY>\nVALUE\n</parameter>\n` blocks in
+/// which each key appears at most once and every required key appears.
+///
+/// In any order, for up to [`ANY_ORDER_MAX_KEYS`] keys: the order a model writes
+/// depends on the request (`write_file` came out `path` first for one prompt and
+/// `content` first for another, every run), so a fixed order — sorted or the
+/// schema's — rewrote one call or the other. Each rule is a state, the set of
+/// keys written so far: it continues with any key not in it, and may end once
+/// it holds every required key. Past that many keys, the schema's `properties`
+/// order (as the client sent it, which the prompt shows): a required key
+/// mandatory, an optional one `?`-gated.
+///
+/// Never a Kleene star over the key alternation, which is what lets a greedy
+/// decode repeat a parameter without end. Unlike the Gemma `call:NAME{…}` body
+/// there is no `,` separator — each block is self-delimiting (`</parameter>\n`).
+fn qwen35_body_rules(body: &str, schema: &Value) -> Result<Vec<(String, String)>> {
     let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
         // Unknown shape — allow any sequence of well-formed parameter blocks
         // (still structurally constrained: each is `<parameter=…>…</parameter>`).
-        return Ok("(param_block)*".to_string());
+        return Ok(vec![(body.to_string(), "(param_block)*".to_string())]);
     };
     if properties.is_empty() {
-        return Ok("\"\"".to_string());
+        return Ok(vec![(body.to_string(), "\"\"".to_string())]);
     }
-    // Per-key rendered block, keyed by name for canonical ordering.
-    let mut rendered: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    for (key, _schema) in properties {
-        rendered.insert(
-            key.clone(),
-            format!(
-                "({} param_value)",
-                lark_literal(&format!("<parameter={key}>\n"))
-            ),
-        );
-    }
-    let required: std::collections::BTreeSet<String> = schema
+    let required: std::collections::HashSet<&str> = schema
         .get("required")
         .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    let req_keys: Vec<&String> = rendered.keys().filter(|k| required.contains(*k)).collect();
-    let opt_keys: Vec<&String> = rendered.keys().filter(|k| !required.contains(*k)).collect();
-
-    let mut segments: Vec<String> = Vec::with_capacity(rendered.len());
-    // Required first, each mandatory (no `?`). Optionals follow, each `?`.
-    // Unlike the Gemma `call:NAME{…}` body there is no `,` separator between
-    // parameter blocks — each block is fully self-delimiting (`</parameter>\n`)
-    // — so required and optional blocks compose without comma bookkeeping.
-    for k in &req_keys {
-        segments.push(rendered[*k].clone());
+    let blocks: Vec<(String, bool)> = properties
+        .keys()
+        .map(|key| {
+            let block = format!(
+                "{} param_value",
+                lark_literal(&format!("<parameter={key}>\n"))
+            );
+            (block, required.contains(key.as_str()))
+        })
+        .collect();
+    if blocks.len() > ANY_ORDER_MAX_KEYS {
+        let segments: Vec<String> = blocks
+            .iter()
+            .map(|(block, req)| {
+                if *req {
+                    format!("({block})")
+                } else {
+                    format!("({block})?")
+                }
+            })
+            .collect();
+        return Ok(vec![(body.to_string(), segments.join(" "))]);
     }
-    for k in &opt_keys {
-        segments.push(format!("({})?", rendered[*k]));
-    }
-    // Unreachable: `rendered` is non-empty here (an empty `properties` map
-    // returned earlier), and every key lands in exactly one of req/opt. Kept as
-    // a terminating fallback rather than an `unwrap`.
-    if lumen_core::never!(segments.is_empty()) {
-        return Ok("(param_block)*".to_string());
-    }
-    Ok(segments.join(" "))
+    let required_set: usize = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, req))| *req)
+        .map(|(j, _)| 1 << j)
+        .sum();
+    let state = |written: usize| {
+        if written == 0 {
+            body.to_string()
+        } else {
+            format!("{body}_{written}")
+        }
+    };
+    Ok((0..1usize << blocks.len())
+        .map(|written| {
+            let mut alts: Vec<String> = blocks
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| written & (1 << j) == 0)
+                .map(|(j, (block, _))| format!("{block} {}", state(written | 1 << j)))
+                .collect();
+            if written & required_set == required_set {
+                alts.push("\"\"".to_string());
+            }
+            (state(written), alts.join(" | "))
+        })
+        .collect())
 }
 
 /// Render the raw Lark grammar text for `tools` in the given mode. Split out
@@ -1963,6 +1989,94 @@ mod tests {
         })]
     }
 
+    /// A tool `f` with string parameters `keys`, of which `required` must appear.
+    fn qwen_tool(keys: &[&str], required: &[&str]) -> Vec<Value> {
+        let properties: serde_json::Map<String, Value> = keys
+            .iter()
+            .map(|k| ((*k).to_string(), json!({ "type": "string" })))
+            .collect();
+        vec![json!({
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": { "type": "object", "properties": properties, "required": required },
+            },
+        })]
+    }
+
+    /// Whether the Qwen XML grammar for `tools` takes a call to `f` writing
+    /// `keys`, in that order, to its end.
+    fn qwen_takes(tools: &[Value], keys: &[&str]) -> bool {
+        let mut state = Gemma4GrammarState::new_qwen35_xml(
+            shared_factory_placeholder(),
+            tools,
+            GrammarMode::Eager,
+            None,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build");
+        let mut call = String::from("<tool_call>\n<function=f>\n");
+        for k in keys {
+            call.push_str(&format!("<parameter={k}>\nv\n</parameter>\n"));
+        }
+        call.push_str("</function>\n</tool_call>");
+        feed(&mut state, call.as_bytes()).is_none() && !state.is_active()
+    }
+
+    /// The parameters may come in any order: a model writes `path` first for
+    /// one request and `content` first for another, and a fixed order (sorted
+    /// or the schema's) rewrote one of them.
+    #[test]
+    fn parameters_may_come_in_any_order() {
+        let tools = qwen_tool(&["path", "content", "append"], &["content", "path"]);
+        for keys in [
+            &["path", "content"][..],
+            &["content", "path"],
+            &["append", "content", "path"],
+            &["content", "append", "path"],
+        ] {
+            assert!(qwen_takes(&tools, keys), "{keys:?}");
+        }
+    }
+
+    /// Any order still means every required key, each key once.
+    #[test]
+    fn any_order_keeps_required_keys_and_no_repeats() {
+        let tools = qwen_tool(&["path", "content", "append"], &["content", "path"]);
+        assert!(!qwen_takes(&tools, &["content"]), "a required key left out");
+        assert!(
+            !qwen_takes(&tools, &["append", "path"]),
+            "a required key left out"
+        );
+        assert!(
+            !qwen_takes(&tools, &["path", "content", "path"]),
+            "a key repeated"
+        );
+        assert!(
+            !qwen_takes(&tools, &["path", "append", "content", "append"]),
+            "a key repeated"
+        );
+        assert!(
+            !qwen_takes(&tools, &["path", "content", "mode"]),
+            "an undeclared key"
+        );
+    }
+
+    /// Past [`ANY_ORDER_MAX_KEYS`] keys the order is the schema's, so the
+    /// grammar stays `2^N`-free for a tool with many optional flags.
+    #[test]
+    fn many_keys_take_the_schema_order() {
+        let keys = ["a", "b", "c", "d", "e", "f", "g"];
+        assert!(keys.len() > ANY_ORDER_MAX_KEYS);
+        let tools = qwen_tool(&keys, &keys);
+        assert!(qwen_takes(&tools, &keys));
+        let mut swapped = keys;
+        swapped.swap(0, 1);
+        assert!(!qwen_takes(&tools, &swapped));
+        let rules = qwen35_lark_grammar_string(&tools, ToolCalls::OneOrMore).expect("build");
+        assert!(!rules.contains("q_0_body_1"), "no key-set states:\n{rules}");
+    }
+
     #[test]
     fn a_required_parameter_after_a_value_is_still_required() {
         // The value terminal used to be a greedy `/(.|\n)*?/`: a parse in which
@@ -2688,33 +2802,11 @@ mod tests {
 
     #[test]
     fn qwen35_grammar_enforces_required_param() {
-        // A tool whose only property is required must emit that parameter
-        // block unconditionally (no `?` gate) so `<function=read></function>`
-        // (empty params) is grammatically impossible — the empty-param defect.
-        let tools = vec![json!({
-            "type": "function",
-            "function": {
-                "name": "read",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }
-            }
-        })];
-        let s = qwen35_lark_grammar_string(&tools, ToolCalls::OneOrMore).unwrap();
-        let body_line = s
-            .lines()
-            .find(|l| l.starts_with("q_0_body:"))
-            .expect("read body rule present");
-        assert!(
-            body_line.contains("<parameter=path>"),
-            "required param present: {body_line}"
-        );
-        assert!(
-            !body_line.contains(")?"),
-            "required-only param must not be optional-gated: {body_line}"
-        );
+        // `<function=read></function>` with no parameters — the empty-param
+        // defect — must not parse when `path` is required.
+        let tools = qwen_tool(&["path"], &["path"]);
+        assert!(!qwen_takes(&tools, &[]), "a call without its required key");
+        assert!(qwen_takes(&tools, &["path"]));
     }
 
     #[test]
@@ -2723,31 +2815,24 @@ mod tests {
         // ⇒ no duplicate-parameter n-gram cycle (the failure mode that kept
         // Gemma's Eager Lark disabled).
         let s = qwen35_lark_grammar_string(&sample_tools(), ToolCalls::OneOrMore).unwrap();
-        for line in s.lines() {
-            if line.starts_with("q_") && line.contains("_body:") {
-                assert!(
-                    !line.contains(")*"),
-                    "qwen35 body line must not repeat params with a Kleene star: {line}"
-                );
-            }
+        for line in s.lines().filter(|l| l.starts_with("q_")) {
+            assert!(
+                !line.contains(")*"),
+                "qwen35 body line must not repeat params with a Kleene star: {line}"
+            );
         }
+        let tools = qwen_tool(&["question", "options"], &["question"]);
+        assert!(!qwen_takes(&tools, &["question", "question"]));
     }
 
     #[test]
     fn qwen35_grammar_optional_params_are_gated() {
-        // ask_to_user: `question` required, `options` optional → options must
-        // be `?`-gated, question must not be.
-        let s = qwen35_lark_grammar_string(&sample_tools(), ToolCalls::OneOrMore).unwrap();
-        let body_line = s
-            .lines()
-            .find(|l| l.starts_with("q_1_body:"))
-            .expect("ask_to_user body present");
-        assert!(body_line.contains("<parameter=question>"));
-        assert!(body_line.contains("<parameter=options>"));
-        assert!(
-            body_line.contains(")?"),
-            "optional param must be `?`-gated: {body_line}"
-        );
+        // `question` required, `options` optional: both with and without
+        // `options` parse, `options` alone does not.
+        let tools = qwen_tool(&["question", "options"], &["question"]);
+        assert!(qwen_takes(&tools, &["question"]));
+        assert!(qwen_takes(&tools, &["question", "options"]));
+        assert!(!qwen_takes(&tools, &["options"]));
     }
 
     #[test]
