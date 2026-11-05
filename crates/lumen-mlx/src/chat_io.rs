@@ -193,10 +193,14 @@ pub enum BackendStreamEvent<'a> {
     Reasoning(&'a str),
     /// Backend's parser has identified the start of a tool call —
     /// it's seen `call:NAME{` and accumulated `NAME`. Args body is
-    /// not yet known; the engine emits the SSE start chunk now and
-    /// fills in args via a separate `ArgumentsDelta` event after
-    /// the backend finishes parsing the body.
+    /// not yet known.
     ToolCallStart { name: &'a str },
+    /// A piece of the open call's `arguments` JSON, in order. Only a backend
+    /// that streams arguments sends these (Qwen); the pieces of one call add
+    /// up to the arguments the finished response carries.
+    ToolCallArgs { fragment: &'a str },
+    /// The open call is complete. Sent after its last [`Self::ToolCallArgs`].
+    ToolCallEnd,
 }
 
 /// Phase 1.6: normalized tool-choice intent passed from the HTTP layer

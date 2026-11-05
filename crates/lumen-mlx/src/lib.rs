@@ -2006,6 +2006,25 @@ lumen_flags::flag! {
 }
 
 lumen_flags::flag! {
+    /// Stream a Qwen tool call's `arguments` while the model writes them.
+    ///
+    /// Each call goes out as it is parsed: its start with the first piece of
+    /// its arguments, then the pieces (a parameter's key when it opens; a
+    /// string value as it arrives once it cannot be any other JSON; any other
+    /// value whole when it closes), then its end at `</tool_call>`. The pieces
+    /// of one call add up to the `arguments` the non-streaming response
+    /// carries. Off, every call goes out complete after the reply ends, as
+    /// before; the non-streaming response is the same either way.
+    ///
+    /// **`Behavior`**: it changes when a streaming client sees a call.
+    pub(crate) qwen_stream_tool_args {
+        env: "LUMEN_QWEN_STREAM_TOOL_ARGS",
+        default: true,
+        kind: Behavior,
+    }
+}
+
+lumen_flags::flag! {
     /// Read Qwen's `<think>`, `</think>` and `<tool_call>` in the reply only when
     /// the model emits them as their own token ids.
     ///
@@ -6232,11 +6251,19 @@ impl MlxQwen35Backend {
         };
         // Prime the parser with the prefill so its state machine
         // transitions OUT of Visible BEFORE the model starts generating.
-        // Events from the prefill are SUPPRESSED — the engine assigns
-        // the wire id only when the MODEL produces the call, not when
-        // the prompt does.
+        // Only the call's name goes on from the prefill: a named tool's
+        // `<function=NAME>` is in it, and streaming the call's arguments
+        // needs that name. The call itself goes out on the stream with the
+        // first piece of arguments the MODEL writes.
         if !prefill_str.is_empty() {
-            let _ = parser.feed(&prefill_str);
+            for ev in parser.feed(&prefill_str) {
+                if matches!(
+                    ev,
+                    crate::qwen3_5_tools::Qwen35ParseEvent::ToolCallStart { .. }
+                ) {
+                    forward_parse_event(ev, &mut on_event)?;
+                }
+            }
         }
         // What the model writes is read for markers by id; the prefill above
         // is the template's own text.
@@ -7697,6 +7724,16 @@ where
         Qwen35ParseEvent::ToolCallStart { name } => {
             on_event(BackendStreamEvent::ToolCallStart { name: &name })
         }
+        Qwen35ParseEvent::ToolCallArgs(fragment) if qwen_stream_tool_args::get() => {
+            on_event(BackendStreamEvent::ToolCallArgs {
+                fragment: &fragment,
+            })
+        }
+        Qwen35ParseEvent::ToolCallEnd if qwen_stream_tool_args::get() => {
+            on_event(BackendStreamEvent::ToolCallEnd)
+        }
+        // Off: the engine sends each call after decode, as it always did.
+        Qwen35ParseEvent::ToolCallArgs(_) | Qwen35ParseEvent::ToolCallEnd => Ok(()),
     }
 }
 
@@ -8632,6 +8669,71 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].name, "get_weather");
         assert_eq!(parsed.tool_calls[0].arguments["city"], "Seoul");
         assert_eq!(parsed.reasoning, "");
+    }
+
+    /// A named tool's call streams under its name: the name is in the
+    /// prefill (`<function=get_weather>`), so the prefill's call start has to
+    /// reach the engine, ahead of the arguments the model writes. The pieces
+    /// add up to the finished call's arguments; off, none are sent.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn a_named_call_streams_its_arguments_after_its_name() {
+        use crate::chat_io::BackendStreamEvent;
+        use crate::grammar::ToolCalls;
+        // The model continues `<function=get_weather>\n` with the body.
+        let script = vec![4, 2, 5, 2, 7, 2, 8, 2, 9, SCRIPT_EOS];
+        let run = |on: bool| {
+            qwen_stream_tool_args::with(on, || {
+                let mut backend = marker_backend(script.clone());
+                let mut events = Vec::new();
+                let parsed = backend
+                    .chat_with_tools_impl(
+                        vec![42],
+                        "<tool_call>\n<function=get_weather>\n".to_string(),
+                        Vec::new(),
+                        None,
+                        ToolCalls::OneOrMore,
+                        24,
+                        7,
+                        None,
+                        None,
+                        Default::default(),
+                        Vec::new(),
+                        false,
+                        |ev| {
+                            events.push(match ev {
+                                BackendStreamEvent::ToolCallStart { name } => {
+                                    format!("start {name}")
+                                }
+                                BackendStreamEvent::ToolCallArgs { fragment } => {
+                                    fragment.to_string()
+                                }
+                                BackendStreamEvent::ToolCallEnd => "end".to_string(),
+                                _ => "other".to_string(),
+                            });
+                            Ok(())
+                        },
+                    )
+                    .expect("tool decode loop");
+                (events, parsed)
+            })
+        };
+        let (events, parsed) = run(true);
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("start get_weather")
+        );
+        assert_eq!(events.last().map(String::as_str), Some("end"));
+        assert_eq!(
+            events[1..events.len() - 1].concat(),
+            serde_json::to_string(&parsed.tool_calls[0].arguments).unwrap()
+        );
+        let (events, _) = run(false);
+        assert_eq!(
+            events,
+            ["start get_weather"],
+            "off: the call goes out after decode"
+        );
     }
 
     /// In `tool_choice=auto` a call the model opens is held to the schema: it

@@ -14,6 +14,9 @@ use crate::qwen3_5_tools::{Qwen35ParseEvent, Qwen35ResponseParser};
 pub(crate) struct Outcome {
     /// What the events add up to: `(text, reasoning, tool-call starts)`.
     pub(crate) events: (String, String, usize),
+    /// Each call's streamed `arguments` pieces, joined; a call still open at
+    /// the end is the last entry.
+    pub(crate) args: Vec<String>,
     pub(crate) visible: String,
     pub(crate) reasoning: String,
     pub(crate) calls: Vec<(String, serde_json::Value)>,
@@ -27,25 +30,23 @@ pub(crate) fn run(chunks: &[&str]) -> Outcome {
 /// [`run`] on `p`, which may start anywhere (a thinking-open parser).
 pub(crate) fn run_with(mut p: Qwen35ResponseParser, chunks: &[&str]) -> Outcome {
     let (mut text, mut reasoning, mut starts) = (String::new(), String::new(), 0);
+    let (mut args, mut open) = (Vec::new(), None::<String>);
+    let mut take = |event| match event {
+        Qwen35ParseEvent::Text(t) => text.push_str(&t),
+        Qwen35ParseEvent::Reasoning(r) => reasoning.push_str(&r),
+        Qwen35ParseEvent::ToolCallStart { .. } => starts += 1,
+        Qwen35ParseEvent::ToolCallArgs(piece) => open.get_or_insert_default().push_str(&piece),
+        Qwen35ParseEvent::ToolCallEnd => args.extend(open.take()),
+    };
     for chunk in chunks {
-        for event in p.feed(chunk) {
-            match event {
-                Qwen35ParseEvent::Text(t) => text.push_str(&t),
-                Qwen35ParseEvent::Reasoning(r) => reasoning.push_str(&r),
-                Qwen35ParseEvent::ToolCallStart { .. } => starts += 1,
-            }
-        }
+        p.feed(chunk).into_iter().for_each(&mut take);
     }
-    for event in p.flush() {
-        match event {
-            Qwen35ParseEvent::Text(t) => text.push_str(&t),
-            Qwen35ParseEvent::Reasoning(r) => reasoning.push_str(&r),
-            Qwen35ParseEvent::ToolCallStart { .. } => starts += 1,
-        }
-    }
+    p.flush().into_iter().for_each(&mut take);
+    args.extend(open);
     let done = p.finish();
     Outcome {
         events: (text, reasoning, starts),
+        args,
         visible: done.visible,
         reasoning: done.reasoning,
         calls: done
@@ -87,5 +88,23 @@ pub fn assert_qwen35_parser_contract(data: &[u8]) {
     assert_eq!(whole.events.0, whole.visible, "{text:?}");
     assert_eq!(whole.events.1, whole.reasoning, "{text:?}");
     assert!(whole.events.2 >= whole.calls.len(), "{text:?}");
+    assert_streamed_args_are_the_calls(&whole, &text);
     assert_eq!(run(&chunks), whole, "{text:?} as {chunks:?}");
+}
+
+/// Each finished call's streamed pieces read back as exactly its arguments, in
+/// its key order. They are its serialization byte for byte while no key
+/// repeats; a repeated key leaves both values in the text, and reading it back
+/// keeps the first position and the last value, as the parser does.
+pub(crate) fn assert_streamed_args_are_the_calls(outcome: &Outcome, text: &str) {
+    assert!(outcome.args.len() >= outcome.calls.len(), "{text:?}");
+    for (streamed, (_, arguments)) in outcome.args.iter().zip(&outcome.calls) {
+        let read: serde_json::Value = serde_json::from_str(streamed)
+            .unwrap_or_else(|e| panic!("streamed {streamed:?} is not JSON ({e}) for {text:?}"));
+        assert_eq!(
+            serde_json::to_string(&read).expect("serializes"),
+            serde_json::to_string(arguments).expect("serializes"),
+            "streamed {streamed:?} for {text:?}"
+        );
+    }
 }

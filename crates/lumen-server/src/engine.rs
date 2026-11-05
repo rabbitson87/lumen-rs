@@ -1171,14 +1171,9 @@ impl InferenceEngine {
         // chat_completion non-stream path. Owning buffers
         // (`arg_values`, `assistant_tc_buf`) keep ChatTurn borrows
         // stable until the call returns.
-        // Phase 1.6c: tracks tool_calls the backend's parser announced
-        // mid-decode via `BackendStreamEvent::ToolCallStart`. Lives
-        // outside both branches so the post-decode emission loop can
-        // skip Start chunks already on the wire.
-        // Kept (always empty) so the reconciliation loop's `early_tc.get(i)`
-        // falls through to a fresh, sequential per-call emission. Early
-        // per-call Starts are intentionally NOT emitted (see closures below).
-        let early_tc: Vec<(String, u32, String)> = Vec::new();
+        // The turn's tool calls on the stream: streamed as they are parsed
+        // when the backend sends their arguments, otherwise after decode.
+        let tool_stream = std::cell::RefCell::new(ToolCallStream::new(&tools_owned, "call_"));
         // Stop-sequence filtering shared by both stream closures. The matcher
         // holds back text that might be the prefix of a stop string, emits only
         // safe-to-stream text, and trims at a full match. `stopped_by_seq`
@@ -1233,14 +1228,13 @@ impl InferenceEngine {
                         deliver_or_gone(token_tx, StreamEvent::ReasoningDelta(t.to_string()))?;
                     }
                     BackendStreamEvent::ToolCallStart { name } => {
-                        // Early per-call Start suppressed. Args are not known
-                        // until a call closes, so emitting Start0,Start1,Start2
-                        // up front (then Args0,Args1,Args2 in a batch) made
-                        // clients fold every later parallel call's arguments
-                        // onto index 0 — only the first tool call kept its args.
-                        // The reconciliation loop below now emits each call as a
-                        // sequential Start_i → Args_i → Stop_i unit.
-                        let _ = name;
+                        tool_stream.borrow_mut().announce(name, token_tx)?;
+                    }
+                    BackendStreamEvent::ToolCallArgs { fragment } => {
+                        tool_stream.borrow_mut().args(fragment, token_tx)?;
+                    }
+                    BackendStreamEvent::ToolCallEnd => {
+                        tool_stream.borrow_mut().end(token_tx)?;
                     }
                 }
                 Ok(())
@@ -1295,14 +1289,13 @@ impl InferenceEngine {
                         deliver_or_gone(token_tx, StreamEvent::ReasoningDelta(t.to_string()))?;
                     }
                     BackendStreamEvent::ToolCallStart { name } => {
-                        // Early per-call Start suppressed. Args are not known
-                        // until a call closes, so emitting Start0,Start1,Start2
-                        // up front (then Args0,Args1,Args2 in a batch) made
-                        // clients fold every later parallel call's arguments
-                        // onto index 0 — only the first tool call kept its args.
-                        // The reconciliation loop below now emits each call as a
-                        // sequential Start_i → Args_i → Stop_i unit.
-                        let _ = name;
+                        tool_stream.borrow_mut().announce(name, token_tx)?;
+                    }
+                    BackendStreamEvent::ToolCallArgs { fragment } => {
+                        tool_stream.borrow_mut().args(fragment, token_tx)?;
+                    }
+                    BackendStreamEvent::ToolCallEnd => {
+                        tool_stream.borrow_mut().end(token_tx)?;
                     }
                 }
                 Ok(())
@@ -1337,46 +1330,13 @@ impl InferenceEngine {
                 // Bug A: resolve abbreviated tool names (e.g. the model dropped
                 // an MCP namespace) by unique suffix match before emitting.
                 remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
-                // Phase 1.5: emit each parsed tool_call as the
-                // start / arguments / stop trio so the SSE layer can
-                // synthesize OpenAI `delta.tool_calls` chunks. Phase
-                // 1.6c: if the backend already announced this call
-                // via `BackendStreamEvent::ToolCallStart`, skip the
-                // redundant Start (we just emit ArgumentsDelta + Stop
-                // with the matching index).
-                //
-                // NOTE: `early_tc` lives inside the `if/else` branch
-                // above so it's not visible here — we re-derive
-                // index/id from the call order. The early Start chunks
-                // already went out on the wire; this loop only owns
-                // ArgumentsDelta + Stop.
+                // Every call not already on the stream goes out now, one at a
+                // time as a start / arguments / stop trio, so the SSE layer
+                // can synthesize OpenAI `delta.tool_calls` chunks.
                 let has_tool_calls = !parsed.tool_calls.is_empty();
-                for (i, call) in parsed.tool_calls.iter().enumerate() {
-                    // Phase 1.6c: if the backend already announced
-                    // this call mid-decode (early_tc[i] matches by
-                    // name) we reuse its (index, id). Otherwise emit
-                    // a fresh Start now — covers legacy backends that
-                    // don't fire `BackendStreamEvent::ToolCallStart`.
-                    let (index, already_started) = match early_tc.get(i) {
-                        Some((name, idx, _)) if name == &call.name => (*idx, true),
-                        _ => (i as u32, false),
-                    };
-                    if !already_started {
-                        let id = format!("call_{}", gen_id());
-                        let _ = token_tx.deliver(StreamEvent::ToolCallStart {
-                            index,
-                            id,
-                            name: call.name.clone(),
-                        });
-                    }
-                    let args =
-                        serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
-                    let _ = token_tx.deliver(StreamEvent::ToolCallArgumentsDelta {
-                        index,
-                        partial_json: args,
-                    });
-                    let _ = token_tx.deliver(StreamEvent::ToolCallStop { index });
-                }
+                tool_stream
+                    .into_inner()
+                    .finish(&parsed.tool_calls, token_tx);
                 let completion_tokens = completion_tokens_with_tools(
                     &self.backend,
                     &parsed.visible,
@@ -1498,12 +1458,8 @@ impl InferenceEngine {
         // turns `anthropic_messages` builds (`AnthropicHistory`), except that a
         // message of another role is left out rather than refused.
         //
-        // Phase 1.6c: tracks tool_calls the backend announced mid-decode
-        // so the post-decode loop skips redundant Start chunks.
-        // Kept (always empty) so the reconciliation loop's `early_tc.get(i)`
-        // falls through to a fresh, sequential per-call emission. Early
-        // per-call Starts are intentionally NOT emitted (see closures below).
-        let early_tc: Vec<(String, u32, String)> = Vec::new();
+        // The turn's tool calls on the stream, as on the OpenAI route.
+        let mut tool_stream = ToolCallStream::new(&tools_owned, "toolu_");
         // `stop_sequences`, applied as the OpenAI stream applies `stop`: text
         // that could still grow into a sequence is held back, so one split
         // across two pieces is caught and never reaches the client.
@@ -1550,7 +1506,7 @@ impl InferenceEngine {
             if !self.admit_anthropic_stream(prompt_tokens, token_tx) {
                 return;
             }
-            let on_event = anthropic_stream_sink(token_tx, &mut stops);
+            let on_event = anthropic_stream_sink(token_tx, &mut stops, &mut tool_stream);
             self.backend.chat_streaming_from_history_with_images(
                 &turns,
                 &turn_images,
@@ -1578,7 +1534,7 @@ impl InferenceEngine {
             if !self.admit_anthropic_stream(prompt_tokens, token_tx) {
                 return;
             }
-            let on_event = anthropic_stream_sink(token_tx, &mut stops);
+            let on_event = anthropic_stream_sink(token_tx, &mut stops, &mut tool_stream);
             let thinking =
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
             self.backend.chat_streaming_with_images(
@@ -1610,27 +1566,7 @@ impl InferenceEngine {
                 // an MCP namespace) by unique suffix match before emitting.
                 remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
                 let has_tool_calls = !parsed.tool_calls.is_empty();
-                for (i, call) in parsed.tool_calls.iter().enumerate() {
-                    let (index, already_started) = match early_tc.get(i) {
-                        Some((name, idx, _)) if name == &call.name => (*idx, true),
-                        _ => (i as u32, false),
-                    };
-                    if !already_started {
-                        let id = format!("toolu_{}", gen_id());
-                        let _ = token_tx.deliver(StreamEvent::ToolCallStart {
-                            index,
-                            id,
-                            name: call.name.clone(),
-                        });
-                    }
-                    let args =
-                        serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
-                    let _ = token_tx.deliver(StreamEvent::ToolCallArgumentsDelta {
-                        index,
-                        partial_json: args,
-                    });
-                    let _ = token_tx.deliver(StreamEvent::ToolCallStop { index });
-                }
+                tool_stream.finish(&parsed.tool_calls, token_tx);
                 let completion_tokens = completion_tokens_with_tools(
                     &self.backend,
                     &parsed.visible,
@@ -2964,9 +2900,10 @@ fn stream_text_through_stops(
 /// The event sink both streaming `/v1/messages` branches hand the backend.
 /// Visible text goes through the request's `stop_sequences` (the trace is
 /// not matched, as the non-streaming route trims only the answer).
-fn anthropic_stream_sink<'a>(
+fn anthropic_stream_sink<'a, 't>(
     token_tx: &'a StreamTx,
     stops: &'a mut lumen_core::stop::StopMatcher,
+    calls: &'a mut ToolCallStream<'t>,
 ) -> impl FnMut(BackendStreamEvent<'_>) -> Result<()> + 'a {
     move |ev| {
         match ev {
@@ -2974,16 +2911,141 @@ fn anthropic_stream_sink<'a>(
             BackendStreamEvent::Reasoning(t) => {
                 deliver_or_gone(token_tx, StreamEvent::ReasoningDelta(t.to_string()))?;
             }
-            BackendStreamEvent::ToolCallStart { name } => {
-                // Early per-call Start suppressed — see the OpenAI stream's
-                // closures and the reconciliation loop after decode.
-                // Sequential Start_i → Args_i → Stop_i per call is the standard
-                // order; batched up-front Starts dropped args for parallel
-                // calls after index 0.
-                let _ = name;
-            }
+            BackendStreamEvent::ToolCallStart { name } => calls.announce(name, token_tx)?,
+            BackendStreamEvent::ToolCallArgs { fragment } => calls.args(fragment, token_tx)?,
+            BackendStreamEvent::ToolCallEnd => calls.end(token_tx)?,
         }
         Ok(())
+    }
+}
+
+/// A turn's tool calls on the stream, for both streaming routes.
+///
+/// A backend that streams a call's arguments (`ToolCallArgs`, Qwen) gets the
+/// call out while it is parsed: its start with the first piece of arguments,
+/// the pieces, its stop at `ToolCallEnd`. One call at a time, start → pieces →
+/// stop, so parallel calls keep their indices: batched starts up front once
+/// made clients fold every later call's arguments onto index 0. A call whose
+/// name resolves to no declared tool is not streamed at all, since
+/// [`remap_tool_call_names`] drops it after decode, and the streamed name is
+/// the repaired one. Calls the backend did not stream (Gemma sends no pieces)
+/// go out whole after decode ([`Self::finish`]), as they always did.
+struct ToolCallStream<'t> {
+    tools: &'t [ToolDef<'t>],
+    id_prefix: &'static str,
+    /// The name the parser announced for the call it is reading.
+    announced: Option<String>,
+    /// The call whose pieces are arriving: `Some(true)` streaming,
+    /// `Some(false)` skipped (an undeclared name), `None` before its first.
+    current: Option<bool>,
+    /// The declared names of the calls on the stream, by index.
+    streamed: Vec<String>,
+    /// Whether the last streamed call still lacks its stop.
+    open: bool,
+}
+
+impl<'t> ToolCallStream<'t> {
+    fn new(tools: &'t [ToolDef<'t>], id_prefix: &'static str) -> Self {
+        Self {
+            tools,
+            id_prefix,
+            announced: None,
+            current: None,
+            streamed: Vec::new(),
+            open: false,
+        }
+    }
+
+    /// The parser read a call's name. Its start waits for its first piece of
+    /// arguments, so a backend that sends none changes nothing.
+    fn announce(&mut self, name: &str, tx: &StreamTx) -> Result<()> {
+        self.stop_open(tx)?;
+        self.announced = Some(name.to_string());
+        self.current = None;
+        Ok(())
+    }
+
+    fn args(&mut self, fragment: &str, tx: &StreamTx) -> Result<()> {
+        if self.current.is_none() {
+            let declared = self
+                .announced
+                .take()
+                .and_then(|n| resolve_tool_name(&n, self.tools).map(|(full, _)| full.to_string()));
+            self.current = Some(declared.is_some());
+            if let Some(name) = declared {
+                let index = self.streamed.len() as u32;
+                let id = format!("{}{}", self.id_prefix, gen_id());
+                deliver_or_gone(
+                    tx,
+                    StreamEvent::ToolCallStart {
+                        index,
+                        id,
+                        name: name.clone(),
+                    },
+                )?;
+                self.streamed.push(name);
+                self.open = true;
+            }
+        }
+        if self.current == Some(true) && self.open {
+            let index = self.streamed.len() as u32 - 1;
+            let partial_json = fragment.to_string();
+            deliver_or_gone(
+                tx,
+                StreamEvent::ToolCallArgumentsDelta {
+                    index,
+                    partial_json,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn end(&mut self, tx: &StreamTx) -> Result<()> {
+        self.current = None;
+        self.stop_open(tx)
+    }
+
+    fn stop_open(&mut self, tx: &StreamTx) -> Result<()> {
+        if std::mem::take(&mut self.open) {
+            let index = self.streamed.len() as u32 - 1;
+            deliver_or_gone(tx, StreamEvent::ToolCallStop { index })?;
+        }
+        Ok(())
+    }
+
+    /// After decode: `calls` are the turn's calls once names are repaired and
+    /// undeclared ones dropped, so call `i` is streamed call `i` where there is
+    /// one. Those get their stop if they lack it (a call cut off mid-arguments
+    /// keeps what was sent); the rest go out whole, in order.
+    fn finish(mut self, calls: &[ParsedToolCall], tx: &StreamTx) {
+        for (i, call) in calls.iter().enumerate() {
+            if let Some(name) = self.streamed.get(i) {
+                if name != &call.name {
+                    eprintln!(
+                        "[tool-calls] streamed call {i} was {name:?}, the parsed one is {:?}",
+                        call.name
+                    );
+                }
+                continue;
+            }
+            let _ = self.stop_open(tx);
+            let index = i as u32;
+            let id = format!("{}{}", self.id_prefix, gen_id());
+            let _ = tx.deliver(StreamEvent::ToolCallStart {
+                index,
+                id,
+                name: call.name.clone(),
+            });
+            let partial_json =
+                serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
+            let _ = tx.deliver(StreamEvent::ToolCallArgumentsDelta {
+                index,
+                partial_json,
+            });
+            let _ = tx.deliver(StreamEvent::ToolCallStop { index });
+        }
+        let _ = self.stop_open(tx);
     }
 }
 
@@ -5257,7 +5319,9 @@ mod anthropic_stream_stops {
         use BackendStreamEvent::{Reasoning, Text};
         let (tx, rx) = crate::engine::stream_channel();
         let mut stops = StopMatcher::new(Vec::new());
-        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        let mut calls = super::ToolCallStream::new(&[], "toolu_");
+
+        let mut sink = anthropic_stream_sink(&tx, &mut stops, &mut calls);
         assert!(sink(Text("still here")).is_ok());
         drop(rx);
         for ev in [Text("x"), Reasoning("y")] {
@@ -5265,7 +5329,9 @@ mod anthropic_stream_stops {
             assert!(super::client_gone(&err), "{err:#}");
         }
         let mut stops = StopMatcher::new(vec!["END".into()]);
-        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        let mut calls = super::ToolCallStream::new(&[], "toolu_");
+
+        let mut sink = anthropic_stream_sink(&tx, &mut stops, &mut calls);
         let err = sink(Text("held? no: sent")).expect_err("with a matcher too");
         assert!(super::client_gone(&err), "{err:#}");
     }
@@ -5280,7 +5346,9 @@ mod anthropic_stream_stops {
         use BackendStreamEvent::Text;
         let (tx, mut rx) = crate::engine::stream_channel();
         let mut stops = StopMatcher::new(Vec::new());
-        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        let mut calls = super::ToolCallStream::new(&[], "toolu_");
+
+        let mut sink = anthropic_stream_sink(&tx, &mut stops, &mut calls);
         for n in 0..1000 {
             let _ = sink(Text(&format!("{n},")));
         }
@@ -5309,7 +5377,9 @@ mod anthropic_stream_stops {
         use BackendStreamEvent::Text;
         let (tx, mut rx) = crate::engine::stream_channel();
         let mut stops = StopMatcher::new(vec!["\n\nHuman:".into(), "END".into()]);
-        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        let mut calls = super::ToolCallStream::new(&[], "toolu_");
+
+        let mut sink = anthropic_stream_sink(&tx, &mut stops, &mut calls);
 
         // "EN" could still be the start of "END": it must be held, not sent.
         decode(&mut sink, &[Text("The answer is 4. "), Text("EN")]).expect("no stop yet");
@@ -5337,7 +5407,9 @@ mod anthropic_stream_stops {
         use BackendStreamEvent::Text;
         let (tx, mut rx) = crate::engine::stream_channel();
         let mut stops = StopMatcher::new(vec![", four".into()]);
-        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        let mut calls = super::ToolCallStream::new(&[], "toolu_");
+
+        let mut sink = anthropic_stream_sink(&tx, &mut stops, &mut calls);
         for p in ["one", ", two", ", three", ", fo", "ur", ", five", ", six"] {
             let _ = sink(Text(p));
         }
@@ -5356,7 +5428,9 @@ mod anthropic_stream_stops {
         use BackendStreamEvent::Text;
         let (tx, mut rx) = crate::engine::stream_channel();
         let mut stops = StopMatcher::new(vec!["END".into()]);
-        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        let mut calls = super::ToolCallStream::new(&[], "toolu_");
+
+        let mut sink = anthropic_stream_sink(&tx, &mut stops, &mut calls);
         decode(&mut sink, &[Text("THE E"), Text("N")]).expect("no stop");
         drop(sink);
         assert_eq!(drain(&mut rx).0, "THE ");
@@ -5372,13 +5446,17 @@ mod anthropic_stream_stops {
         use BackendStreamEvent::{Reasoning, Text};
         let (tx, mut rx) = crate::engine::stream_channel();
         let mut stops = StopMatcher::new(vec!["END".into()]);
-        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        let mut calls = super::ToolCallStream::new(&[], "toolu_");
+
+        let mut sink = anthropic_stream_sink(&tx, &mut stops, &mut calls);
         decode(&mut sink, &[Reasoning("think END think"), Text("ok")]).expect("no stop");
         drop(sink);
         assert_eq!(drain(&mut rx), ("ok".into(), "think END think".into()));
 
         let mut none = StopMatcher::new(Vec::new());
-        let mut sink = anthropic_stream_sink(&tx, &mut none);
+        let mut calls = super::ToolCallStream::new(&[], "toolu_");
+
+        let mut sink = anthropic_stream_sink(&tx, &mut none, &mut calls);
         decode(&mut sink, &[Text("END"), Text(" of it")]).expect("no stops requested");
         drop(sink);
         assert_eq!(drain(&mut rx).0, "END of it");
@@ -5460,5 +5538,149 @@ mod gemma_finish_reason {
             .chat_completion(&openai("Reply with the single word OK.", 64, false))
             .expect("chat");
         assert_eq!(resp.choices[0].finish_reason, "stop");
+    }
+}
+
+/// Tool calls on the stream, against [`ToolCallStream`] the way the stream
+/// sinks drive it: what reaches the wire, in order.
+#[cfg(test)]
+mod tool_call_stream {
+    use super::{ParsedToolCall, StreamEvent, ToolCallStream, ToolDef};
+
+    fn tools() -> [ToolDef<'static>; 2] {
+        let tool = |name| ToolDef {
+            name,
+            description: None,
+            parameters: None,
+            response: None,
+        };
+        [tool("get_weather"), tool("mcp__fs__read_file")]
+    }
+
+    fn call(name: &str, arguments: serde_json::Value) -> ParsedToolCall {
+        ParsedToolCall {
+            name: name.to_string(),
+            arguments,
+        }
+    }
+
+    fn wire(rx: &mut crate::engine::StreamRx) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(match ev {
+                StreamEvent::ToolCallStart { index, name, .. } => format!("start {index} {name}"),
+                StreamEvent::ToolCallArgumentsDelta {
+                    index,
+                    partial_json,
+                } => format!("args {index} {partial_json}"),
+                StreamEvent::ToolCallStop { index } => format!("stop {index}"),
+                _ => "other".to_string(),
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn streamed_calls_go_out_one_at_a_time_and_are_not_sent_again() {
+        let (tx, mut rx) = crate::engine::stream_channel();
+        let tools = tools();
+        let mut s = ToolCallStream::new(&tools, "call_");
+        s.announce("get_weather", &tx).unwrap();
+        for piece in ["{\"city\":", "\"Seo", "ul\"", "}"] {
+            s.args(piece, &tx).unwrap();
+        }
+        s.end(&tx).unwrap();
+        // A dropped namespace goes out under the declared name.
+        s.announce("read_file", &tx).unwrap();
+        s.args("{}", &tx).unwrap();
+        s.end(&tx).unwrap();
+        s.finish(
+            &[
+                call("get_weather", serde_json::json!({"city": "Seoul"})),
+                call("mcp__fs__read_file", serde_json::json!({})),
+            ],
+            &tx,
+        );
+        assert_eq!(
+            wire(&mut rx),
+            [
+                "start 0 get_weather",
+                "args 0 {\"city\":",
+                "args 0 \"Seo",
+                "args 0 ul\"",
+                "args 0 }",
+                "stop 0",
+                "start 1 mcp__fs__read_file",
+                "args 1 {}",
+                "stop 1",
+            ]
+        );
+    }
+
+    /// The post-decode list has no undeclared call, so neither may the
+    /// stream: it would be a call the client cannot make, at an index the
+    /// list then gives to the next one.
+    #[test]
+    fn an_undeclared_call_is_not_streamed_and_the_next_keeps_index_zero() {
+        let (tx, mut rx) = crate::engine::stream_channel();
+        let tools = tools();
+        let mut s = ToolCallStream::new(&tools, "call_");
+        s.announce("delete_everything", &tx).unwrap();
+        s.args("{}", &tx).unwrap();
+        s.end(&tx).unwrap();
+        s.announce("get_weather", &tx).unwrap();
+        s.args("{}", &tx).unwrap();
+        s.end(&tx).unwrap();
+        s.finish(&[call("get_weather", serde_json::json!({}))], &tx);
+        assert_eq!(
+            wire(&mut rx),
+            ["start 0 get_weather", "args 0 {}", "stop 0"]
+        );
+    }
+
+    /// Gemma announces calls but streams no arguments: its calls go out after
+    /// decode exactly as before, start / arguments / stop per call.
+    #[test]
+    fn calls_without_streamed_arguments_go_out_after_decode() {
+        let (tx, mut rx) = crate::engine::stream_channel();
+        let tools = tools();
+        let mut s = ToolCallStream::new(&tools, "toolu_");
+        s.announce("get_weather", &tx).unwrap();
+        s.announce("get_weather", &tx).unwrap();
+        assert!(wire(&mut rx).is_empty(), "nothing before decode ends");
+        s.finish(
+            &[
+                call("get_weather", serde_json::json!({"city": "Seoul"})),
+                call("get_weather", serde_json::json!({"city": "Tokyo"})),
+            ],
+            &tx,
+        );
+        assert_eq!(
+            wire(&mut rx),
+            [
+                "start 0 get_weather",
+                "args 0 {\"city\":\"Seoul\"}",
+                "stop 0",
+                "start 1 get_weather",
+                "args 1 {\"city\":\"Tokyo\"}",
+                "stop 1",
+            ]
+        );
+    }
+
+    /// A reply that runs out mid-call (max_tokens) keeps what was sent and
+    /// gets its stop, so a client is not left with an open block.
+    #[test]
+    fn a_call_cut_off_mid_arguments_is_stopped_at_the_end() {
+        let (tx, mut rx) = crate::engine::stream_channel();
+        let tools = tools();
+        let mut s = ToolCallStream::new(&tools, "call_");
+        s.announce("get_weather", &tx).unwrap();
+        s.args("{\"city\":", &tx).unwrap();
+        s.finish(&[], &tx);
+        assert_eq!(
+            wire(&mut rx),
+            ["start 0 get_weather", "args 0 {\"city\":", "stop 0"]
+        );
     }
 }

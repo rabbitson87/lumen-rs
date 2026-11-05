@@ -69,6 +69,7 @@ value → on.
 | `LUMEN_QWEN4_TOKEN_COUNTERS` | off | Diagnostic | `lumen_mlx::decode_probe::token_counters` |
 | `LUMEN_QWEN4_WIDEN_SCALES` | on | Optimization | `lumen_mlx::qwen4_exp::model::widen_scales` |
 | `LUMEN_QWEN_MARKERS_BY_ID` | on | Behavior | `lumen_mlx::qwen_markers_by_id` |
+| `LUMEN_QWEN_STREAM_TOOL_ARGS` | on | Behavior | `lumen_mlx::qwen_stream_tool_args` |
 | `LUMEN_QWEN_TOOL_GRAMMAR_AUTO` | off | Behavior | `lumen_mlx::qwen_tool_grammar_auto` |
 | `LUMEN_SPARSE_DECODE` | off | Behavior | `lumen_mlx::native_attention::imp::sparse_decode` |
 | `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
@@ -932,6 +933,22 @@ Read Qwen's `<think>`, `</think>` and `<tool_call>` in the reply only when
 
  **`Behavior`**: it changes how such a reply is split. Off, the tags are
  matched as text, as before.
+
+### `LUMEN_QWEN_STREAM_TOOL_ARGS`
+
+*Behavior, default on.*
+
+Stream a Qwen tool call's `arguments` while the model writes them.
+
+ Each call goes out as it is parsed: its start with the first piece of
+ its arguments, then the pieces (a parameter's key when it opens; a
+ string value as it arrives once it cannot be any other JSON; any other
+ value whole when it closes), then its end at `</tool_call>`. The pieces
+ of one call add up to the `arguments` the non-streaming response
+ carries. Off, every call goes out complete after the reply ends, as
+ before; the non-streaming response is the same either way.
+
+ **`Behavior`**: it changes when a streaming client sees a call.
 
 ### `LUMEN_QWEN_TOOL_GRAMMAR_AUTO`
 
