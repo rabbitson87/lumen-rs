@@ -89,6 +89,9 @@ mod imp {
     struct PendingStep {
         /// 0-d `u32` argmax of this step, already submitted with `async_eval`.
         out: Array,
+        /// The `[1, 1, V]` logits `out` is the argmax of, for a grammar to mask
+        /// before the pick ([`NativeMlxRunner::decode_step_chained_masked`]).
+        logits: Array,
         /// The token this step consumes. The caller's next call is this step's
         /// only if it passes exactly this token.
         input: u32,
@@ -1358,20 +1361,10 @@ mod imp {
             // The step the caller is waiting for: the one built ahead if it
             // consumed this very token, else a fresh one (after taking back a
             // stale one).
-            let (current, undo_current) = match state.pending.take() {
-                Some(step) if step.input == last_token => (step.out, step.undo),
-                stale => {
-                    if let Some(step) = stale {
-                        step.undo.restore_into(&mut state.cache).context(
-                            "native mlx-rs runner: take back a decode step built from another token",
-                        )?;
-                    }
-                    Self::submit_step(model, state, StepInput::Token(last_token))?
-                }
-            };
+            let (current, _, undo_current) = Self::current_step(model, state, last_token)?;
             // The step after it, from the unread token. Whatever goes wrong from
             // here leaves the sequence where this call found it.
-            let (next_out, undo_next) =
+            let (next_out, next_logits, undo_next) =
                 match Self::submit_step(model, state, StepInput::Lazy(&current)) {
                     Ok(built) => built,
                     Err(e) => {
@@ -1389,10 +1382,112 @@ mod imp {
             state.position += 1;
             state.pending = Some(PendingStep {
                 out: next_out,
+                logits: next_logits,
                 input: token,
                 undo: undo_next,
             });
             Ok((token, state.position))
+        }
+
+        /// [`Self::decode_step_chained`] under a grammar: the step's logits are
+        /// masked on the GPU with what `allowed(vocab)` permits, the masked
+        /// argmax is the token, and the step after it is built from that unread
+        /// token before it is read — so a masked step keeps the GPU a step ahead
+        /// as a free one does, instead of idling through the next graph build.
+        /// `allowed` runs on the host while the GPU computes the logits it masks;
+        /// `None` from it leaves the step unmasked.
+        ///
+        /// The same token as the host-masked [`Self::decode_step_masked`]: the
+        /// same disallowed ids go to `-inf` and the argmax is the free step's.
+        /// `Ok(None)` when the step cannot be built ahead; the caller then takes
+        /// the host-masked step.
+        pub(crate) fn decode_step_chained_masked(
+            &mut self,
+            seq_id: u64,
+            last_token: u32,
+            allowed: &mut dyn FnMut(usize) -> Result<Option<Vec<bool>>>,
+        ) -> Result<Option<(u32, usize)>> {
+            if !self.can_chain(seq_id) {
+                return Ok(None);
+            }
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
+            let state = self.seqs.get_ahead_mut(&seq_id).ok_or_else(|| {
+                anyhow!("native mlx-rs runner: masked decode on unknown seq_id {seq_id}")
+            })?;
+            let (current, logits, undo_current) = Self::current_step(model, state, last_token)?;
+            let built = Self::masked_pick(model, &current, &logits, allowed).and_then(|token| {
+                Self::submit_step(model, state, StepInput::Lazy(&token)).map(|next| (token, next))
+            });
+            let (token, (next_out, next_logits, undo_next)) = match built {
+                Ok(built) => built,
+                Err(e) => {
+                    let _ = undo_current.restore_into(&mut state.cache);
+                    return Err(e);
+                }
+            };
+            let token = match NativeQwen3_5MoeModel::read_token(&token) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = undo_current.restore_into(&mut state.cache);
+                    return Err(e);
+                }
+            };
+            state.position += 1;
+            state.pending = Some(PendingStep {
+                out: next_out,
+                logits: next_logits,
+                input: token,
+                undo: undo_next,
+            });
+            Ok(Some((token, state.position)))
+        }
+
+        /// The step that consumes `last_token`: the one built ahead if it
+        /// consumed this very token, else a fresh one (after taking back a stale
+        /// one).
+        fn current_step(
+            model: &NativeQwen3_5MoeModel,
+            state: &mut NativeSeqState,
+            last_token: u32,
+        ) -> Result<(Array, Array, RollbackPoint)> {
+            match state.pending.take() {
+                Some(step) if step.input == last_token => Ok((step.out, step.logits, step.undo)),
+                stale => {
+                    if let Some(step) = stale {
+                        step.undo.restore_into(&mut state.cache).context(
+                            "native mlx-rs runner: take back a decode step built from another token",
+                        )?;
+                    }
+                    Self::submit_step(model, state, StepInput::Token(last_token))
+                }
+            }
+        }
+
+        /// The argmax of `logits` over the ids `allowed` permits, unread; `out`
+        /// (the unmasked argmax) when it permits everything.
+        fn masked_pick(
+            model: &NativeQwen3_5MoeModel,
+            out: &Array,
+            logits: &Array,
+            allowed: &mut dyn FnMut(usize) -> Result<Option<Vec<bool>>>,
+        ) -> Result<Array> {
+            let vocab = logits.shape().last().copied().unwrap_or(0);
+            let Some(allowed) = allowed(vocab as usize)? else {
+                return Ok(out.clone());
+            };
+            let allowed = Array::from_slice(&allowed, &[vocab]);
+            let masked = mlx_rs::ops::r#where(&allowed, logits, Array::from_f32(f32::NEG_INFINITY))
+                .context("native mlx-rs runner: mask the logits")?;
+            let token = model.argmax_last_token_lazy(&masked)?;
+            // Submitted on its own: evaluated together with the step built from it, the token
+            // would be read only once the GPU had worked through that step's first command
+            // buffers too, and the step ahead would gain nothing.
+            mlx_rs::transforms::async_eval([&token])
+                .context("native mlx-rs runner: masked pick async_eval")?;
+            Ok(token)
         }
 
         /// Whether `seq_id`'s next step may be built ahead.
@@ -1413,12 +1508,13 @@ mod imp {
         }
 
         /// Build one decode step for `state` from `input`, hand it to the GPU and
-        /// return its argmax (unread) with the cache as it was before the step.
+        /// return its argmax (unread), its logits and the cache as it was before
+        /// the step.
         fn submit_step(
             model: &NativeQwen3_5MoeModel,
             state: &mut NativeSeqState,
             input: StepInput<'_>,
-        ) -> Result<(Array, RollbackPoint)> {
+        ) -> Result<(Array, Array, RollbackPoint)> {
             let undo = RollbackPoint::capture_lazy(&state.cache, state.position)?;
             let logits = match input {
                 StepInput::Token(token) => model.forward_decode_shifted(
@@ -1431,9 +1527,9 @@ mod imp {
                     model.forward_decode_lazy(token, &mut state.cache, state.mrope_delta)
                 }
             };
-            let out = logits.and_then(|l| model.argmax_last_token_lazy(&l));
-            let out = match out {
-                Ok(out) => out,
+            let built = logits.and_then(|l| model.argmax_last_token_lazy(&l).map(|out| (out, l)));
+            let (out, logits) = match built {
+                Ok(built) => built,
                 Err(e) => {
                     let _ = undo.restore_into(&mut state.cache);
                     return Err(e.context("native mlx-rs runner: chained decode forward"));
@@ -1441,7 +1537,7 @@ mod imp {
             };
             mlx_rs::transforms::async_eval([&out])
                 .context("native mlx-rs runner: chained decode async_eval")?;
-            Ok((out, undo))
+            Ok((out, logits, undo))
         }
 
         /// Phase 1b: batched decode of N sequences in ONE forward. N==1 delegates
@@ -1638,10 +1734,11 @@ mod imp {
             &mut self,
             seq_id: u64,
             last_token: u32,
+            ahead: &mut dyn FnMut() -> Result<()>,
             mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
         ) -> Result<(u32, usize)> {
             // Pull last-position logits to host (single eval), mask, argmax.
-            self.decode_step_pick(seq_id, last_token, &mut |buf| {
+            self.decode_step_pick(seq_id, last_token, ahead, &mut |buf| {
                 mask(buf).context("native mlx-rs runner: grammar mask callback failed")?;
                 argmax_host_f32(buf).ok_or_else(|| {
                     anyhow!("native mlx-rs runner: masked decode empty logit buffer")
@@ -1657,10 +1754,13 @@ mod imp {
         /// out of the host logit buffer differs, which is exactly the property
         /// that lets sampling and a grammar mask compose in one callback
         /// without either one touching the recurrent state.
+        ///
+        /// `ahead` runs on the host while the GPU computes the logits.
         pub(crate) fn decode_step_pick(
             &mut self,
             seq_id: u64,
             last_token: u32,
+            ahead: &mut dyn FnMut() -> Result<()>,
             pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
         ) -> Result<(u32, usize)> {
             let model = self
@@ -1675,7 +1775,7 @@ mod imp {
                 .with_context(|| {
                     format!("native mlx-rs runner: sampled decode forward (seq_id={seq_id})")
                 })?;
-            let mut buf = crate::gemma4_sampling::imp::last_logits_to_cpu_f32(&logits)
+            let mut buf = crate::gemma4_sampling::imp::last_logits_to_cpu_f32_after(&logits, ahead)
                 .context("native mlx-rs runner: sampled decode last-logits-to-cpu failed")?;
             let next_tok =
                 pick(&mut buf).context("native mlx-rs runner: sampler callback failed")?;
@@ -3312,6 +3412,55 @@ mod imp {
             let got = r.extend(2, &tail).expect("extend");
             assert_eq!(got, want);
             assert!(!has_step_ahead(&mut r, 2));
+        }
+
+        /// A mask that changes every step and leaves one id in seven, so it
+        /// overrules the model's favourite most of the time.
+        fn allowed(step: usize, vocab: usize) -> Vec<bool> {
+            (0..vocab).map(|id| (id + step).is_multiple_of(7)).collect()
+        }
+
+        /// Masked steps masked on the GPU and built ahead pick what the blocking
+        /// host-masked step picks under the same mask, through switches between
+        /// masked and free steps both ways.
+        #[test]
+        #[ignore = "needs a real Qwen3.5/3.6 checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+        fn masked_chained_tokens_equal_host_masked_tokens() {
+            let Some(mut r) = runner() else { return };
+            let (mut a, mut pa) = r.prefill(1, &PROMPT).expect("prefill");
+            let (mut b, mut pb) = r.prefill(2, &PROMPT).expect("prefill");
+            let (mut want, mut got) = (Vec::new(), Vec::new());
+            for step in 0..30 {
+                if step % 3 == 2 {
+                    (a, pa) = r.decode_step(1, a, pa).expect("blocking");
+                    (b, pb) = r.decode_step_chained(2, b, pb).expect("chained");
+                } else {
+                    (a, pa) = r
+                        .decode_step_masked(1, a, &mut || Ok(()), &mut |logits| {
+                            let ok = allowed(step, logits.len());
+                            for (l, ok) in logits.iter_mut().zip(ok) {
+                                if !ok {
+                                    *l = f32::NEG_INFINITY;
+                                }
+                            }
+                            Ok(())
+                        })
+                        .expect("host-masked");
+                    (b, pb) = r
+                        .decode_step_chained_masked(2, b, &mut |v| Ok(Some(allowed(step, v))))
+                        .expect("chained masked")
+                        .expect("the masked step was built ahead");
+                    assert_eq!(
+                        (b as usize + step) % 7,
+                        0,
+                        "step {step} took a masked-out id"
+                    );
+                }
+                want.push(a);
+                got.push(b);
+            }
+            assert!(has_step_ahead(&mut r, 2), "the chained path did not run");
+            assert_eq!((got, pb), (want, pa));
         }
     }
 }

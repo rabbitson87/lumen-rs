@@ -799,11 +799,13 @@ impl TokenScriptRunner {
         &mut self,
         seq_id: u64,
         _last_token: u32,
+        ahead: &mut dyn FnMut() -> Result<()>,
         mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
     ) -> Result<(u32, usize)> {
         if self.vocab == 0 {
             return Err(anyhow!("token-script: a masked step needs with_vocab"));
         }
+        ahead()?;
         let scripted = self.pop();
         let mut logits = vec![0.0f32; self.vocab];
         if let Some(l) = logits.get_mut(scripted as usize) {
@@ -1143,14 +1145,15 @@ impl RunnerImpl {
         &mut self,
         seq_id: u64,
         last_token: u32,
+        ahead: &mut dyn FnMut() -> Result<()>,
         mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
     ) -> Result<(u32, usize)> {
         if let Self::Qwen4Exp(r) = self {
-            return r.decode_step_masked(seq_id, last_token, mask);
+            return r.decode_step_masked(seq_id, last_token, ahead, mask);
         }
         #[cfg(test)]
         if let Self::Scripted(r) = self {
-            return r.decode_step_masked(seq_id, last_token, mask);
+            return r.decode_step_masked(seq_id, last_token, ahead, mask);
         }
         self.native_mut()
             .ok_or_else(|| {
@@ -1158,7 +1161,23 @@ impl RunnerImpl {
                     "decode_step_masked (grammar) is only supported on the native (mlx-rs) backend"
                 )
             })?
-            .decode_step_masked(seq_id, last_token, mask)
+            .decode_step_masked(seq_id, last_token, ahead, mask)
+    }
+
+    /// A greedy masked step that keeps the GPU a step ahead (see
+    /// `NativeMlxRunner::decode_step_chained_masked`); `Ok(None)` where the
+    /// runner cannot build it, and the caller takes [`Self::decode_step_masked`].
+    #[cfg(feature = "mlx-native")]
+    fn decode_step_chained_masked(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        allowed: &mut dyn FnMut(usize) -> Result<Option<Vec<bool>>>,
+    ) -> Result<Option<(u32, usize)>> {
+        match self.native_mut() {
+            Some(r) => r.decode_step_chained_masked(seq_id, last_token, allowed),
+            None => Ok(None),
+        }
     }
 
     /// [`Self::decode_step_masked`] with the pick handed to the caller — the
@@ -1169,14 +1188,15 @@ impl RunnerImpl {
         &mut self,
         seq_id: u64,
         last_token: u32,
+        ahead: &mut dyn FnMut() -> Result<()>,
         pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
     ) -> Result<(u32, usize)> {
         if let Self::Qwen4Exp(r) = self {
-            return r.decode_step_pick(seq_id, last_token, pick);
+            return r.decode_step_pick(seq_id, last_token, ahead, pick);
         }
         self.native_mut()
             .ok_or_else(|| anyhow!("sampling is only supported on the native (mlx-rs) backend"))?
-            .decode_step_pick(seq_id, last_token, pick)
+            .decode_step_pick(seq_id, last_token, ahead, pick)
     }
 
     /// [`Self::decode_step_pick`] for an unconstrained sampled step, the one kind a runner with
@@ -1192,7 +1212,7 @@ impl RunnerImpl {
         if let Self::Qwen4Exp(r) = self {
             return r.decode_step_spec(seq_id, last_token, pick);
         }
-        self.decode_step_pick(seq_id, last_token, pick)
+        self.decode_step_pick(seq_id, last_token, &mut || Ok(()), pick)
     }
 
     /// Install a Qwen3.5/3.6 MTP block onto the active runner. Native-only.
@@ -2014,8 +2034,17 @@ lumen_flags::flag! {
     /// The model writes freely until it emits `<tool_call>` (one token id in
     /// every shipped Qwen tokenizer). From that token to `</tool_call>` the call
     /// is masked by the request's tool grammar: a declared function name, every
-    /// required parameter, none twice. Then the grammar waits for the next
-    /// opener, so each call of a parallel turn is constrained.
+    /// required parameter, none twice, in any order (up to six parameters; past
+    /// that, the schema's). Then the grammar waits for the next opener, so each
+    /// call of a parallel turn is constrained.
+    ///
+    /// Off by default because nothing measured needs it. On Qwen3.6-35B-A3B
+    /// (mxfp4) and Qwen3.5-9B, over a plain tool set and one built to trip a
+    /// model up (unusual parameter names, required flags, ten tools), greedy and
+    /// sampled, no call came out invalid without it and every reply was the same
+    /// with it. A masked step costs ~0.4 ms over a free one (+1 % decode in a tool
+    /// turn). What did go wrong is value types — booleans written `True` — which
+    /// the grammar does not constrain.
     ///
     /// **`Behavior`**: it changes which tokens a call can contain. Off, an auto
     /// request decodes unconstrained, as before; `tool_choice=required` and a
@@ -4130,18 +4159,37 @@ impl MlxQwen35Backend {
                 .map(|w| w.iter().copied().collect())
                 .unwrap_or_default();
             let mut chosen = 0u32;
-            let out = runner.decode_step_pick(seq_id, last_token, &mut |buf| {
-                g.apply_mask_to_logits(buf)?;
-                let probs = sampling_distribution(buf, &history, &cfg);
-                chosen = sample_distribution(&probs, rng);
-                Ok(chosen)
-            })?;
+            // The mask does not depend on the logits: computed while the GPU runs the step.
+            let g = std::cell::RefCell::new(g);
+            let out = runner.decode_step_pick(
+                seq_id,
+                last_token,
+                &mut || g.borrow_mut().prepare_mask(),
+                &mut |buf| {
+                    g.borrow_mut().apply_mask_to_logits(buf)?;
+                    let probs = sampling_distribution(buf, &history, &cfg);
+                    chosen = sample_distribution(&probs, rng);
+                    Ok(chosen)
+                },
+            )?;
             self.note_sampled(seq_id, chosen, cfg.repeat_penalty_last_n);
             return Ok(out);
         }
-        let mut mask = |buf: &mut [f32]| -> Result<()> { g.apply_mask_to_logits(buf).map(|_| ()) };
-        self.runner
-            .decode_step_masked(seq_id, last_token, &mut mask)
+        if let Some(out) =
+            self.runner
+                .decode_step_chained_masked(seq_id, last_token, &mut |vocab| {
+                    g.allowed_tokens(vocab)
+                })?
+        {
+            return Ok(out);
+        }
+        let g = std::cell::RefCell::new(g);
+        self.runner.decode_step_masked(
+            seq_id,
+            last_token,
+            &mut || g.borrow_mut().prepare_mask(),
+            &mut |buf| g.borrow_mut().apply_mask_to_logits(buf).map(|_| ()),
+        )
     }
 
     /// Record a sampled token in this sequence's penalty window.
@@ -4232,7 +4280,7 @@ impl MlxQwen35Backend {
             let out = if speculate {
                 runner.decode_step_sampled(seq_id, last_token, &mut pick)?
             } else {
-                runner.decode_step_pick(seq_id, last_token, &mut pick)?
+                runner.decode_step_pick(seq_id, last_token, &mut || Ok(()), &mut pick)?
             };
             self.note_sampled(seq_id, out.0, cfg.repeat_penalty_last_n);
             return Ok(out);

@@ -1053,6 +1053,7 @@ impl Qwen4ExpRunner {
         &mut self,
         seq_id: u64,
         last_token: u32,
+        ahead: &mut dyn FnMut() -> Result<()>,
         pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
     ) -> Result<(u32, usize)> {
         self.mem_note_decode(seq_id);
@@ -1065,7 +1066,7 @@ impl Qwen4ExpRunner {
         seq.pending = None;
         seq.forked_from = None;
         let logits = model.forward(&[last_token], &mut seq.cache, true)?;
-        let mut host = crate::gemma4_sampling::imp::last_logits_to_cpu_f32(&logits)
+        let mut host = crate::gemma4_sampling::imp::last_logits_to_cpu_f32_after(&logits, ahead)
             .context("qwen4_exp: logits to host")?;
         let next = pick(&mut host).context("qwen4_exp: sampler callback")?;
         seq.position += 1;
@@ -1203,9 +1204,10 @@ impl Qwen4ExpRunner {
         &mut self,
         seq_id: u64,
         last_token: u32,
+        ahead: &mut dyn FnMut() -> Result<()>,
         mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
     ) -> Result<(u32, usize)> {
-        self.decode_step_pick(seq_id, last_token, &mut |logits| {
+        self.decode_step_pick(seq_id, last_token, ahead, &mut |logits| {
             mask(logits)?;
             logits
                 .iter()
