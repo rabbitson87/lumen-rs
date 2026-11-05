@@ -7395,9 +7395,14 @@ impl MlxQwen35Backend {
                 last = *out.committed.last().context("mtp_step committed nothing")?;
             }
             let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+            let host = crate::qwen3_5_moe::take_mtp_host_timing()
+                .map(|(build, wait, n)| {
+                    format!(" host_build={build:.2}ms gpu_wait={wait:.2}ms over {n} cycles")
+                })
+                .unwrap_or_default();
             eprintln!(
                 "[mlx-mtp] seq {seq_id} done: {} tokens in {decode_ms:.0}ms ({:.1} tok/s); \
-                 cycles={cycles} accept={:.3} emit/cycle={:.2} depths={}",
+                 cycles={cycles} accept={:.3} emit/cycle={:.2} depths={}{host}",
                 answer.len(),
                 answer.len() as f64 / (decode_ms / 1000.0),
                 accepted as f64 / attempted.max(1) as f64,

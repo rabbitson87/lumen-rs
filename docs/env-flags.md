@@ -38,6 +38,7 @@ value → on.
 | `LUMEN_MOE_TRACE` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace` |
 | `LUMEN_MTP_COARSE_HEAD` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_coarse_head` |
 | `LUMEN_MTP_HISTORY` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_history` |
+| `LUMEN_MTP_HOST_TIMING` | off | Diagnostic | `lumen_mlx::qwen3_5_moe::imp::mtp_host_timing` |
 | `LUMEN_NATIVE_ACT_BF16` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::act_bf16` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
@@ -472,6 +473,19 @@ Keep the MTP head's own attention cache across draft cycles and prime it with th
  Output-identical: the head only proposes drafts, the trunk's verify decides every
  token. MTPLX measured depth-1 acceptance 0.90 with the history against 0.26 without
  on code; numbers for this repo in the commit that added it.
+
+### `LUMEN_MTP_HOST_TIMING`
+
+*Diagnostic, default off.*
+
+Time, in a greedy one-forward MTP cycle, the host's construction of the verify graph
+ (from the verify forward's first op to the accept argmax) and the wait for the GPU
+ that follows it, and print both per request on the `[mlx-mtp] ... done` line. The
+ drafter is already running when the build starts, so a build longer than the
+ drafter's GPU time is GPU idle.
+
+ Reads `Instant` around calls that only build lazy graphs: nothing is evaluated
+ earlier than without it, so tokens and timing are unchanged.
 
 ### `LUMEN_NATIVE_ACT_BF16`
 
