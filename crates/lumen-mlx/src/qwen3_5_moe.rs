@@ -102,6 +102,40 @@ mod imp {
     }
 
     lumen_flags::flag! {
+        /// Time, in a greedy one-forward MTP cycle, the host's construction of the verify graph
+        /// (from the verify forward's first op to the accept argmax) and the wait for the GPU
+        /// that follows it, and print both per request on the `[mlx-mtp] ... done` line. The
+        /// drafter is already running when the build starts, so a build longer than the
+        /// drafter's GPU time is GPU idle.
+        ///
+        /// Reads `Instant` around calls that only build lazy graphs: nothing is evaluated
+        /// earlier than without it, so tokens and timing are unchanged.
+        pub(crate) mtp_host_timing {
+            env: "LUMEN_MTP_HOST_TIMING",
+            default: false,
+            kind: Diagnostic,
+        }
+    }
+
+    /// [`mtp_host_timing`]'s sums since the last [`take_mtp_host_timing`]: build and wait in
+    /// nanoseconds, and the cycles they cover.
+    static HOST_BUILD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static HOST_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static HOST_CYCLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// The mean verify-graph build and GPU wait per cycle in milliseconds, and the cycle count,
+    /// since the last call; `None` when no cycle was timed.
+    pub fn take_mtp_host_timing() -> Option<(f64, f64, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = HOST_CYCLES.swap(0, Relaxed);
+        let (b, w) = (
+            HOST_BUILD_NS.swap(0, Relaxed),
+            HOST_WAIT_NS.swap(0, Relaxed),
+        );
+        (n > 0).then(|| (b as f64 / n as f64 / 1e6, w as f64 / n as f64 / 1e6, n))
+    }
+
+    lumen_flags::flag! {
         /// Keep the MTP head's own attention cache across draft cycles and prime it with the
         /// prompt ([`MtpHistory`]): every committed pair (trunk hidden, next token) enters it,
         /// as MTPLX and oMLX run the head. With it off the cache is emptied every cycle and the
@@ -5486,6 +5520,8 @@ mod imp {
             // slice, so the capture slot holds [1, K+1, hidden].
             self.set_mtp_capture_enabled(true);
             let t_verify0 = st.then(Instant::now);
+            let host_timing = lazy && mtp_host_timing::get();
+            let t_build0 = host_timing.then(Instant::now);
             let (verify_logits, _) = self
                 .forward_ids(
                     &verify_ids,
@@ -5559,8 +5595,23 @@ mod imp {
                 .context("mtp_step1: accept cast i32")?;
                 match &lazy_ids {
                     Some(d) => {
+                        let t_wait0 = t_build0.map(|t| {
+                            let now = Instant::now();
+                            HOST_BUILD_NS.fetch_add(
+                                (now - t).as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            now
+                        });
                         mlx_rs::transforms::eval([&argmax_per_pos, d])
                             .context("mtp_step1: accept eval")?;
+                        if let Some(t) = t_wait0 {
+                            HOST_WAIT_NS.fetch_add(
+                                t.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            HOST_CYCLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         drafts = d.as_slice::<i32>().iter().map(|&x| x as u32).collect();
                     }
                     None => argmax_per_pos.eval().context("mtp_step1: accept eval")?,
@@ -5896,6 +5947,8 @@ pub(crate) use imp::{ResolvedLinear, argmax_rows};
 // the crate root via `lumen_mlx::MtpStepOutput`.
 #[cfg(feature = "mlx-native")]
 pub use imp::MtpStepOutput;
+#[cfg(feature = "mlx-native")]
+pub use imp::take_mtp_host_timing;
 
 /// The MTP head's history of a sequence and a point to return it to (runner seq state).
 #[cfg(feature = "mlx-native")]
