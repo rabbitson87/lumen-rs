@@ -2598,6 +2598,50 @@ fn anthropic_tools_to_defs(tools: Option<&[AnthropicTool]>) -> Vec<ToolDef<'_>> 
         .collect()
 }
 
+/// The declared tool a call's emitted name means, and how it was repaired:
+/// `None` for the repair when the name is exact, `None` altogether when it
+/// names no declared tool (or more than one).
+///
+/// Two repairs, in this order. **Suffix**: the model dropped a namespace
+/// (`get_weather` for a declared `mcp__wx__get_weather`), matched only at a
+/// separator boundary and only when one declared name fits. **Stutter**: the
+/// emitted name is LONGER than a declared one and ends with it, because the
+/// model stuttered its opening bytes. Measured on Qwen3.8-27B:
+/// `<function=geget_weather>` for a declared `get_weather`, on the second call
+/// of a turn — after the one-call grammar released and the tail decoded
+/// unconstrained. Repaired only when the extra prefix is itself a prefix of
+/// the declared name, which is what makes it a stutter rather than a
+/// different word. Without that guard a declared `list` would swallow an
+/// emitted `blacklist`; with it, `black` is not a prefix of `list` and
+/// nothing happens. An ambiguous suffix is not tried as a stutter.
+fn resolve_tool_name<'t>(
+    emitted: &str,
+    tools: &'t [ToolDef<'t>],
+) -> Option<(&'t str, Option<&'static str>)> {
+    if let Some(t) = tools.iter().find(|t| t.name == emitted) {
+        return Some((t.name, None));
+    }
+    let mut hit: Option<&str> = None;
+    for t in tools {
+        let n = t.name;
+        if n.len() <= emitted.len() || !n.ends_with(emitted) {
+            continue;
+        }
+        let before = n.as_bytes()[n.len() - emitted.len() - 1];
+        if before.is_ascii_alphanumeric() {
+            continue; // suffix must start at a separator boundary
+        }
+        if hit.is_some() {
+            return None; // ambiguous
+        }
+        hit = Some(n);
+    }
+    if let Some(full) = hit {
+        return Some((full, Some("suffix match")));
+    }
+    unique_stutter_match(emitted, tools).map(|full| (full, Some("stutter")))
+}
+
 /// Convert backend-parsed tool calls into OpenAI-shaped `ToolCall`s. The
 /// `id` is generated server-side; clients echo it on the next turn as
 /// `tool_call_id`. `function.arguments` is JSON-encoded into a string per
@@ -2626,54 +2670,8 @@ fn remap_tool_call_names(calls: &mut Vec<ParsedToolCall>, tools: &[ToolDef<'_>])
         return;
     }
     for c in calls.iter_mut() {
-        if tools.iter().any(|t| t.name == c.name) {
-            continue; // already a valid, exact name
-        }
-        let emitted = c.name.as_str();
-        let mut hit: Option<&str> = None;
-        let mut ambiguous = false;
-        for t in tools {
-            let n = t.name;
-            if n.len() <= emitted.len() || !n.ends_with(emitted) {
-                continue;
-            }
-            let before = n.as_bytes()[n.len() - emitted.len() - 1];
-            if before.is_ascii_alphanumeric() {
-                continue; // suffix must start at a separator boundary
-            }
-            if hit.is_some() {
-                ambiguous = true;
-                break;
-            }
-            hit = Some(n);
-        }
-        if ambiguous {
-            continue;
-        }
-        if let Some(full) = hit {
-            eprintln!(
-                "[mlx] tool-name resolved {:?} -> {:?} (suffix match)",
-                c.name, full
-            );
-            c.name = full.to_string();
-            continue;
-        }
-        // Bug A's mirror image: the emitted name is LONGER than a declared one
-        // and ends with it, because the model stuttered its opening bytes.
-        // Measured on Qwen3.8-27B: `<function=geget_weather>` for a declared
-        // `get_weather`, on the second call of a turn — after the one-call
-        // grammar released and the tail decoded unconstrained.
-        //
-        // Repaired only when the extra prefix is itself a prefix of the
-        // declared name, which is what makes it a stutter rather than a
-        // different word. Without that guard a declared `list` would swallow an
-        // emitted `blacklist`; with it, `black` is not a prefix of `list` and
-        // nothing happens.
-        if let Some(full) = unique_stutter_match(emitted, tools) {
-            eprintln!(
-                "[mlx] tool-name resolved {:?} -> {:?} (stutter)",
-                c.name, full
-            );
+        if let Some((full, Some(how))) = resolve_tool_name(&c.name, tools) {
+            eprintln!("[mlx] tool-name resolved {:?} -> {full:?} ({how})", c.name);
             c.name = full.to_string();
         }
     }
