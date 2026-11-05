@@ -30,7 +30,7 @@ use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
 use crate::native_quant::MODE_AFFINE;
 
 lumen_flags::flag! {
-    /// Run the matvecs of an affine 4- or 8-bit, group-32/64 projection whose activation is f32 and
+    /// Run the matvecs of an affine 4-, 6- or 8-bit, group-32/64 projection whose activation is f32 and
     /// whose scales and biases are bf16 or f16 in kernels that read those scales as they are
     /// (`native_qmv::matvec`), instead of MLX's `quantized_matmul`, which casts them to f32 on every
     /// call, and keep such projections' scales in bf16 under `LUMEN_NATIVE_WIDEN_SCALES`. A
@@ -103,8 +103,8 @@ const MAX_ROW_VECTORS: i32 = 4;
 
 /// Vectors the row kernels dot with each decoded weight at a time: at 4 bits all of them up to
 /// three, four in two passes of two, as a lane holding four vectors' 16 values spills (M3 Max,
-/// 17408x5120, four vectors: at once 531 us, in two passes 320 us); at 8 bits, 8 values a vector,
-/// all four at once (two passes 465 us, one 369 us).
+/// 17408x5120, four vectors: at once 531 us, in two passes 320 us); at 6 and 8 bits, 8 values a
+/// vector, all four at once (8-bit: two passes 465 us, one 369 us).
 fn vectors_per_pass(vectors: i32, bits: i32) -> i32 {
     if vectors == 4 && bits == 4 {
         2
@@ -330,6 +330,118 @@ const ROWS8_BODY: &str = r#"
     }
 "#;
 
+/// [`FAST_BODY`] for 6-bit weights (`qmv_fast_impl<float, GS, 6>`): lane `l` takes values
+/// `8 l .. 8 l + 8` of every block of 256, two packs of four values in three bytes each, summed in
+/// `qdot`'s order.
+const FAST6_BODY: &str = r#"
+    const int lane = thread_index_in_simdgroup;
+    const int vec = thread_position_in_grid.z;
+    constexpr int G = K / GS;
+    constexpr int BLOCKS = K / 256;
+    constexpr int WB = K * 3 / 4;
+    const device float* xv = x + (size_t)vec * K;
+    const device uint8_t* wb = (const device uint8_t*)w;
+    float acc[R];
+    for (int r = 0; r < R; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (int blk = 0; blk < BLOCKS; ++blk) {
+        float x_thread[8];
+        const float sum = load_vector6(xv + blk * 256 + lane * 8, x_thread);
+        const int scale_at = blk * (256 / GS) + lane / (GS / 8);
+        for (int r = 0; r < R; ++r) {
+            const size_t row = (size_t)rg * R + r;
+            const float s = sc[row * G + scale_at];
+            const float b = bi[row * G + scale_at];
+            acc[r] += qdot6(wb + row * WB + blk * 192 + lane * 6, x_thread, s, b, sum);
+        }
+    }
+    for (int r = 0; r < R; ++r) {
+        const float y = simd_sum(acc[r]);
+        if (lane == 0) {
+            out[(size_t)vec * N + rg * R + r] = y;
+        }
+    }
+"#;
+
+/// [`ROWS_BODY`] for 6-bit weights: each block of 256 of every vector staged in threadgroup
+/// memory once, each pack's six masked fields read once and dotted with every vector in `qdot`'s
+/// order.
+const ROWS6_BODY: &str = r#"
+    const int lane = thread_index_in_simdgroup;
+    const int sgi = simdgroup_index_in_threadgroup;
+    constexpr int G = K / GS;
+    constexpr int BLOCKS = K / 256;
+    constexpr int WB = K * 3 / 4;
+    const device uint8_t* wb = (const device uint8_t*)w;
+    threadgroup float xs[VV * 8 * 32];
+    threadgroup float xsum[VV * 32];
+    float acc[VV][R];
+    for (int v = 0; v < VV; ++v) {
+        for (int r = 0; r < R; ++r) {
+            acc[v][r] = 0.0f;
+        }
+    }
+    for (int blk = 0; blk < BLOCKS; ++blk) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int v = sgi; v < VV; v += SG) {
+            float xt[8];
+            xsum[v * 32 + lane] = load_vector6(x + (size_t)v * K + blk * 256 + lane * 8, xt);
+            for (int i = 0; i < 8; ++i) {
+                xs[(v * 8 + i) * 32 + lane] = xt[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int scale_at = blk * (256 / GS) + lane / (GS / 8);
+        for (int c = 0; c < VV; c += VC) {
+            float xt[VC][8];
+            float xsm[VC];
+            for (int v = 0; v < VC; ++v) {
+                for (int i = 0; i < 8; ++i) {
+                    xt[v][i] = xs[((c + v) * 8 + i) * 32 + lane];
+                }
+                xsm[v] = xsum[(c + v) * 32 + lane];
+            }
+            for (int r = 0; r < R; ++r) {
+                const size_t row = (size_t)rg * R + r;
+                const device uint8_t* pw = wb + row * WB + blk * 192 + lane * 6;
+                const float s = sc[row * G + scale_at];
+                const float b = bi[row * G + scale_at];
+                float m[12];
+                for (int i = 0; i < 2; ++i) {
+                    m[6 * i] = pw[3 * i] & 0x3f;
+                    m[6 * i + 1] = pw[3 * i] & 0xc0;
+                    m[6 * i + 2] = pw[3 * i + 1] & 0x0f;
+                    m[6 * i + 3] = pw[3 * i + 1] & 0xf0;
+                    m[6 * i + 4] = pw[3 * i + 2] & 0x03;
+                    m[6 * i + 5] = pw[3 * i + 2] & 0xfc;
+                }
+                for (int v = 0; v < VC; ++v) {
+                    float accum = 0;
+                    for (int i = 0; i < 2; ++i) {
+                        const thread float* xq = xt[v] + 4 * i;
+                        accum += m[6 * i] * xq[0];
+                        accum += m[6 * i + 1] * xq[1];
+                        accum += m[6 * i + 2] * (xq[1] * 256.0f);
+                        accum += m[6 * i + 3] * xq[2];
+                        accum += m[6 * i + 4] * (xq[2] * 256.0f);
+                        accum += m[6 * i + 5] * xq[3];
+                    }
+                    acc[c + v][r] += s * accum + xsm[v] * b;
+                }
+            }
+        }
+    }
+    for (int v = 0; v < VV; ++v) {
+        for (int r = 0; r < R; ++r) {
+            const float y = simd_sum(acc[v][r]);
+            if (lane == 0) {
+                out[(size_t)v * N + rg * R + r] = y;
+            }
+        }
+    }
+"#;
+
 /// [`FAST_BODY`] for `projections` projections of one activation (`w0`, `sc0`, `bi0`, `out0`,
 /// `N0`, then `w1`, ...): projection `p` owns the `Np / R` row groups after those of the ones
 /// before it, along the grid's y axis.
@@ -387,6 +499,61 @@ const WIDE8_SOURCE: &str = r#"
             const int k0 = g * GS + c * 8;
             float w_dq[8];
             dequantize8x8(wrow + k0, scale, bias, w_dq);
+            for (int v = 0; v < V; v++) {
+                const device float* xc = xv[v] + k0;
+                float acc = 0;
+                for (int i = 0; i < 8; i++) {
+                    acc += xc[i] * w_dq[i];
+                }
+                result[v] += acc;
+            }
+        }
+    }
+    for (int v = 0; v < V; v++) {
+        result[v] += simd_shuffle_down(result[v], 4);
+        result[v] += simd_shuffle_down(result[v], 2);
+        result[v] += simd_shuffle_down(result[v], 1);
+    }
+    if (k_lane == 0 && out_row < N) {
+        for (int v = 0; v < V; v++) {
+            if (vec0 + v < M) {
+                out[(size_t)(vec0 + v) * N + out_row] = result[v];
+            }
+        }
+    }
+"#;
+
+/// [`WIDE_SOURCE`] for 6-bit weights (`qmv_wide_impl<float, GS, 6, V, 8>`): a row is `3K / 4` bytes
+/// and each eight values are six bytes.
+const WIDE6_SOURCE: &str = r#"
+    const int lane = thread_index_in_simdgroup;
+    const int sg = simdgroup_index_in_threadgroup;
+    const int tile = threadgroup_position_in_grid.x;
+    constexpr int KL = 8;
+    constexpr int RPS = 32 / KL;
+    constexpr int G = K / GS;
+    const int k_lane = lane % KL;
+    const int sg_row = lane / KL;
+    const int out_row = threadgroup_position_in_grid.y * (RPS * 2) + RPS * sg + sg_row;
+    const int vec0 = tile * V;
+    const int row = min(out_row, N - 1);
+    const device uint8_t* wrow = (const device uint8_t*)w + (size_t)row * (K * 3 / 4);
+    const size_t srow = (size_t)row * G;
+    const device float* xv[V];
+    for (int v = 0; v < V; v++) {
+        xv[v] = x + (size_t)min(vec0 + v, M - 1) * K;
+    }
+    float result[V];
+    for (int v = 0; v < V; v++) {
+        result[v] = 0.0f;
+    }
+    for (int g = k_lane; g < G; g += KL) {
+        const float scale = sc[srow + g];
+        const float bias = bi[srow + g];
+        for (int c = 0; c < GS / 8; c++) {
+            const int k0 = g * GS + c * 8;
+            float w_dq[8];
+            dequantize6x8(wrow + k0 * 3 / 4, scale, bias, w_dq);
             for (int v = 0; v < V; v++) {
                 const device float* xc = xv[v] + k0;
                 float acc = 0;
@@ -592,21 +759,21 @@ pub(crate) struct Plan {
 }
 
 /// The group sizes the kernels take. MLX's matvecs index a group's scale the same way for each:
-/// a lane's values of a block (16 of 512 at 4 bits, 8 of 256 at 8) lie in one group.
+/// a lane's values of a block (16 of 512 at 4 bits, 8 of 256 at 6 and 8) lie in one group.
 const GROUP_SIZES: [i32; 2] = [32, 64];
 
 /// The weight widths the kernels take, and the input length MLX's `qmv_fast` needs for each: its
-/// block, 32 lanes of 16 (4-bit) or 8 (8-bit) values.
+/// block, 32 lanes of 16 (4-bit) or 8 (6- and 8-bit) values.
 fn qmv_fast_block(bits: i32) -> Option<i32> {
     match bits {
         4 => Some(512),
-        8 => Some(256),
+        6 | 8 => Some(256),
         _ => None,
     }
 }
 
 /// `[outputs, inputs]` and the biases when the kernels read this projection: `decode_qmv` is on,
-/// the weights are affine 4- or 8-bit, group 32 or 64, in the lengths MLX runs as `qmv_fast`
+/// the weights are affine 4-, 6- or 8-bit, group 32 or 64, in the lengths MLX runs as `qmv_fast`
 /// (inputs a multiple of its block, outputs a multiple of 8), and the scales and biases are bf16 or
 /// f16, which `quantized_matmul` would cast.
 fn layout<'a>(w: &Weights<'a>) -> Option<(i32, i32, &'a Array)> {
@@ -712,6 +879,10 @@ struct Kernels {
     fast8: MetalKernel,
     rows8: MetalKernel,
     wide8: MetalKernel,
+    /// The 6-bit kernels, one projection a launch.
+    fast6: MetalKernel,
+    rows6: MetalKernel,
+    wide6: MetalKernel,
 }
 
 thread_local! {
@@ -902,6 +1073,33 @@ fn with_kernels<R>(f: impl FnOnce(&Kernels) -> Result<R>) -> Result<R> {
                     /* ensure_row_contiguous */ true,
                     /* atomic_outputs */ false,
                 )?,
+                fast6: MetalKernel::new_with_header(
+                    "decode_qmv_affine6",
+                    &one.inputs(),
+                    &one.outputs(),
+                    QMV_6BIT,
+                    &fast_source(1, FAST6_BODY),
+                    /* ensure_row_contiguous */ true,
+                    /* atomic_outputs */ false,
+                )?,
+                rows6: MetalKernel::new_with_header(
+                    "decode_qmv_rows_affine6",
+                    &one.inputs(),
+                    &one.outputs(),
+                    QMV_6BIT,
+                    &fast_source(1, ROWS6_BODY),
+                    /* ensure_row_contiguous */ true,
+                    /* atomic_outputs */ false,
+                )?,
+                wide6: MetalKernel::new_with_header(
+                    "decode_qmv_wide_affine6",
+                    &["x", "w", "sc", "bi"],
+                    &["out"],
+                    QMV_WIDE6,
+                    WIDE6_SOURCE,
+                    /* ensure_row_contiguous */ true,
+                    /* atomic_outputs */ false,
+                )?,
             };
             let _ = cell.set(kernels);
         }
@@ -984,6 +1182,8 @@ fn run_fast(x: &Array, plans: &[Plan], weights: &[Weights<'_>]) -> Result<Vec<Ar
         let kernel = match (bits, shared_rows) {
             (8, true) => &k.rows8,
             (8, false) => &k.fast8,
+            (6, true) => &k.rows6,
+            (6, false) => &k.fast6,
             (_, true) => &k.rows[plans.len() - 1],
             (_, false) => &k.fast[plans.len() - 1],
         };
@@ -1035,7 +1235,11 @@ pub(crate) fn matvec(plan: &Plan, x: &Array, w: &Weights<'_>) -> Result<Array> {
         config.set_thread_group(32, SIMDGROUPS, 1)
     })?;
     let y = with_kernels(|k| {
-        let wide = if bits == 8 { &k.wide8 } else { &k.wide };
+        let wide = match bits {
+            8 => &k.wide8,
+            6 => &k.wide6,
+            _ => &k.wide,
+        };
         Ok(wide
             .apply(&[&flat, w.weight, w.scales, biases], &config, 1)
             .context("decode matvec kernel failed")?
@@ -1060,8 +1264,8 @@ pub(crate) fn matvec_shared(x: &Array, weights: &[Weights<'_>]) -> Result<Option
     else {
         return Ok(None);
     };
-    // One group size a launch: it is a template argument of the kernel. The 8-bit kernels run one
-    // projection a launch.
+    // One group size a launch: it is a template argument of the kernel. The 6- and 8-bit kernels
+    // run one projection a launch.
     if plans
         .iter()
         .any(|p| p.group_size != plans[0].group_size || p.bits != 4)
@@ -1171,6 +1375,54 @@ inline void dequantize4x8(const device uint8_t* w, float scale, float bias, thre
     for (int i = 0; i < 4; i++) {
         w_local[2 * i] = static_cast<float>(sc[0] * (w[i] & 0x0f) + b);
         w_local[2 * i + 1] = static_cast<float>(sc[1] * (w[i] & 0xf0) + b);
+    }
+}
+"#;
+
+/// `load_vector` and `qdot` for 6-bit weights over f32 activations, eight values a lane: two packs
+/// of four values in three bytes, the lanes' values pre-divided by 64, 16, 4 so that each field can
+/// be dotted where it lies in its bytes (a field split across two bytes is the two halves, the upper
+/// one's value times 256).
+const QMV_6BIT: &str = r#"
+inline float load_vector6(const device float* x, thread float* x_thread) {
+    float sum = 0;
+    for (int i = 0; i < 8; i += 4) {
+        sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+        x_thread[i] = x[i];
+        x_thread[i + 1] = x[i + 1] / 64.0f;
+        x_thread[i + 2] = x[i + 2] / 16.0f;
+        x_thread[i + 3] = x[i + 3] / 4.0f;
+    }
+    return sum;
+}
+inline float qdot6(const device uint8_t* w, const thread float* x_thread, float scale, float bias, float sum) {
+    float accum = 0;
+    for (int i = 0; i < 2; i++) {
+        x_thread += 4 * i;
+        w += 3 * i;
+        accum += (w[0] & 0x3f) * x_thread[0];
+        accum += (w[0] & 0xc0) * x_thread[1];
+        accum += (w[1] & 0x0f) * (x_thread[1] * 256.0f);
+        accum += (w[1] & 0xf0) * x_thread[2];
+        accum += (w[2] & 0x03) * (x_thread[2] * 256.0f);
+        accum += (w[2] & 0xfc) * x_thread[3];
+    }
+    return scale * accum + sum * bias;
+}
+"#;
+
+/// `dequantize<float, 8, 6>` (`qmv_wide`'s): eight 6-bit values from six bytes, `q * scale + bias`.
+const QMV_WIDE6: &str = r#"
+inline void dequantize6x8(const device uint8_t* w, float scale, float bias, thread float* w_local) {
+    const float s = float(scale);
+    const float b = float(bias);
+    for (int i = 0; i < 2; i++) {
+        w_local += 4 * i;
+        w += 3 * i;
+        w_local[0] = static_cast<float>((w[0] & 0x3f) * s + b);
+        w_local[1] = static_cast<float>((((w[0] >> 6) & 0x03) + ((w[1] & 0x0f) << 2)) * s + b);
+        w_local[2] = static_cast<float>((((w[1] >> 4) & 0x0f) + ((w[2] & 0x03) << 4)) * s + b);
+        w_local[3] = static_cast<float>(((w[2] >> 2) & 0x3f) * s + b);
     }
 }
 "#;
@@ -1299,10 +1551,10 @@ mod tests {
                         (32, 2048),
                         (512, 2048),
                     ];
-                    // 8-bit runs blocks of 256: lengths 4-bit cannot take.
+                    // 6- and 8-bit run blocks of 256: lengths 4-bit cannot take.
                     let shapes8 = [(8, 256), (16, 768)];
-                    let cases = [4, 8].iter().flat_map(|&bits| {
-                        let lengths: Vec<(i32, i32)> = if bits == 8 {
+                    let cases = [4, 6, 8].iter().flat_map(|&bits| {
+                        let lengths: Vec<(i32, i32)> = if bits != 4 {
                             shapes.iter().chain(&shapes8).copied().collect()
                         } else {
                             shapes.to_vec()
@@ -1393,7 +1645,7 @@ mod tests {
             decode_qmv_rows::with(true, || {
                 let w = activation(&[1024, 2048], 70);
                 let w = w.as_dtype(Dtype::Bfloat16).expect("bf16");
-                for (group, bits) in [(64, 6), (128, 4)] {
+                for (group, bits) in [(64, 5), (128, 4)] {
                     let (qw, s, b) = quantize_with_mode(&w, group, bits, MODE_AFFINE).expect("q");
                     let b = b.expect("affine biases");
                     let weights = Weights {
@@ -1487,7 +1739,7 @@ mod tests {
                     }
                 });
             }
-            // Nor 8-bit projections (one a launch), projections of different group sizes (one
+            // Nor 6- and 8-bit projections (one a launch), projections of different group sizes (one
             // template argument a launch), of different input lengths, or more than four.
             let eight = [
                 projection_q(64, 512, 10, 64, 8),
@@ -1497,6 +1749,16 @@ mod tests {
             assert!(plan(&x8, &eight[0].weights()).is_some());
             assert!(
                 matvec_shared(&x8, &[eight[0].weights(), eight[1].weights()])
+                    .expect("kernel")
+                    .is_none()
+            );
+            let six = [
+                projection_q(64, 512, 13, 64, 6),
+                projection_q(64, 512, 14, 64, 6),
+            ];
+            assert!(plan(&x8, &six[0].weights()).is_some());
+            assert!(
+                matvec_shared(&x8, &[six[0].weights(), six[1].weights()])
                     .expect("kernel")
                     .is_none()
             );
@@ -1625,7 +1887,7 @@ mod tests {
             let q = projection(12, 1024, 6);
             assert!(plan(&x, &q.weights()).is_none());
             // Other quantizations.
-            for (group_size, bits) in [(128, 4), (64, 6)] {
+            for (group_size, bits) in [(128, 4), (64, 5), (64, 3)] {
                 let other = Weights {
                     group_size,
                     bits,
