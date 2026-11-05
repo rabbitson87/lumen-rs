@@ -18,7 +18,10 @@
 //! Usage:
 //!   MODEL_ID=mlx-community/Qwen3.6-27B-4bit \
 //!     cargo run --release -p lumen-mlx --example bench_s_scaling_mtp_gate \
-//!       --features mlx-native -- --runs 7
+//!       --features mlx-native -- --runs 7 [--s-list 1,2,4,8,16] [--prompt-tokens 8192]
+//!
+//! `--prompt-tokens N` repeats the prompt to N tokens, so the forward runs
+//! against an N-token cache (a verify's cost grows with the cache it reads).
 
 use std::time::Instant;
 
@@ -39,12 +42,17 @@ fn main() -> Result<()> {
 
     let mut runs: usize = 7;
     let mut s_list: Vec<usize> = vec![1, 2, 3, 4];
+    let mut prompt_tokens: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--runs" => {
                 runs = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(7);
+                i += 2;
+            }
+            "--prompt-tokens" => {
+                prompt_tokens = args.get(i + 1).and_then(|v| v.parse().ok());
                 i += 2;
             }
             "--s-list" => {
@@ -72,7 +80,10 @@ fn main() -> Result<()> {
     // the family-specific backend. Escape hatch via `as_qwen35_mut()` per
     // the doc on that method ("examples + benchmarks that drive the
     // low-level API use this").
-    let prompt_ids = backend.encode(DEFAULT_PROMPT)?;
+    let mut prompt_ids = backend.encode(DEFAULT_PROMPT)?;
+    if let Some(n) = prompt_tokens {
+        prompt_ids = prompt_ids.iter().copied().cycle().take(n).collect();
+    }
     let backend = backend
         .as_qwen35_mut()
         .ok_or_else(|| anyhow!("S-scaling gate requires the Qwen3.5 family backend"))?;
