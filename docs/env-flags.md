@@ -238,6 +238,17 @@ The disk KV tier (`kv_disk.rs`): prompt and conversation states, and
  free, though stored entries stay and are still read; `0` = no floor).
  `LUMEN_KV_DISK=0` (or `false`, `off`, `no`) turns the tier off.
 
+ A state is keyed by the prefill grid it was cut on. Up to the position
+ where the scores budget (`LUMEN_QWEN35_PREFILL_SCORES_GB`,
+ `LUMEN_GEMMA4_PREFILL_SCORES_GB`, 8 GB by default) starts shrinking the
+ chunks (59,392 tokens at 16 attention heads, 38,912 at 24), the key is
+ the chunk size, as before, so entries already on disk stay readable.
+ Past it, the grid depends on position alone, and entries that earlier
+ builds wrote there are not read. Those builds sized every chunk of a
+ long prompt from the whole prompt's length, so a longer follow-up turn
+ never matched them anyway. Re-sending the same prompt prefills it once
+ more.
+
 ### `LUMEN_MEMORY_PLAN_RECLAIMABLE`
 
 *Behavior, default on.*
