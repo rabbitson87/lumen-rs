@@ -16,6 +16,78 @@
 //!
 //! Reference: `mlx_lm/tool_parsers/gemma4.py` + `chat_template.jinja`.
 
+/// The first line of a Gemma 4 reasoning channel: the channel's name, not part of the trace.
+const CHANNEL_NAME_LINE: &str = "thought\n";
+
+/// A reasoning channel's text without its name line: `<|channel>thought\n…` opens every channel,
+/// even the empty one Gemma 4 writes with thinking off, and `thought` is the channel, not what
+/// the model reasoned. Text that is still a prefix of the name line is withheld; text that does
+/// not start with it is returned whole, so nothing a model actually wrote is dropped.
+///
+/// Safe on a growing prefix: the result for a longer text always extends the result for a
+/// shorter one, which is what lets a stream and the final response agree.
+pub(crate) fn strip_channel_name(text: &str) -> &str {
+    if CHANNEL_NAME_LINE.starts_with(text) {
+        ""
+    } else {
+        text.strip_prefix(CHANNEL_NAME_LINE).unwrap_or(text)
+    }
+}
+
+/// [`strip_channel_name`] over a channel streamed a piece at a time: what each new piece adds.
+#[derive(Debug, Default)]
+pub(crate) struct ChannelNameFilter {
+    text: String,
+    sent: usize,
+}
+
+impl ChannelNameFilter {
+    pub(crate) fn push(&mut self, piece: &str) -> String {
+        self.text.push_str(piece);
+        let shown = strip_channel_name(&self.text);
+        let fresh = shown.get(self.sent..).unwrap_or_default().to_string();
+        self.sent = shown.len();
+        fresh
+    }
+}
+
+#[cfg(test)]
+mod channel_name {
+    use super::{ChannelNameFilter, strip_channel_name};
+
+    #[test]
+    fn the_name_line_is_not_reasoning_and_the_rest_is() {
+        assert_eq!(strip_channel_name("thought\n"), "");
+        assert_eq!(strip_channel_name("thought"), "");
+        assert_eq!(strip_channel_name("thought\nbecause sky"), "because sky");
+        // A trace that only looks like the name for a while is not cut.
+        assert_eq!(strip_channel_name("thoughts on it"), "thoughts on it");
+        assert_eq!(strip_channel_name("the answer"), "the answer");
+        assert_eq!(strip_channel_name(""), "");
+    }
+
+    #[test]
+    fn a_streamed_channel_adds_up_to_the_stripped_whole_for_any_cut() {
+        for whole in [
+            "thought\n",
+            "thought\nbecause sky",
+            "thoughts on it",
+            "the answer",
+            "t",
+        ] {
+            for cut in 0..=whole.len() {
+                let mut f = ChannelNameFilter::default();
+                let streamed = f.push(&whole[..cut]) + &f.push(&whole[cut..]);
+                assert_eq!(
+                    streamed,
+                    strip_channel_name(whole),
+                    "{whole:?} cut at {cut}"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(feature = "mlx-native")]
 #[allow(dead_code)] // surfaced via gemma4_response::imp::* once the server lands
 pub(crate) mod imp {
@@ -78,6 +150,11 @@ pub(crate) mod imp {
         state: ParseState,
         visible_tokens: Vec<u32>,
         reasoning_tokens: Vec<u32>,
+        /// Where each reasoning channel starts in `reasoning_tokens`: every channel opens with
+        /// its name line, which [`super::strip_channel_name`] takes off each one.
+        channel_starts: Vec<usize>,
+        /// The open channel's streamed pieces, for [`Self::reasoning_delta`].
+        streamed_channel: super::ChannelNameFilter,
         tool_tokens: Vec<u32>,
         tool_calls: Vec<ParsedToolCall>,
         /// Phase 1.6c: incremental tool-call name detection state.
@@ -101,6 +178,8 @@ pub(crate) mod imp {
                 state: ParseState::Visible,
                 visible_tokens: Vec::new(),
                 reasoning_tokens: Vec::new(),
+                channel_starts: Vec::new(),
+                streamed_channel: super::ChannelNameFilter::default(),
                 tool_tokens: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_text_prefix: String::new(),
@@ -121,6 +200,8 @@ pub(crate) mod imp {
                 // ── Reasoning channel ─────────────────────────────────
                 (ParseState::Visible, t) if t == TOK_CHANNEL_OPEN => {
                     self.state = ParseState::Reasoning;
+                    self.channel_starts.push(self.reasoning_tokens.len());
+                    self.streamed_channel = super::ChannelNameFilter::default();
                 }
                 (ParseState::Reasoning, t) if t == TOK_CHANNEL_CLOSE => {
                     self.state = ParseState::Visible;
@@ -208,16 +289,38 @@ pub(crate) mod imp {
             Some(name)
         }
 
+        /// What a reasoning token's decoded `piece` adds to the stream: the open channel's text
+        /// without its name line, as [`Self::finalize`] reports it.
+        pub fn reasoning_delta(&mut self, piece: &str) -> String {
+            self.streamed_channel.push(piece)
+        }
+
         /// Finalize the parser, decoding accumulated buffers into strings.
         pub fn finalize(self) -> Result<ParsedResponse> {
             let visible = self
                 .template
                 .decode(&self.visible_tokens, /* skip_special */ true)
                 .context("decode visible buffer")?;
-            let reasoning = self
-                .template
-                .decode(&self.reasoning_tokens, /* skip_special */ true)
-                .context("decode reasoning buffer")?;
+            // Each channel decoded on its own, so each one's name line comes off.
+            let mut reasoning = String::new();
+            let mut starts = self.channel_starts.clone();
+            if starts.first() != Some(&0) {
+                starts.insert(0, 0);
+            }
+            for (i, &from) in starts.iter().enumerate() {
+                let to = starts
+                    .get(i + 1)
+                    .copied()
+                    .unwrap_or(self.reasoning_tokens.len());
+                let text = self
+                    .template
+                    .decode(
+                        &self.reasoning_tokens[from..to],
+                        /* skip_special */ true,
+                    )
+                    .context("decode reasoning buffer")?;
+                reasoning.push_str(super::strip_channel_name(&text));
+            }
             Ok(ParsedResponse {
                 visible,
                 reasoning,

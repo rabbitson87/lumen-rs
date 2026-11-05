@@ -432,6 +432,7 @@ pub(crate) mod imp {
                 && matches!(state_after, ParseState::Reasoning)
             {
                 let chunk = chat.decode(&[token], /* skip_special */ true)?;
+                let chunk = parser.reasoning_delta(&chunk);
                 if !chunk.is_empty() {
                     on_event(BackendStreamEvent::Reasoning(&chunk))?;
                 }
