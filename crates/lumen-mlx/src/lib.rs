@@ -4905,6 +4905,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill};
         let mut full = format_qwen3_chat_with_tools(messages, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill(tool_choice);
@@ -4926,6 +4927,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String, Vec<u32>)> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill};
         let prompt_only = format_qwen3_chat_with_tools(messages, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill(tool_choice);
@@ -4959,6 +4961,7 @@ impl MlxQwen35Backend {
         Vec<u32>,
         Vec<crate::qwen36_vision::PreparedImage>,
     )> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_and_images, qwen35_tool_choice_prefill,
         };
@@ -5027,6 +5030,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill,
         };
@@ -5046,6 +5050,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String, Vec<u32>)> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill,
         };
@@ -5081,6 +5086,7 @@ impl MlxQwen35Backend {
         Vec<u32>,
         Vec<crate::qwen36_vision::PreparedImage>,
     )> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::chat_io::ChatTurn;
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_from_history_and_images, qwen35_tool_choice_prefill,
@@ -6145,7 +6151,9 @@ impl MlxQwen35Backend {
                 Default::default()
             },
             prepared,
-            thinking,
+            // The parser starts where the prompt left the reply: in
+            // reasoning only when the builders above left the block open.
+            crate::qwen3_5_tools::opens_thinking(thinking, tool_choice),
             on_event,
         )
     }
@@ -6356,11 +6364,11 @@ impl MlxQwen35Backend {
         #[cfg(feature = "mlx-native")]
         if hold_back_last {
             let held = *prompt_ids.last().expect("hold_back_last implies non-empty");
-            let stepped = {
-                let g = grammar
-                    .as_mut()
-                    .expect("hold_back_last implies an active grammar");
-                self.decode_step_grammar(seq_id, held, g)
+            // The replay above may have dropped the grammar the token was
+            // held back for: the step is then taken unmasked below.
+            let stepped = match grammar.as_mut() {
+                Some(g) => self.decode_step_grammar(seq_id, held, g),
+                None => Err(anyhow!("the prefill replay dropped the grammar")),
             };
             match stepped {
                 Ok((next, new_pos)) => {
@@ -8588,6 +8596,42 @@ mod tests {
             parameters: Some(params),
             response: None,
         }]
+    }
+
+    /// With thinking on, a forced call is still a call. The prompt used to end
+    /// `<think>\n<tool_call>\n<function=`, so the prefill sat inside the open
+    /// trace, the parser started in it, and the turn came back with the call
+    /// as its reasoning and no `tool_calls`.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn a_forced_call_with_thinking_on_is_a_call() {
+        use crate::chat_io::{PromptSource, ResolvedToolChoice};
+        use crate::grammar::ToolCalls;
+        // The prefill takes the first token (the step after it is the masked
+        // one); the model then completes `<function=` + `get_weather>`.
+        let script = vec![0, 15, 2, 4, 2, 5, 2, 7, 2, 8, 2, 9, SCRIPT_EOS];
+        let mut backend = marker_backend(script);
+        let params = weather_params();
+        let tools = weather_tool(&params);
+        let messages = vec![("user".to_string(), "weather in Seoul?".to_string())];
+        let parsed = backend
+            .chat_with_tools(
+                PromptSource::Flat(&messages),
+                &[],
+                24,
+                true,
+                7,
+                &tools,
+                &ResolvedToolChoice::Required,
+                ToolCalls::OneOrMore,
+                |_| Ok(()),
+                None,
+            )
+            .expect("tool decode loop");
+        assert_eq!(parsed.tool_calls.len(), 1, "{parsed:?}");
+        assert_eq!(parsed.tool_calls[0].name, "get_weather");
+        assert_eq!(parsed.tool_calls[0].arguments["city"], "Seoul");
+        assert_eq!(parsed.reasoning, "");
     }
 
     /// In `tool_choice=auto` a call the model opens is held to the schema: it

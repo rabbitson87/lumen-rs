@@ -714,6 +714,18 @@ pub fn format_qwen3_chat_with_tools_from_history_and_images(
 /// must append this AFTER the generation prompt (`<|im_start|>assistant\n
 /// <think>...</think>\n\n`).
 ///
+/// Whether the reply opens inside `<think>`: thinking was asked for and the
+/// call is not forced.
+///
+/// A forced call's prefill ([`qwen35_tool_choice_prefill`]) is the start of
+/// the reply, so the reasoning block is closed before it, as the template
+/// writes a turn without thinking. Left open, the prefill landed inside the
+/// trace: the parser read the forced call as reasoning and the turn came back
+/// without it.
+pub fn opens_thinking(thinking: bool, choice: &ResolvedToolChoice<'_>) -> bool {
+    thinking && matches!(choice, ResolvedToolChoice::Auto | ResolvedToolChoice::None)
+}
+
 /// The opener is the template's, the function name the client's.
 pub fn qwen35_tool_choice_prefill(choice: &ResolvedToolChoice<'_>) -> PromptText {
     let mut s = PromptText::new();
