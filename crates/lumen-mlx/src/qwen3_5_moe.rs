@@ -5954,6 +5954,8 @@ pub use imp::take_mtp_host_timing;
 #[cfg(feature = "mlx-native")]
 pub(crate) use imp::{MtpHistory, MtpMark};
 
+#[cfg(feature = "mlx-native")]
+pub(crate) use imp::kv_store_bf16;
 /// bf16 KV storage toggle. Public so an A/B harness can flip it between runs in
 /// one process rather than relying on a per-process env read — see
 /// `examples/kv_bf16_ab.rs`.

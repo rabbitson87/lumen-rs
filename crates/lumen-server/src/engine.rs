@@ -236,6 +236,14 @@ impl ModelBackend {
         }
     }
 
+    /// A prefill of `prompt_tokens` against the GPU's working set, where the backend can
+    /// predict it.
+    fn prefill_peak(&self, prompt_tokens: u32) -> Option<lumen_mlx::PrefillPeak> {
+        match self {
+            Self::Mlx(m) => m.prefill_peak(prompt_tokens as usize),
+        }
+    }
+
     /// End-of-turn tokens, for deciding why a [`Self::generate`] call stopped.
     fn eos_tokens(&self) -> &[u32] {
         match self {
@@ -1776,7 +1784,41 @@ fn effective_prompt_cap_for(backend: &ModelBackend) -> (u32, u32, Option<u32>) {
 /// an `Err` whose message explains the cause + the fix.
 fn guard_prompt_fits(backend: &ModelBackend, prompt_tokens: u32) -> Result<()> {
     let (effective, operator_cap, max_ctx) = effective_prompt_cap_for(backend);
-    refuse_oversized_prompt(prompt_tokens, effective, operator_cap, max_ctx)
+    refuse_oversized_prompt(prompt_tokens, effective, operator_cap, max_ctx)?;
+    match backend.prefill_peak(prompt_tokens) {
+        Some(peak) => refuse_prefill_past_working_set(prompt_tokens, peak),
+        None => Ok(()),
+    }
+}
+
+/// A count says nothing about the machine: a prompt under the cap can still need more memory
+/// than the GPU keeps resident (a 27B on a 36 GB Mac peaks at ~26 GB for 32K tokens), and
+/// pushing one through once rebooted the machine. Refused here, before prefill, when the
+/// predicted peak ([`lumen_mlx::PrefillPeak`]) is past the device's working set. Same
+/// `PROMPT_REJECTED` line as the count guard, with the memory figures.
+fn refuse_prefill_past_working_set(prompt_tokens: u32, peak: lumen_mlx::PrefillPeak) -> Result<()> {
+    if !peak.exceeds() {
+        return Ok(());
+    }
+    let gb = |b: u64| b as f64 / 1e9;
+    eprintln!(
+        "[mlx-guard] PROMPT_REJECTED prompt_tokens={prompt_tokens} reason=memory \
+         predicted_peak_gb={:.1} resident_gb={:.1} working_set_gb={:.1}",
+        gb(peak.resident + peak.transient),
+        gb(peak.resident),
+        gb(peak.working_set)
+    );
+    Err(PromptTooLarge(format!(
+        "prompt too large for this machine: prefilling {prompt_tokens} tokens needs about \
+         {:.1} GB at its peak ({:.1} GB in use plus {:.1} GB for the prefill), more than \
+         the {:.1} GB the GPU keeps resident. Trim the prompt or the conversation, or use a \
+         smaller model.",
+        gb(peak.resident + peak.transient),
+        gb(peak.resident),
+        gb(peak.transient),
+        gb(peak.working_set)
+    ))
+    .into())
 }
 
 /// The decision [`guard_prompt_fits`] makes once the limits are known.
@@ -1825,6 +1867,36 @@ fn refuse_oversized_prompt(
         "prompt too large: {prompt_tokens} tokens > limit {effective}.{hint}"
     ))
     .into())
+}
+
+#[cfg(test)]
+mod prefill_peak_guard {
+    use super::{PromptTooLarge, refuse_prefill_past_working_set};
+    use lumen_mlx::PrefillPeak;
+
+    const GB: u64 = 1_000_000_000;
+
+    #[test]
+    fn a_prefill_past_the_working_set_is_a_400_and_one_inside_passes() {
+        let inside = PrefillPeak {
+            resident: 15 * GB,
+            transient: 11 * GB,
+            working_set: 30 * GB,
+        };
+        assert!(refuse_prefill_past_working_set(32_768, inside).is_ok());
+        let past = PrefillPeak {
+            resident: 15 * GB,
+            transient: 16 * GB,
+            working_set: 30 * GB,
+        };
+        let err = refuse_prefill_past_working_set(90_000, past).expect_err("must refuse");
+        assert!(
+            err.downcast_ref::<PromptTooLarge>().is_some(),
+            "a 400, not a 500: {err:#}"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("31.0 GB") && msg.contains("30.0 GB"), "{msg}");
+    }
 }
 
 /// A prompt [`guard_prompt_fits`] refused.

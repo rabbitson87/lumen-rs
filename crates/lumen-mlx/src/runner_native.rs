@@ -1970,6 +1970,28 @@ mod imp {
             Some(qwen35_prefill_grid(self.model.as_ref()?))
         }
 
+        /// The loaded model's shape as a prefill's peak memory depends on it. `None` before a
+        /// model is loaded.
+        pub(crate) fn prefill_peak_model(&self) -> Option<crate::prefill_budget::PrefillPeakModel> {
+            let t = &self.model.as_ref()?.config().text_config;
+            let full = t.layer_types.iter().filter(|l| !l.is_linear()).count() as u64;
+            let kv_bytes = if crate::qwen3_5_moe::kv_store_bf16() {
+                2
+            } else {
+                4
+            };
+            Some(crate::prefill_budget::PrefillPeakModel {
+                layers: t.num_hidden_layers,
+                heads: t.num_attention_heads,
+                bytes_per_token: full
+                    * 2
+                    * t.num_key_value_heads as u64
+                    * t.head_dim as u64
+                    * kv_bytes
+                    + 2 * t.hidden_size as u64,
+            })
+        }
+
         /// Remember `seq_id`'s current state as the point [`Self::rollback`]
         /// returns to, replacing any earlier one. See [`RollbackPoint`] for why
         /// this costs no copy of the KV.
@@ -3365,6 +3387,10 @@ mod imp {
         }
 
         pub(crate) fn prefill_grid(&self) -> Option<crate::session_feed::PrefillGrid> {
+            None
+        }
+
+        pub(crate) fn prefill_peak_model(&self) -> Option<crate::prefill_budget::PrefillPeakModel> {
             None
         }
 

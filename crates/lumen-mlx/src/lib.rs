@@ -665,6 +665,28 @@ fn tool_markers(tokenizer: Option<&TextTokenizer>) -> crate::qwen3_5_tools::Qwen
     ids
 }
 
+/// The size of a checkpoint's weight files (`*.safetensors`, and an MTP head's under `mtp/`), or
+/// 0 when the directory cannot be resolved. A little over what is resident once loaded (a
+/// vision tower that is not loaded is counted), never under.
+fn weight_file_bytes(model_id: &str) -> u64 {
+    #[cfg(feature = "mlx-native")]
+    if let Ok(dir) = crate::runner_native::resolve_model_dir(model_id) {
+        let size = |d: &std::path::Path| -> u64 {
+            std::fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        };
+        return size(&dir) + size(&dir.join("mtp"));
+    }
+    let _ = model_id;
+    0
+}
+
 fn resolve_tokenizer_json_path(model_id: &str) -> Result<PathBuf> {
     let local = std::path::Path::new(model_id);
     if local.is_dir() {
@@ -2006,6 +2028,27 @@ lumen_flags::flag! {
 }
 
 lumen_flags::flag! {
+    /// Refuse a prompt, before prefill, whose predicted prefill peak is past the GPU's working
+    /// set (`max_recommended_working_set_size`), with the same `PROMPT_REJECTED` 400 as the
+    /// token-count guard. A count says nothing about the machine: Qwen3.6-27B on a 36 GB Mac
+    /// peaks at ~26 GB for a 32K prompt, and pushing a much longer one through once rebooted
+    /// the machine.
+    ///
+    /// The prediction (`prefill_budget::PrefillPeakModel`) is the memory in use (at least the
+    /// checkpoint's weight files, which MLX maps lazily), a fixed part per layer for one chunk,
+    /// what each prompt token keeps, and the largest chunk's bf16 scores. Measured on three
+    /// Qwen checkpoints at 4K-32K it is never under the high-water mark and at most 4 % over
+    /// the total. Qwen 3.5/3.6/3.8 (not Flash-Next, which plans its own memory, nor Gemma 4).
+    ///
+    /// **`Behavior`**: it refuses prompts the count allows. `=0` leaves only the count.
+    pub(crate) prefill_memory_guard {
+        env: "LUMEN_PREFILL_MEMORY_GUARD",
+        default: true,
+        kind: Behavior,
+    }
+}
+
+lumen_flags::flag! {
     /// Stream a Qwen tool call's `arguments` while the model writes them.
     ///
     /// Each call goes out as it is parsed: its start with the first piece of
@@ -2369,6 +2412,15 @@ impl MlxBackend {
     /// process), so the engine rejects such prompts up front. Gemma 4 reports
     /// its `LUMEN_MAX_CTX`-capped value; Qwen3.5 returns `None` (its context is
     /// not env-capped here, so only the operator prompt cap applies).
+    /// See [`MlxQwen35Backend::prefill_peak`]; `None` for Gemma 4, which has no prediction.
+    pub fn prefill_peak(&self, prompt_tokens: usize) -> Option<PrefillPeak> {
+        match self {
+            Self::Qwen35Family(m) => m.prefill_peak(prompt_tokens),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(_) => None,
+        }
+    }
+
     pub fn max_context(&self) -> Option<usize> {
         match self {
             Self::Qwen35Family(m) => m.max_context(),
@@ -3744,6 +3796,10 @@ pub struct MlxQwen35Backend {
     /// `</think>` in this checkpoint's tokenizer: the auto tool grammar's
     /// trigger, and the markers the reply parser reads by id.
     tool_markers: crate::qwen3_5_tools::QwenMarkerIds,
+    /// The checkpoint's weight files, in bytes: what the weights will hold once MLX, which maps
+    /// them lazily, has materialized them. Active memory reads 0 until the first forward, so
+    /// the prefill guard takes the larger of the two. 0 when unknown.
+    weight_file_bytes: u64,
     /// Whether THIS checkpoint's chat template declares `reasoning_effort`
     /// (Qwen 3.8 does; 3.5 and 3.6 do not). Decided at load by reading the
     /// shipped `chat_template.jinja` — see
@@ -3838,6 +3894,7 @@ impl MlxQwen35Backend {
             eos_tokens: vec![eos],
             vocab_size,
             tool_markers: tool_markers(Some(&tokenizer)),
+            weight_file_bytes: 0,
             tokenizer: Some(tokenizer),
             next_seq_id: AtomicU64::new(1),
             sessions: session::Sessions::new(),
@@ -3949,6 +4006,7 @@ impl MlxQwen35Backend {
             eos_tokens,
             vocab_size,
             tool_markers: tool_markers(tokenizer.as_ref()),
+            weight_file_bytes: weight_file_bytes(model_id),
             tokenizer,
             next_seq_id: AtomicU64::new(1),
             sessions,
@@ -5141,6 +5199,30 @@ impl MlxQwen35Backend {
 
     pub fn alloc_seq_id(&self) -> u64 {
         self.next_seq_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// A prefill of `prompt_tokens` against what the GPU keeps resident, as
+    /// [`crate::prefill_budget::PrefillPeakModel`] predicts it, or `None` where there is no
+    /// prediction (Flash-Next plans its own memory; an unknown working set).
+    #[cfg(feature = "mlx-native")]
+    pub fn prefill_peak(&self, prompt_tokens: usize) -> Option<PrefillPeak> {
+        if !prefill_memory_guard::get() {
+            return None;
+        }
+        let native = self.runner.native()?;
+        let (model, grid) = (native.prefill_peak_model()?, native.prefill_grid()?);
+        let active = metal_memory::get_active_memory().ok()? as u64;
+        Some(PrefillPeak {
+            resident: active.max(self.weight_file_bytes),
+            transient: model.transient_bytes(&grid, prompt_tokens),
+            working_set: metal_memory::working_set_limit()? as u64,
+        })
+    }
+
+    /// Without the native runner there is no prediction.
+    #[cfg(not(feature = "mlx-native"))]
+    pub fn prefill_peak(&self, _prompt_tokens: usize) -> Option<PrefillPeak> {
+        None
     }
 
     /// The longest prompt the loaded runner's memory is planned for, when it plans for one
@@ -7677,6 +7759,24 @@ impl std::fmt::Display for StepTimes {
             self.free.0,
             mean(self.free)
         )
+    }
+}
+
+/// A prefill's predicted peak against what the GPU keeps resident, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillPeak {
+    /// In use before the prefill: weights, live sequences' state, everything.
+    pub resident: u64,
+    /// What the prefill adds at its peak ([`prefill_budget::PrefillPeakModel`]).
+    pub transient: u64,
+    /// The device's `max_recommended_working_set_size`.
+    pub working_set: u64,
+}
+
+impl PrefillPeak {
+    /// Whether the prefill would go past the working set.
+    pub fn exceeds(&self) -> bool {
+        prefill_budget::exceeds_working_set(self.resident, self.transient, self.working_set)
     }
 }
 
