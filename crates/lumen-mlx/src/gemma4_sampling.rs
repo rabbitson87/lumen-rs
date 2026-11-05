@@ -62,16 +62,34 @@ pub(crate) mod imp {
     /// (most decode paths leave logits in f32 already; bf16 prefill
     /// paths get one conversion here).
     pub fn last_logits_to_cpu_f32(logits: &Array) -> Result<Vec<f32>> {
+        let f32_view = last_logits_f32(logits)?;
+        f32_view.eval().context("sample: eval")?;
+        Ok(f32_view.as_slice::<f32>().to_vec())
+    }
+
+    /// [`last_logits_to_cpu_f32`], with `ahead` run on the host while the GPU
+    /// computes the logits: host work the pick needs but that does not depend
+    /// on them (a grammar's next mask) then costs nothing.
+    pub fn last_logits_to_cpu_f32_after(
+        logits: &Array,
+        ahead: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        let f32_view = last_logits_f32(logits)?;
+        mlx_rs::transforms::async_eval([&f32_view]).context("sample: start eval")?;
+        ahead().context("sample: host work ahead of the logits")?;
+        f32_view.eval().context("sample: eval")?;
+        Ok(f32_view.as_slice::<f32>().to_vec())
+    }
+
+    fn last_logits_f32(logits: &Array) -> Result<Array> {
         let l = logits.shape()[1];
         let last_pos = l - 1;
         let last_idx = Array::from_slice(&[last_pos], &[1]);
         let last_logits = mlx_rs::ops::indexing::take_axis(logits, &last_idx, 1)
             .context("sample: take_axis(L-1)")?;
-        let f32_view = last_logits
+        last_logits
             .as_dtype(mlx_rs::Dtype::Float32)
-            .context("sample: cast to f32")?;
-        f32_view.eval().context("sample: eval")?;
-        Ok(f32_view.as_slice::<f32>().to_vec())
+            .context("sample: cast to f32")
     }
 
     #[allow(dead_code)]

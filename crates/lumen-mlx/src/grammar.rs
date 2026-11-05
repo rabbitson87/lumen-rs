@@ -35,7 +35,7 @@ use llguidance::{
     Matcher, ParserFactory,
     api::TopLevelGrammar,
     token_bytes_from_tokenizer_json,
-    toktrie::{ApproximateTokEnv, TokEnv, TokRxInfo, TokTrie},
+    toktrie::{ApproximateTokEnv, SimpleVob, TokEnv, TokRxInfo, TokTrie},
 };
 use serde_json::{Value, json};
 
@@ -207,6 +207,10 @@ pub struct Gemma4GrammarState {
     factory: Arc<ParserFactory>,
     schema: TopLevelGrammar,
     matcher: Option<Matcher>,
+    /// The mask for the matcher's current position, computed by
+    /// [`Self::prepare_mask`] before the logits it applies to exist. Every
+    /// method that moves the matcher drops it.
+    ahead: Option<SimpleVob>,
     mode: GrammarMode,
     /// True once `stop_reason()` reports termination — the matcher releases
     /// and subsequent tokens are unconstrained.
@@ -254,6 +258,7 @@ impl Gemma4GrammarState {
             factory,
             schema,
             matcher: None,
+            ahead: None,
             mode,
             finished: false,
             lazy_trigger: Some(LazyTrigger {
@@ -295,6 +300,7 @@ impl Gemma4GrammarState {
             factory,
             schema,
             matcher: None,
+            ahead: None,
             mode,
             finished: false,
             // The whole assistant message is the JSON value — there is no
@@ -366,6 +372,7 @@ impl Gemma4GrammarState {
             factory,
             schema,
             matcher: None,
+            ahead: None,
             mode,
             finished: false,
             lazy_trigger: Some(LazyTrigger {
@@ -431,6 +438,7 @@ impl Gemma4GrammarState {
             factory,
             schema,
             matcher: None,
+            ahead: None,
             mode,
             finished: false,
             // `tool_call: "<tool_call>\n" …` — the opener IS the grammar's
@@ -474,6 +482,23 @@ impl Gemma4GrammarState {
     pub fn release(&mut self) {
         self.finished = true;
         self.matcher = None;
+        self.ahead = None;
+    }
+
+    /// Compute the next token's mask now, so a caller can run it while the GPU
+    /// computes the logits it applies to; [`Self::apply_mask_to_logits`] then
+    /// takes it instead of computing its own. No-op when not constraining.
+    pub fn prepare_mask(&mut self) -> Result<()> {
+        if self.finished || self.ahead.is_some() {
+            return Ok(());
+        }
+        if let Some(m) = self.matcher.as_mut() {
+            let mask = m
+                .compute_mask()
+                .map_err(|e| anyhow!("Matcher::compute_mask: {e}"))?;
+            self.ahead = Some(mask);
+        }
+        Ok(())
     }
 
     /// Mask raw f32 logits so positions outside the current grammar are
@@ -484,30 +509,9 @@ impl Gemma4GrammarState {
     /// Returns the number of positions masked, useful for sanity logging
     /// (0 in the no-op case; for an active matcher, expect vocab − allowed).
     pub fn apply_mask_to_logits(&mut self, logits: &mut [f32]) -> Result<usize> {
-        if self.finished {
-            return Ok(0);
-        }
-        let Some(m) = self.matcher.as_mut() else {
+        let Some(mask) = self.mask_for(logits.len())? else {
             return Ok(0);
         };
-        let mask = m
-            .compute_mask()
-            .map_err(|e| anyhow!("Matcher::compute_mask: {e}"))?;
-        // SimpleVob.len() reports the underlying vocab size used when the
-        // ParserFactory was built (from tokenizer.json). The model's lm_head
-        // can emit a LARGER, padded vocab (e.g. Qwen 3.6: tokenizer 248077 vs
-        // lm_head 248320 — the tail are reserved/padding ids the tokenizer
-        // never decodes). Treat those extra logits as disallowed (-inf): they
-        // are never legal grammar outputs anyway. A logits buffer SMALLER than
-        // the mask, however, means the tokenizer env and the model are
-        // genuinely mismatched and downstream sampling is meaningless — error.
-        if logits.len() < mask.len() {
-            return Err(anyhow!(
-                "grammar mask vocab mismatch: mask.len()={} > logits.len()={}",
-                mask.len(),
-                logits.len()
-            ));
-        }
         let mut masked = 0usize;
         let mask_len = mask.len();
         for (i, l) in logits.iter_mut().enumerate() {
@@ -519,6 +523,57 @@ impl Gemma4GrammarState {
             }
         }
         Ok(masked)
+    }
+
+    /// The tokens the grammar allows next over a vocabulary of `vocab` ids, for
+    /// masking on the GPU: the same set [`Self::apply_mask_to_logits`] leaves
+    /// finite. `None` when the grammar is not constraining.
+    pub fn allowed_tokens(&mut self, vocab: usize) -> Result<Option<Vec<bool>>> {
+        let Some(mask) = self.mask_for(vocab)? else {
+            return Ok(None);
+        };
+        // Word by word: a lookup per id cost a fifth of a millisecond over a
+        // 250K vocabulary, on the host, between two GPU steps.
+        let mut allowed = vec![false; vocab];
+        let len = mask.len();
+        for (chunk, &word) in allowed[..len].chunks_mut(32).zip(mask.as_slice()) {
+            for (bit, slot) in chunk.iter_mut().enumerate() {
+                *slot = word >> bit & 1 == 1;
+            }
+        }
+        Ok(Some(allowed))
+    }
+
+    /// The mask for the matcher's current position over `vocab` ids: the one
+    /// prepared ahead, else computed now. `None` when not constraining.
+    ///
+    /// `SimpleVob::len()` is the vocabulary the `ParserFactory` was built from
+    /// (`tokenizer.json`). The model's lm_head can emit a LARGER, padded vocab
+    /// (e.g. Qwen 3.6: tokenizer 248077 vs lm_head 248320 — the tail are
+    /// reserved/padding ids the tokenizer never decodes); those ids are never
+    /// legal grammar outputs, and callers disallow them. A vocabulary SMALLER
+    /// than the mask, however, means the tokenizer env and the model are
+    /// genuinely mismatched and anything picked from it is meaningless — error.
+    fn mask_for(&mut self, vocab: usize) -> Result<Option<SimpleVob>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let Some(m) = self.matcher.as_mut() else {
+            return Ok(None);
+        };
+        let mask = match self.ahead.take() {
+            Some(mask) => mask,
+            None => m
+                .compute_mask()
+                .map_err(|e| anyhow!("Matcher::compute_mask: {e}"))?,
+        };
+        if vocab < mask.len() {
+            return Err(anyhow!(
+                "grammar mask vocab mismatch: mask.len()={} > logits.len()={vocab}",
+                mask.len()
+            ));
+        }
+        Ok(Some(mask))
     }
 
     /// Observe a sampled token and advance internal state.
@@ -537,6 +592,7 @@ impl Gemma4GrammarState {
     /// tool call, since the streaming path is the only one that wires the
     /// grammar in.
     pub fn observe(&mut self, token: u32) -> Result<()> {
+        self.ahead = None;
         if self.finished {
             return Ok(());
         }
@@ -583,6 +639,7 @@ impl Gemma4GrammarState {
     /// fall back to free sampling rather than decode against a desynced
     /// matcher.
     pub fn observe_prefill(&mut self, token: u32) -> Result<()> {
+        self.ahead = None;
         if self.finished {
             return Ok(());
         }
@@ -610,6 +667,7 @@ impl Gemma4GrammarState {
     }
 
     fn activate(&mut self) -> Result<()> {
+        self.ahead = None;
         // `Matcher::new` accepts the `Result` directly so internal errors
         // (e.g. grammar compile failures) are kept on the matcher and
         // surfaced via `is_error()` / `get_error()` rather than panicking.
@@ -2244,6 +2302,71 @@ mod tests {
         assert!(state.is_active());
     }
 
+    /// A mask prepared ahead is the mask of the position it is applied at:
+    /// the same one `apply_mask_to_logits` computes on its own, and never the
+    /// mask of a position a later token moved the matcher past.
+    #[test]
+    fn a_prepared_mask_is_the_mask_of_the_current_position() {
+        let build = || {
+            Gemma4GrammarState::new_json_schema(
+                shared_factory_placeholder(),
+                &city_schema(),
+                GrammarMode::Eager,
+            )
+            .expect("build")
+        };
+        let masked = |state: &mut Gemma4GrammarState| {
+            let mut logits = vec![0.0_f32; 262];
+            state.apply_mask_to_logits(&mut logits).expect("mask");
+            logits.iter().map(|l| l.is_finite()).collect::<Vec<_>>()
+        };
+        let (mut fresh, mut ahead) = (build(), build());
+        for &b in b"{\"city\": \"Paris\"" {
+            ahead.prepare_mask().expect("prepare");
+            assert_eq!(
+                masked(&mut ahead),
+                masked(&mut fresh),
+                "before {:?}",
+                b as char
+            );
+            // Prepared, then moved on: the next position's mask, not this one's.
+            ahead.prepare_mask().expect("prepare");
+            ahead.observe(u32::from(b)).expect("in grammar");
+            fresh.observe(u32::from(b)).expect("in grammar");
+        }
+        assert_eq!(masked(&mut ahead), masked(&mut fresh));
+    }
+
+    /// The allowed set the GPU masks with is the set the host mask leaves
+    /// finite, at every position and over a vocabulary padded past the
+    /// tokenizer's (whose tail is never allowed).
+    #[test]
+    fn allowed_tokens_are_what_the_host_mask_keeps() {
+        let build = || {
+            Gemma4GrammarState::new_json_schema(
+                shared_factory_placeholder(),
+                &city_schema(),
+                GrammarMode::Eager,
+            )
+            .expect("build")
+        };
+        let vocab = 300;
+        let (mut host, mut gpu) = (build(), build());
+        for &b in b"{\"city\": \"Paris\"}" {
+            let mut logits = vec![0.0_f32; vocab];
+            host.apply_mask_to_logits(&mut logits).expect("mask");
+            let kept: Vec<bool> = logits.iter().map(|l| l.is_finite()).collect();
+            let allowed = gpu
+                .allowed_tokens(vocab)
+                .expect("mask")
+                .expect("constraining");
+            assert_eq!(allowed, kept, "before {:?}", b as char);
+            assert!(!allowed[vocab - 1], "a padding id is never allowed");
+            host.observe(u32::from(b)).expect("in grammar");
+            gpu.observe(u32::from(b)).expect("in grammar");
+        }
+    }
+
     #[test]
     fn release_stops_constraining() {
         let factory = shared_factory_placeholder();
@@ -2983,6 +3106,82 @@ mod tests {
         assert!(
             !body_line.contains("))*"),
             "no-required strict body must still be dup-free: {body_line}"
+        );
+    }
+}
+
+/// Bench: what a grammar-masked decode step spends on the mask itself, with a real
+/// tokenizer: `compute_mask` for the next token and applying it to a vocabulary-wide logit row.
+/// `LUMEN_QWEN35_MODEL_DIR` points at a checkpoint with a `tokenizer.json`; run with
+/// `--release --ignored --nocapture`.
+#[cfg(test)]
+mod mask_cost {
+    use super::*;
+
+    #[test]
+    #[ignore = "bench; needs the Qwen3.6-35B-A3B-mxfp4 checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn mask_compute_and_apply_cost() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            eprintln!("skipping: set LUMEN_QWEN35_MODEL_DIR");
+            return;
+        };
+        let path = std::path::Path::new(&dir).join("tokenizer.json");
+        let tj: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let factory = shared_factory_from_tokenizer_value(
+            &tj,
+            EndTokens {
+                eos: 248046,
+                end_of_turn: None,
+            },
+        )
+        .unwrap();
+        let tokenizer = tokenizers::Tokenizer::from_file(&path).unwrap();
+        let tools = vec![
+            json!({"type": "function", "function": {"name": "write_file",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"}, "content": {"type": "string"}},
+                "required": ["path", "content"]}}}),
+        ];
+        let text = "<tool_call>\n<function=write_file>\n<parameter=path>\nnotes/a.txt\n</parameter>\n\
+                    <parameter=content>\nThe quick brown fox jumps over the lazy dog, again and again \
+                    until the story ends.\n</parameter>\n</function>\n</tool_call>";
+        let ids = tokenizer.encode(text, false).unwrap().get_ids().to_vec();
+        let vocab = 248_320;
+        let mut logits = vec![0.0f32; vocab];
+        let (mut t_mask, mut t_apply, mut t_allowed, mut n) = (0f64, 0f64, 0f64, 0u32);
+        for _round in 0..20 {
+            let mut state = Gemma4GrammarState::new_qwen35_xml(
+                factory.clone(),
+                &tools,
+                GrammarMode::Eager,
+                None,
+                ToolCalls::OneOrMore,
+            )
+            .unwrap();
+            for &id in &ids {
+                if !state.is_active() {
+                    break;
+                }
+                let t = std::time::Instant::now();
+                state.prepare_mask().unwrap();
+                t_mask += t.elapsed().as_secs_f64();
+                let t = std::time::Instant::now();
+                state.apply_mask_to_logits(&mut logits).unwrap();
+                t_apply += t.elapsed().as_secs_f64();
+                state.prepare_mask().unwrap();
+                let t = std::time::Instant::now();
+                std::hint::black_box(state.allowed_tokens(vocab).unwrap());
+                t_allowed += t.elapsed().as_secs_f64();
+                n += 1;
+                state.observe(id).unwrap();
+            }
+        }
+        eprintln!(
+            "[mask-cost] {n} steps: compute_mask {:.3} ms, apply over {vocab} logits {:.3} ms, \
+             allowed set {:.3} ms per step",
+            t_mask * 1e3 / f64::from(n),
+            t_apply * 1e3 / f64::from(n),
+            t_allowed * 1e3 / f64::from(n)
         );
     }
 }
