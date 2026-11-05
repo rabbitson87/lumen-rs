@@ -9642,7 +9642,9 @@ mod tests {
     /// `top_p` on Qwen and installed nothing, while its decode steps read the
     /// installed sampling, so a completion decoded greedily when it asked to
     /// sample, and with the previous request's temperature and seed when it
-    /// asked for greedy.
+    /// asked for greedy. Under `mlx-native` the scripted runner refuses to
+    /// sample, so a sampled completion fails after dispatch; what it
+    /// installed stays visible, as in the image test above.
     #[test]
     fn a_completion_decodes_with_its_own_sampling() {
         let ov = SamplingOverrides::default();
@@ -9650,8 +9652,10 @@ mod tests {
         for (temperature, sampled) in [(0.0, false), (0.8, true)] {
             let mut b = qwen_with_prefix_cache();
             qwen(&mut b).set_sampling(leftover);
-            b.generate(&[CHAT_BLUE, CHAT_BLUE], 4, temperature, 1.0, &ov, None)
-                .expect("a scripted completion");
+            let decoded = b.generate(&[CHAT_BLUE, CHAT_BLUE], 4, temperature, 1.0, &ov, None);
+            if !sampled {
+                decoded.expect("a scripted greedy completion");
+            }
             assert_eq!(
                 qwen(&mut b).sampling.map(|c| c.temperature),
                 sampled.then_some(temperature),
