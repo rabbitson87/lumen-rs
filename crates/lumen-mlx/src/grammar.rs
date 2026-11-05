@@ -828,19 +828,24 @@ fn qwen35_lark_grammar_string(tools: &[Value], calls: ToolCalls) -> Result<Strin
     for (rule_name, rule_rhs) in &body_rules {
         grammar.push_str(&format!("{rule_name}: {rule_rhs}\n"));
     }
-    // A parameter value: any bytes (incl. newlines) up to the framing newline
-    // that precedes `</parameter>`. Non-greedy so the FIRST `\n</parameter>`
-    // closes the value. The framing `\n` on each side matches the renderer's
+    // A parameter value and its closer: any bytes (incl. newlines), ended by
+    // the FIRST `\n</parameter>\n`, which is where the parser ends a value
+    // too. The framing `\n` on each side matches the renderer's
     // `<parameter=KEY>\nVALUE\n</parameter>`.
-    grammar.push_str("param_value: /(.|\\n)*?/\n");
+    //
+    // The end has to be the lexeme's own (`suffix`, which makes it lazy). A
+    // `*?` in the regex does not do it: llguidance matches a regex greedily,
+    // so `/(.|\n)*?/` followed by a `"\n</parameter>\n"` literal kept a parse
+    // in which the value had not ended yet. That parse accepts any byte, so
+    // from the first value on the grammar constrained nothing, and it never
+    // finished at `</tool_call>`.
+    grammar.push_str("param_value[suffix=\"\\n</parameter>\\n\"]: /(.|\\n)*/\n");
     // Generic well-formed parameter block — used by the permissive fallback
     // for tools whose schema isn't in the supported subset (unknown
     // `properties` shape or non-identifier keys). The key name is left free
     // (`/[^>\\n]*/`) but the surrounding tags are still enforced, so even the
     // fallback can't degenerate into unstructured output.
-    grammar.push_str(
-        "param_block: \"<parameter=\" /[^>\\n]*/ \">\\n\" param_value \"\\n</parameter>\\n\"\n",
-    );
+    grammar.push_str("param_block: \"<parameter=\" /[^>\\n]*/ \">\\n\" param_value\n");
     Ok(grammar)
 }
 
@@ -865,7 +870,7 @@ fn qwen35_body_for_object_schema(schema: &Value) -> Result<String> {
         rendered.insert(
             key.clone(),
             format!(
-                "({} param_value \"\\n</parameter>\\n\")",
+                "({} param_value)",
                 lark_literal(&format!("<parameter={key}>\n"))
             ),
         );
@@ -1867,6 +1872,47 @@ mod tests {
         state
             .observe(u32::from(b't'))
             .expect("matcher advanced past `<`, so `t` continues `<tool_call>`");
+    }
+
+    fn two_required() -> Vec<Value> {
+        vec![json!({
+            "type": "function",
+            "function": {
+                "name": "w",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
+                    "required": ["a", "b"],
+                },
+            },
+        })]
+    }
+
+    #[test]
+    fn a_required_parameter_after_a_value_is_still_required() {
+        // The value terminal used to be a greedy `/(.|\n)*?/`: a parse in which
+        // `a`'s value had not ended stayed alive, accepted any byte, and so
+        // let the call close without `b`.
+        let mut state = Gemma4GrammarState::new_qwen35_xml(
+            shared_factory_placeholder(),
+            &two_required(),
+            GrammarMode::Eager,
+            None,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build");
+        assert_eq!(
+            feed(
+                &mut state,
+                b"<tool_call>\n<function=w>\n<parameter=a>\nx\n</parameter>\n"
+            ),
+            None
+        );
+        assert_eq!(
+            feed(&mut state, b"</function>"),
+            Some(1),
+            "`</function>` with `b` missing must be rejected at its `/`"
+        );
     }
 
     /// Drive a grammar with a byte string, returning the index of the first
