@@ -27,8 +27,8 @@
 //! leaving it to be rediscovered.
 
 use lumen_mlx::prefill_budget::{
-    ChunkDecision, DEFAULT_SCORES_BUDGET_BYTES, MIN_CHUNK, clamp_chunk, parse_scores_budget,
-    projected_scores_bytes,
+    ChunkDecision, DEFAULT_SCORES_BUDGET_BYTES, MIN_CHUNK, PrefillGrid, clamp_chunk,
+    parse_scores_budget, projected_scores_bytes,
 };
 
 /// Head counts spanning the models this serves plus the degenerate ends.
@@ -255,4 +255,43 @@ fn projection_never_wraps_into_looking_safe() {
     assert_eq!(huge, u64::MAX);
     let d = clamp_chunk(usize::MAX, u64::MAX, usize::MAX, usize::MAX);
     assert_invariants(&d, "all-max");
+}
+
+/// Where a cold prefill of `len` tokens is cut: the end of each chunk, then
+/// `len`.
+fn cuts_of(heads: usize, len: usize) -> Vec<usize> {
+    PrefillGrid::new(2048, DEFAULT_SCORES_BUDGET_BYTES, heads).cuts(0, len)
+}
+
+/// A later turn's cold prefill must cut everywhere an earlier turn of the
+/// same conversation cut. A rollback or disk point is left on a cut of the
+/// earlier prompt, and resuming from it is exact only if the longer prompt's
+/// cold prefill cuts there too. The pairs straddle where the default budget
+/// starts to bind: 61,035 tokens at 16 heads, 40,690 at 24.
+#[test]
+fn a_longer_prompt_is_cut_where_its_beginning_was() {
+    let mut failures = Vec::new();
+    for heads in [16usize, 24] {
+        for (early, late) in [
+            (20_000, 30_000),
+            (38_000, 45_000),
+            (50_000, 70_000),
+            (70_000, 72_000),
+            (80_000, 83_000),
+        ] {
+            let late_cuts = cuts_of(heads, late);
+            let early_cuts = cuts_of(heads, early);
+            let missing = early_cuts[..early_cuts.len() - 1]
+                .iter()
+                .filter(|c| !late_cuts.contains(c))
+                .count();
+            if missing > 0 {
+                failures.push(format!(
+                    "heads={heads} {early}->{late}: {missing} of {} cuts missing",
+                    early_cuts.len() - 1
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

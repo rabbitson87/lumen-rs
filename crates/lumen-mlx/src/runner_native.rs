@@ -657,32 +657,38 @@ mod imp {
             .unwrap_or(2048)
     }
 
-    /// The chunk size [`forward_chunked`] runs a call in.
+    /// Where [`forward_chunked`] cuts a prefill: chunks of
+    /// `LUMEN_QWEN35_PREFILL_CHUNK` tokens, shrunk by position so each one's
+    /// full-attention scores over the keys before it and its own stay inside
+    /// `LUMEN_QWEN35_PREFILL_SCORES_GB`.
     ///
     /// The arithmetic lives in `prefill_budget` so it can be swept at tier 0
     /// (it is this crate's `malloc`-fail-at-N analogue: MLX allocation cannot
     /// fail into an `Err`, so the guard is to not allocate). Exposed through
     /// [`NativeMlxRunner::prefill_grid`] so a caller that feeds a prompt in
-    /// pieces can keep the grid a single call would have used.
-    ///
-    /// `kv_upper` is the most keys any chunk attends to: the tokens already in
-    /// the cache plus the ones this call adds.
-    fn prefill_chunk_decision(
-        model: &NativeQwen3_5MoeModel,
-        kv_upper: usize,
-    ) -> crate::prefill_budget::ChunkDecision {
-        crate::prefill_budget::clamp_chunk(
+    /// pieces can keep the cuts a single call makes.
+    /// Where a [`forward_chunked`] call of `n` tokens on `cache` ends its
+    /// pieces, counted from its first token: the grid's pieces from the
+    /// position the cache holds, so each piece's keys include the cached
+    /// prefix (an extend over a long one is cut like the end of a long prompt).
+    fn call_pieces(
+        grid: crate::prefill_budget::PrefillGrid,
+        cache: &NativePromptCache,
+        n: usize,
+    ) -> Vec<usize> {
+        let base = cache.full_attn_offset();
+        grid.pieces(base, base + n)
+            .into_iter()
+            .map(|end| end - base)
+            .collect()
+    }
+
+    fn qwen35_prefill_grid(model: &NativeQwen3_5MoeModel) -> crate::prefill_budget::PrefillGrid {
+        crate::prefill_budget::PrefillGrid::new(
             qwen35_prefill_chunk(),
             crate::prefill_budget::scores_budget_from_env("LUMEN_QWEN35_PREFILL_SCORES_GB"),
             model.config().text_config.num_attention_heads,
-            kv_upper,
         )
-    }
-
-    /// The most keys a [`forward_chunked`] call's chunks attend to: what
-    /// `cache` already holds plus the call's own `n` tokens.
-    fn chunked_call_kv_upper(cache: &NativePromptCache, n: usize) -> usize {
-        cache.full_attn_offset() + n
     }
 
     /// Run `tokens` through the trunk in query-windowed chunks, accumulating
@@ -792,46 +798,44 @@ mod imp {
         // [heads, q_len, kv_len] scores buffer just like Gemma. A single
         // un-chunked pass over a long prompt makes kv_len == q_len == prompt
         // length, and that buffer can exceed Metal's per-buffer cap (observed:
-        // a ~130 GB allocation attempt for a 21k-token single pass). Clamp the
-        // chunk DOWN so one chunk's full-attn scores stay under a byte budget
-        // given the worst-case kv_len: what the cache already holds plus this
-        // call's tokens. Counting only the call's own tokens let an extend or
-        // a prefix-cache continuation over a long cached prefix through
-        // unclamped (Gemma's loop already counted the cache). Short prompts are
+        // a ~130 GB allocation attempt for a 21k-token single pass). Each piece
+        // is the chunk the grid starts at its position, whose scores over the
+        // keys before it (the cache included) and its own fit the budget; a
+        // piece that starts on a cut is the grid's own chunk. Short prompts are
         // unaffected (the cap is large); an over-large
         // `LUMEN_QWEN35_PREFILL_CHUNK` is clamped, never honored — chunking is
         // mandatory. The legacy single-pass A/B path now also requires raising
         // `LUMEN_QWEN35_PREFILL_SCORES_GB` (e.g. a huge value) alongside the
         // chunk override.
-        let chunk = {
-            let d = prefill_chunk_decision(model, chunked_call_kv_upper(cache, n));
-            if d.clamped() {
-                eprintln!(
-                    "[prefill] qwen chunk clamped {} → {} \
-                     (heads={} kv_upper={} budget={:.1}GB) — \
-                     keeps single-chunk full-attn scores under the Metal buffer cap",
-                    d.requested,
-                    d.chunk,
-                    d.heads.max(1),
-                    d.kv_upper.max(1),
-                    d.budget_bytes as f64 / 1e9
-                );
-            }
-            d.chunk
-        };
-        if n <= chunk {
+        let grid = qwen35_prefill_grid(model);
+        let ends = call_pieces(grid, cache, n);
+        if ends.len() <= 1 {
             return chunk_forward(tokens, cache, last_only, 0)
                 .with_context(|| format!("{label}: forward ({n} tokens)"));
         }
-        let n_chunks = n.div_ceil(chunk);
+        // Every piece but the last is a whole chunk of the grid; one shorter
+        // than `requested` means the budget bound here.
+        if let Some(short) = ends
+            .iter()
+            .scan(0, |at, &e| Some(e - std::mem::replace(at, e)))
+            .take(ends.len() - 1)
+            .filter(|&len| len < grid.requested())
+            .min()
+        {
+            eprintln!(
+                "[prefill] qwen chunks shrink by position from {} to {short} over {} pieces \
+                 (keeps each chunk's full-attn scores inside LUMEN_QWEN35_PREFILL_SCORES_GB)",
+                grid.requested(),
+                ends.len()
+            );
+        }
+        let n_chunks = ends.len();
         let report = std::env::var("LUMEN_QWEN35_PREFILL_CHUNK_LOG")
             .map(|v| v == "1")
             .unwrap_or(false);
         let mut logits_opt: Option<Array> = None;
         let mut start = 0usize;
-        let mut idx = 0usize;
-        while start < n {
-            let end = (start + chunk).min(n);
+        for (idx, &end) in ends.iter().enumerate() {
             let is_last = end == n;
             // Intermediate chunks only need to grow the cache; force `last_only`
             // so their lm_head stays `[1, 1, vocab]` (cheap) — their logits are
@@ -869,7 +873,6 @@ mod imp {
                 logits_opt = Some(out);
             }
             start = end;
-            idx += 1;
         }
         logits_opt.ok_or_else(|| anyhow!("{label}: chunked forward produced no logits"))
     }
@@ -1960,14 +1963,11 @@ mod imp {
             Ok(())
         }
 
-        /// The shape of a bulk prefill of `n` tokens: the chunk size it runs
-        /// in, whose boundaries are the only places a rollback point can cut
-        /// it exactly (see `session_feed`). `None` before a model is loaded.
-        pub(crate) fn prefill_grid(&self, n: usize) -> Option<crate::session_feed::PrefillGrid> {
-            let model = self.model.as_ref()?;
-            Some(crate::session_feed::PrefillGrid {
-                chunk: prefill_chunk_decision(model, n).chunk,
-            })
+        /// Where a bulk prefill cuts its chunks, the only places a rollback
+        /// point can cut it exactly (see `session_feed`). `None` before a model
+        /// is loaded.
+        pub(crate) fn prefill_grid(&self) -> Option<crate::session_feed::PrefillGrid> {
+            Some(qwen35_prefill_grid(self.model.as_ref()?))
         }
 
         /// Remember `seq_id`'s current state as the point [`Self::rollback`]
@@ -2002,9 +2002,10 @@ mod imp {
         }
 
         /// Write `seq_id`'s rollback point to the disk tier under the content
-        /// key of `prefix` — the tokens it holds — on prefill grid `chunk`, so
-        /// a later process (or this one, after the session was evicted) can
-        /// resume the conversation from there instead of prefilling it again.
+        /// key of `prefix` — the tokens it holds — and the grid `grid_key`
+        /// names, so a later process (or this one, after the session was
+        /// evicted) can resume the conversation from there instead of
+        /// prefilling it again.
         ///
         /// The entry this seq last wrote or was restored from is removed once the
         /// new one is queued, so a conversation keeps one state on disk, the
@@ -2019,12 +2020,12 @@ mod imp {
             &mut self,
             seq_id: u64,
             prefix: &[u32],
-            chunk: usize,
+            grid_key: u64,
         ) -> Result<bool> {
             let Some(disk) = self.disk.as_ref() else {
                 return Ok(false);
             };
-            let key = crate::kv_disk::point_key(chunk, prefix);
+            let key = crate::kv_disk::point_key(grid_key, prefix);
             if disk.contains(&key) {
                 return Ok(false);
             }
@@ -2103,10 +2104,10 @@ mod imp {
         }
 
         /// Start `seq_id` from the longest session state on disk that `prompt`
-        /// continues, and leave a rollback point there. Only states on this
-        /// prompt's own prefill grid are candidates — each grid point's content
-        /// key is probed from the latest back — so feeding the rest of the
-        /// prompt from there is exactly a cold prefill's computation.
+        /// continues, and leave a rollback point there. Only states at cuts of
+        /// the prefill grid are candidates — each cut's content key is probed
+        /// from the latest back — so feeding the rest of the prompt from there
+        /// is exactly a cold prefill's computation.
         ///
         /// Returns the restored length, or `None` when the tier is off or
         /// nothing matches. A state that fails to load is logged and skipped.
@@ -2118,12 +2119,13 @@ mod imp {
             if self.disk.is_none() || self.seqs.contains_key(&seq_id) {
                 return Ok(None);
             }
-            let Some(chunk) = self.prefill_grid(prompt.len()).map(|g| g.chunk.max(1)) else {
+            let Some(grid) = self.prefill_grid() else {
                 return Ok(None);
             };
-            let last = prompt.len().saturating_sub(1) / chunk * chunk;
-            for at in (chunk..=last).rev().step_by(chunk) {
-                let key = crate::kv_disk::point_key(chunk, &prompt[..at]);
+            let mut cuts = grid.cuts(0, prompt.len());
+            cuts.pop();
+            for at in cuts.into_iter().rev() {
+                let key = crate::kv_disk::point_key(grid.key_at(at), &prompt[..at]);
                 let disk = self
                     .disk
                     .as_mut()
@@ -2329,14 +2331,16 @@ mod imp {
         use super::*;
         use std::process::{Command, Output};
 
-        /// An extend over a cached prefix attends to the prefix too, so the
-        /// scores clamp has to count it.
+        /// An extend over a cached prefix attends to the prefix too, so its
+        /// pieces are sized at the position the cache holds: 4096 cached keys
+        /// shrink the chunk a call over an empty cache gets whole.
         #[test]
         #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-        fn the_chunk_clamp_counts_the_cached_prefix() {
+        fn a_call_is_cut_at_the_position_the_cache_holds() {
+            let grid = crate::prefill_budget::PrefillGrid::new(1024, 10_000_000, 1);
             let mut cache = NativePromptCache::new(&[true, false], 2);
-            assert_eq!(chunked_call_kv_upper(&cache, 10), 10);
-            let block = Array::zeros::<f32>(&[1, 2, 40, 8]).unwrap();
+            assert_eq!(call_pieces(grid, &cache, 2048), vec![1024, 2048]);
+            let block = Array::zeros::<f32>(&[1, 2, 4096, 8]).unwrap();
             cache
                 .layer_mut(1)
                 .unwrap()
@@ -2344,7 +2348,15 @@ mod imp {
                 .unwrap()
                 .update_and_fetch(&block, &block)
                 .unwrap();
-            assert_eq!(chunked_call_kv_upper(&cache, 10), 50);
+            let after = call_pieces(grid, &cache, 2048);
+            assert_eq!(
+                after,
+                grid.pieces(4096, 6144)
+                    .into_iter()
+                    .map(|e| e - 4096)
+                    .collect::<Vec<_>>()
+            );
+            assert!(after[0] < 1024, "{after:?}");
         }
 
         #[test]
@@ -3352,7 +3364,7 @@ mod imp {
             ))
         }
 
-        pub(crate) fn prefill_grid(&self, _n: usize) -> Option<crate::session_feed::PrefillGrid> {
+        pub(crate) fn prefill_grid(&self) -> Option<crate::session_feed::PrefillGrid> {
             None
         }
 
@@ -3372,7 +3384,7 @@ mod imp {
             &mut self,
             _seq_id: u64,
             _prefix: &[u32],
-            _chunk: usize,
+            _grid_key: u64,
         ) -> Result<bool> {
             Ok(false)
         }

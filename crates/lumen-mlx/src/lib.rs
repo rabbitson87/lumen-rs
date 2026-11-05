@@ -492,11 +492,11 @@ trait Runner {
     /// snapshot. Snapshot is *not* consumed — multi-fork supported. Returns
     /// the position of the new seq.
     fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize>;
-    /// The shape of a bulk prefill of `n` tokens, so a caller that feeds a
-    /// prompt in pieces can keep it. `None` when this runner cannot say — and
-    /// then no caller cuts a prefill to place a rollback point, because it
-    /// could not tell whether the cut is exact.
-    fn prefill_grid(&self, _n: usize) -> Option<session_feed::PrefillGrid> {
+    /// Where a bulk prefill cuts its chunks, so a caller that feeds a prompt in
+    /// pieces can keep them. `None` when this runner cannot say — and then no
+    /// caller cuts a prefill to place a rollback point, because it could not
+    /// tell whether the cut is exact.
+    fn prefill_grid(&self) -> Option<session_feed::PrefillGrid> {
         None
     }
     /// Remember `seq_id`'s current state as the point [`Runner::rollback`]
@@ -593,8 +593,8 @@ impl Runner for NativeMlxRunner {
         NativeMlxRunner::fork_from_snapshot(self, snapshot_id, dst_seq_id)
     }
 
-    fn prefill_grid(&self, n: usize) -> Option<session_feed::PrefillGrid> {
-        NativeMlxRunner::prefill_grid(self, n)
+    fn prefill_grid(&self) -> Option<session_feed::PrefillGrid> {
+        NativeMlxRunner::prefill_grid(self)
     }
 
     fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
@@ -783,7 +783,7 @@ impl Runner for TokenScriptRunner {
         let pos = *pos;
         Ok((self.fed(), pos))
     }
-    fn prefill_grid(&self, _n: usize) -> Option<session_feed::PrefillGrid> {
+    fn prefill_grid(&self) -> Option<session_feed::PrefillGrid> {
         self.grid
     }
     fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
@@ -1142,8 +1142,8 @@ impl session::SessionRunner for RunnerImpl {
     fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
         self.as_runner_mut().remove_seq(seq_id)
     }
-    fn prefill_grid(&self, n: usize) -> Option<session_feed::PrefillGrid> {
-        self.as_runner().prefill_grid(n)
+    fn prefill_grid(&self) -> Option<session_feed::PrefillGrid> {
+        self.as_runner().prefill_grid()
     }
     fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
         self.as_runner_mut().mark_rollback(seq_id)
@@ -1165,13 +1165,13 @@ impl session::SessionRunner for RunnerImpl {
         let _ = (seq_id, fresh, tokens, mark);
         Ok(None)
     }
-    fn persist_point(&mut self, seq_id: u64, prefix: &[u32], chunk: usize) -> Result<bool> {
+    fn persist_point(&mut self, seq_id: u64, prefix: &[u32], grid_key: u64) -> Result<bool> {
         #[cfg(feature = "mlx-native")]
         if let Self::Qwen4Exp(r) = self {
-            return r.persist_point(seq_id, prefix, chunk);
+            return r.persist_point(seq_id, prefix, grid_key);
         }
         self.native_mut()
-            .map_or(Ok(false), |r| r.persist_point(seq_id, prefix, chunk))
+            .map_or(Ok(false), |r| r.persist_point(seq_id, prefix, grid_key))
     }
     fn restore_point(&mut self, seq_id: u64, prompt: &[u32]) -> Result<Option<usize>> {
         #[cfg(feature = "mlx-native")]
@@ -7920,7 +7920,7 @@ mod tests {
         b.preserves_thinking_on_replay = preserves_thinking;
         let r = b.script_runner();
         r.feed_token = Some(CHAT_BLUE);
-        r.grid = Some(session_feed::PrefillGrid { chunk: 64 });
+        r.grid = Some(session_feed::PrefillGrid::new(64, u64::MAX, 1));
         b
     }
 
@@ -7980,6 +7980,33 @@ mod tests {
                 "turn two must wind back to the point and feed only what follows it"
             );
             assert_eq!(b.session_count(), 1, "the turn continues its own session");
+        });
+    }
+
+    /// A point is resumed only on the grid it was cut on. Here the grid goes
+    /// from 64-token chunks to 32 between the turns (another chunk or scores
+    /// budget). Position 64 is a cut of both, but on the new grid it is the end
+    /// of two 32-token calls, not one 64-token call, so the state there is one
+    /// no cold prefill on the new grid reaches: the turn must prefill cold.
+    #[test]
+    fn a_point_cut_on_another_grid_is_not_resumed() {
+        session_rollback_enabled::with(true, || {
+            let mut b = chat_backend(false);
+            let system = "S ".repeat(80);
+            chat_turn(&mut b, &[("system", system.as_str()), ("user", "U1")]);
+            b.script_runner().grid = Some(session_feed::PrefillGrid::new(32, u64::MAX, 1));
+            let turn2 = [
+                ("system", system.as_str()),
+                ("user", "U1"),
+                ("assistant", "Blue"),
+                ("user", "U2"),
+            ];
+            let feeds = chat_turn(&mut b, &turn2);
+            assert!(
+                !feeds.iter().any(|f| matches!(f, ScriptFeed::Rollback(_))),
+                "a point from another grid was resumed: {feeds:?}"
+            );
+            assert_eq!(feeds.first(), Some(&ScriptFeed::Prefill(32)), "{feeds:?}");
         });
     }
 
@@ -8696,9 +8723,9 @@ mod tests {
 
         let grid = m
             .runner
-            .prefill_grid(4096)
+            .prefill_grid()
             .expect("native runner reports its grid");
-        let chunk = grid.chunk;
+        let chunk = grid.requested();
         eprintln!("chunk={chunk}");
         for target in [
             600,
@@ -8804,7 +8831,7 @@ mod tests {
 
         // A system prompt two chunks and a bit long, so the point lands on the
         // second grid boundary and the restored state spans more than one chunk.
-        let chunk = m.runner.prefill_grid(4096).expect("grid").chunk;
+        let chunk = m.runner.prefill_grid().expect("grid").requested();
         let mut system = String::from("The printing press changed how ideas spread across Europe.");
         let user = "Summarize the text above in two sentences.";
         while m
@@ -8871,6 +8898,133 @@ mod tests {
         assert_eq!(
             resumed2, cold2,
             "a turn restored from disk must equal a cold prefill (point {point})"
+        );
+        m.drop_session("b");
+        native(m).set_disk_root_for_test(None);
+    }
+
+    /// A long conversation resumes from its rollback point, in RAM and from
+    /// disk, exactly as its next turn prefills cold.
+    ///
+    /// Past where the scores budget binds (about 61K tokens at 16 heads, 41K at
+    /// 24) the chunks shrink. When they shrank by the prompt's whole length,
+    /// each turn of a long conversation was cut on its own grid: the point turn
+    /// one left was not a cut of turn two's cold prefill, a resume from it fed
+    /// the prefix in other chunks than a cold run, and its disk key, which names
+    /// the grid, was never looked up again. Turn one here is ~66K tokens.
+    #[test]
+    #[ignore = "needs a real Qwen checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn a_long_conversation_resumes_on_the_grid_of_its_cold_prefill() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            return;
+        };
+        let target: usize = std::env::var("LUMEN_TEST_LONG_PROMPT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(66_000);
+        let n_gen = 48;
+        let mut backend = MlxBackend::load(&dir).expect("load checkpoint");
+        let MlxBackend::Qwen35Family(m) = &mut backend else {
+            panic!("the session grid concerns the Qwen path");
+        };
+        let run = |m: &mut MlxQwen35Backend, msgs: &[(String, String)], sid: &str| {
+            session_rollback_enabled::with(true, || {
+                m.chat_streaming_session(
+                    msgs,
+                    n_gen,
+                    false,
+                    Some(sid),
+                    |_| ControlFlow::Continue(()),
+                    None,
+                )
+                .expect("chat turn")
+            })
+        };
+        fn native(m: &mut MlxQwen35Backend) -> &mut NativeMlxRunner {
+            m.runner.native_mut().expect("native runner")
+        }
+
+        // A system prompt of `target` tokens, sized from a measured repeat.
+        let user = "Summarize the text above in two sentences.";
+        let unit = " The printing press changed how ideas spread across the cities of Europe.";
+        let len_of = |m: &MlxQwen35Backend, system: &str| {
+            m.build_chat_input(
+                &[
+                    ("system".into(), system.to_string()),
+                    ("user".into(), user.into()),
+                ],
+                false,
+                None,
+            )
+            .expect("prompt")
+            .len()
+        };
+        let mut reps = target / 12;
+        let system = loop {
+            let system = unit.repeat(reps);
+            let n = len_of(m, &system);
+            if n >= target {
+                break system;
+            }
+            reps = reps * target / n.max(1) + 8;
+        };
+        let turn1 = vec![
+            ("system".to_string(), system),
+            ("user".to_string(), user.to_string()),
+        ];
+        eprintln!("turn one: {} tokens", len_of(m, &turn1[0].1));
+
+        // Turn two cold, and turn two resumed in RAM from turn one's point.
+        native(m).set_disk_root_for_test(None);
+        let reply1 = run(m, &turn1, "warm");
+        let point = m
+            .sessions
+            .get("warm")
+            .and_then(|s| s.rollback_len)
+            .expect("a rollback point");
+        let mut turn2 = turn1.clone();
+        turn2.push(("assistant".into(), reply1.clone()));
+        turn2.push(("user".into(), "Now say it in one sentence.".into()));
+        let cold2 = run(m, &turn2, "cold");
+        m.drop_session("cold");
+        let p2 = m.build_chat_input(&turn2, false, None).expect("prompt 2");
+        assert!(
+            m.sessions
+                .get("warm")
+                .expect("session kept")
+                .resumes_at(&p2)
+                == Some(point),
+            "turn two must continue turn one's point ({point})"
+        );
+        let resumed2 = run(m, &turn2, "warm");
+        m.drop_session("warm");
+        assert_eq!(
+            resumed2, cold2,
+            "a resumed long turn must equal its cold prefill (point {point})"
+        );
+
+        // Turn one with the disk tier on persists its point, and turn two,
+        // with nothing in RAM, restores it and answers as cold.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        native(m).set_disk_root_for_test(Some(tmp.path()));
+        assert_eq!(
+            run(m, &turn1, "a"),
+            reply1,
+            "turn one changed with the disk tier on"
+        );
+        m.drop_session("a");
+        let probe = 1_000_000;
+        let restored = native(m).restore_point(probe, &p2).expect("restore");
+        native(m).remove_seq(probe).ok();
+        assert_eq!(
+            restored,
+            Some(point),
+            "turn two must restore the point turn one persisted"
+        );
+        assert_eq!(
+            run(m, &turn2, "b"),
+            cold2,
+            "a long turn restored from disk must equal its cold prefill (point {point})"
         );
         m.drop_session("b");
         native(m).set_disk_root_for_test(None);
@@ -9642,7 +9796,9 @@ mod tests {
     /// `top_p` on Qwen and installed nothing, while its decode steps read the
     /// installed sampling, so a completion decoded greedily when it asked to
     /// sample, and with the previous request's temperature and seed when it
-    /// asked for greedy.
+    /// asked for greedy. Under `mlx-native` the scripted runner refuses to
+    /// sample, so a sampled completion fails after dispatch; what it
+    /// installed stays visible, as in the image test above.
     #[test]
     fn a_completion_decodes_with_its_own_sampling() {
         let ov = SamplingOverrides::default();
@@ -9650,8 +9806,10 @@ mod tests {
         for (temperature, sampled) in [(0.0, false), (0.8, true)] {
             let mut b = qwen_with_prefix_cache();
             qwen(&mut b).set_sampling(leftover);
-            b.generate(&[CHAT_BLUE, CHAT_BLUE], 4, temperature, 1.0, &ov, None)
-                .expect("a scripted completion");
+            let decoded = b.generate(&[CHAT_BLUE, CHAT_BLUE], 4, temperature, 1.0, &ov, None);
+            if !sampled {
+                decoded.expect("a scripted greedy completion");
+            }
             assert_eq!(
                 qwen(&mut b).sampling.map(|c| c.temperature),
                 sampled.then_some(temperature),

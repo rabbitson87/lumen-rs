@@ -180,6 +180,163 @@ pub fn clamp_chunk(
     }
 }
 
+/// Chunks the grid shrinks to are whole multiples of this many tokens.
+pub const GRID_QUANTUM: usize = 256;
+
+/// Where a bulk prefill cuts its chunks, as a function of position alone.
+///
+/// The chunk starting at position `at` attends to `at` cached keys plus its
+/// own, so its scores buffer is `[heads, q, at + q]`. It is `requested` tokens
+/// while that fits the budget, then the largest multiple of [`GRID_QUANTUM`]
+/// that does, never below [`MIN_CHUNK`] (whose overrun [`clamp_chunk`]
+/// documents). The cuts run from 0, each chunk ending where the next starts.
+///
+/// Nothing here depends on how long the prompt is. That is the point: when
+/// the chunk was sized for a prompt's whole length, a longer prompt was cut
+/// somewhere else from its first token on, and a rollback or disk point left
+/// on an earlier turn's cut was not a cut of the next turn's cold prefill.
+/// Below the position where `requested` stops fitting the cuts are the
+/// multiples of `requested`, as they always were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillGrid {
+    requested: usize,
+    budget_bytes: u64,
+    heads: usize,
+}
+
+impl PrefillGrid {
+    pub fn new(requested: usize, budget_bytes: u64, heads: usize) -> Self {
+        Self {
+            requested: requested.max(1),
+            budget_bytes,
+            heads: heads.max(1),
+        }
+    }
+
+    /// The chunk size while the budget does not bind.
+    pub fn requested(&self) -> usize {
+        self.requested
+    }
+
+    fn fits(&self, at: usize, q: usize) -> bool {
+        projected_scores_bytes(
+            self.heads as u64,
+            q as u64,
+            (at as u64).saturating_add(q as u64),
+        ) <= self.budget_bytes
+    }
+
+    /// The chunk that starts at `at`.
+    pub fn chunk_at(&self, at: usize) -> usize {
+        if self.fits(at, self.requested) {
+            return self.requested;
+        }
+        // The largest q with heads·4·q·(at + q) ≤ budget, from the quadratic,
+        // then nudged onto the exact integer boundary.
+        let cap = self.budget_bytes as f64 / (self.heads as f64 * SCORES_BYTES_PER_ELEM as f64);
+        let a = at as f64;
+        let mut q = (((a * a + 4.0 * cap).sqrt() - a) / 2.0).max(0.0) as usize;
+        while q > 0 && !self.fits(at, q) {
+            q -= 1;
+        }
+        while q + 1 < self.requested && self.fits(at, q + 1) {
+            q += 1;
+        }
+        (q / GRID_QUANTUM * GRID_QUANTUM)
+            .max(MIN_CHUNK)
+            .min(self.requested)
+    }
+
+    /// Where the chunks of `requested` tokens end: the first position whose
+    /// chunk is smaller. Every multiple of `requested` up to it is a cut.
+    fn uniform_end(&self) -> usize {
+        let full_chunks = self.budget_bytes
+            / projected_scores_bytes(
+                self.heads as u64,
+                self.requested as u64,
+                self.requested as u64,
+            )
+            .max(1);
+        usize::try_from(full_chunks)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(self.requested)
+    }
+
+    /// The first cut after `pos`.
+    pub fn cut_after(&self, pos: usize) -> usize {
+        let uniform = self.uniform_end();
+        if pos < uniform {
+            return (pos / self.requested + 1) * self.requested;
+        }
+        let mut at = uniform;
+        while at <= pos {
+            at += self.chunk_at(at);
+        }
+        at
+    }
+
+    /// The last cut at or before `pos` (0 is a cut).
+    pub fn cut_at_or_before(&self, pos: usize) -> usize {
+        let uniform = self.uniform_end();
+        if pos < uniform {
+            return pos / self.requested * self.requested;
+        }
+        let mut at = uniform;
+        loop {
+            let next = at + self.chunk_at(at);
+            if next > pos {
+                return at;
+            }
+            at = next;
+        }
+    }
+
+    pub fn is_cut(&self, pos: usize) -> bool {
+        self.cut_at_or_before(pos) == pos
+    }
+
+    /// The cuts in `(start, end)`, ascending, then `end`.
+    pub fn cuts(&self, start: usize, end: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut at = self.cut_after(start);
+        while at < end {
+            out.push(at);
+            at += self.chunk_at(at);
+        }
+        out.push(end);
+        out
+    }
+
+    /// Where one bulk call over `[start, end)` ends its pieces: from `start`,
+    /// each as long as the chunk the grid starts at that position, then `end`.
+    /// From a cut these are the grid's own cuts.
+    pub fn pieces(&self, start: usize, end: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut at = start;
+        while at < end {
+            at = (at + self.chunk_at(at)).min(end);
+            out.push(at);
+        }
+        out
+    }
+
+    /// What names this grid in a disk key for the state at cut `at`: the
+    /// chunk size where every chunk before `at` is a full one, which is what
+    /// keys were before the grid shrank by position, so those states keep
+    /// theirs. Past that, the whole grid.
+    pub fn key_at(&self, at: usize) -> u64 {
+        if at <= self.uniform_end() {
+            return self.requested as u64;
+        }
+        let mix = |v: u64| {
+            let v = (v ^ (v >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            let v = (v ^ (v >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            v ^ (v >> 31)
+        };
+        mix(mix(mix(self.requested as u64) ^ self.budget_bytes) ^ self.heads as u64) | 1 << 63
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +365,127 @@ mod tests {
     fn projection_saturates_instead_of_wrapping() {
         assert_eq!(projected_scores_bytes(2, 3, 5), 120);
         assert_eq!(projected_scores_bytes(u64::MAX, u64::MAX, 2), u64::MAX);
+    }
+
+    /// Every cut from 0 through `end`, by walking the grid one chunk at a time.
+    fn walk(grid: &PrefillGrid, end: usize) -> Vec<usize> {
+        let mut cuts = vec![0];
+        while *cuts.last().unwrap() < end {
+            let at = *cuts.last().unwrap();
+            cuts.push(at + grid.chunk_at(at));
+        }
+        cuts
+    }
+
+    /// Grids at the shipping budget for 16 and 24 heads, and small ones whose
+    /// budget binds within a few chunks so every branch is walked quickly.
+    fn grids() -> Vec<PrefillGrid> {
+        vec![
+            PrefillGrid::new(2048, DEFAULT_SCORES_BUDGET_BYTES, 16),
+            PrefillGrid::new(2048, DEFAULT_SCORES_BUDGET_BYTES, 24),
+            PrefillGrid::new(4096, 3_000_000_000, 40),
+            PrefillGrid::new(1000, 400_000_000, 8),
+            PrefillGrid::new(2048, 0, 16),
+        ]
+    }
+
+    /// Each chunk is `requested` while that fits, then the largest multiple
+    /// of the quantum that fits, and only the floor goes over the budget.
+    #[test]
+    fn each_chunk_is_the_largest_that_fits_where_it_starts() {
+        for grid in grids() {
+            for at in walk(&grid, 300_000) {
+                let q = grid.chunk_at(at);
+                let ctx = format!("{grid:?} at={at} q={q}");
+                assert!(q >= 1 && q <= grid.requested(), "{ctx}");
+                if q == grid.requested() {
+                    assert!(grid.fits(at, q), "{ctx}");
+                    continue;
+                }
+                assert!(q % GRID_QUANTUM == 0, "{ctx}");
+                assert!(
+                    grid.fits(at, q) || q == MIN_CHUNK,
+                    "{ctx}: over budget above the floor"
+                );
+                assert!(
+                    !grid.fits(at, q + GRID_QUANTUM),
+                    "{ctx}: a larger chunk fits"
+                );
+            }
+        }
+    }
+
+    /// Below where `requested` stops fitting, the cuts are its multiples:
+    /// the grid every prompt was cut on before, so short and medium prompts
+    /// prefill exactly as they did.
+    #[test]
+    fn below_the_bound_the_cuts_are_multiples_of_the_chunk() {
+        let grid = PrefillGrid::new(2048, DEFAULT_SCORES_BUDGET_BYTES, 16);
+        assert_eq!(grid.uniform_end(), 29 * 2048);
+        let cuts = walk(&grid, 200_000);
+        for (k, &c) in cuts.iter().take(30).enumerate() {
+            assert_eq!(c, k * 2048);
+        }
+        assert!(
+            cuts[31] - cuts[30] < 2048,
+            "the chunk after the bound shrinks"
+        );
+        // A prompt that ends before the first short chunk would is cut as before.
+        assert_eq!(grid.cuts(0, 61_000).len(), 30);
+        assert_eq!(*grid.cuts(0, 61_000).last().unwrap(), 61_000);
+    }
+
+    /// The lookups agree with walking the grid, at, between and around cuts.
+    #[test]
+    fn the_lookups_agree_with_walking_the_grid() {
+        for grid in grids() {
+            let cuts = walk(&grid, 300_000);
+            for w in cuts.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                for pos in [a, a + 1, (a + b) / 2, b - 1] {
+                    if pos >= b {
+                        continue;
+                    }
+                    let ctx = format!("{grid:?} pos={pos} between {a} and {b}");
+                    assert_eq!(grid.cut_at_or_before(pos), a, "{ctx}");
+                    assert_eq!(grid.cut_after(pos), b, "{ctx}");
+                    assert_eq!(grid.is_cut(pos), pos == a, "{ctx}");
+                }
+            }
+            let end = cuts[cuts.len() / 2] + 7;
+            let inside: Vec<usize> = cuts
+                .iter()
+                .copied()
+                .filter(|&c| c > 0 && c < end)
+                .chain([end])
+                .collect();
+            assert_eq!(grid.cuts(0, end), inside, "{grid:?}");
+            assert_eq!(
+                grid.pieces(0, end),
+                inside,
+                "{grid:?}: pieces from a cut are its cuts"
+            );
+        }
+    }
+
+    /// A state's disk key names its grid by the chunk size wherever every
+    /// chunk before it is a full one, so states written before the grid
+    /// depended on position keep their keys; past that, grids that cut
+    /// differently get different keys.
+    #[test]
+    fn a_disk_key_names_the_grid_a_state_was_cut_on() {
+        let a = PrefillGrid::new(2048, DEFAULT_SCORES_BUDGET_BYTES, 16);
+        let b = PrefillGrid::new(2048, DEFAULT_SCORES_BUDGET_BYTES, 24);
+        assert_eq!(a.key_at(20 * 2048), 2048);
+        assert_eq!(b.key_at(10 * 2048), 2048);
+        let past = a.cut_after(a.uniform_end());
+        assert_ne!(a.key_at(past), 2048);
+        assert_ne!(a.key_at(past), b.key_at(past));
+        assert_eq!(
+            a.key_at(past),
+            a.key_at(a.cut_after(past)),
+            "one key per grid"
+        );
     }
 
     #[test]

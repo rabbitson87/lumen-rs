@@ -1415,6 +1415,46 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "prefill-grid-sized-by-prompt-length",
+        symptom: "once the scores budget bound (about 61K tokens at 16 heads, \
+                  41K at 24) the prefill chunk was sized for the prompt's whole \
+                  length, so each turn of a long conversation was cut on its own \
+                  grid: the point turn one left was not a cut of turn two's cold \
+                  prefill, and its disk key, which names the grid, was never \
+                  looked up again. Measured on Qwen3.5-9B with a 71.5K-token \
+                  conversation: turn two's disk restore missed (None, point \
+                  69880); sized by position it restores at 71424, re-feeding \
+                  168 tokens",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        while at < end {\n            out.push(at);\n            at += self.chunk_at(at);",
+            replace: "        while at < end {\n            out.push(at);\n            at += self.chunk_at(end); // defect: sized by the prompt's length",
+        }],
+        guards: &[mlx_ungated_test(
+            "prefill_budget_faults",
+            "a_longer_prompt_is_cut_where_its_beginning_was",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "session-point-on-another-grid",
+        symptom: "a session resumed from its rollback point whenever the prompt \
+                  continued the tokens before it, without asking whether the \
+                  runner still cut on the grid the point was cut on; after a \
+                  chunk or scores-budget change the point is a state no cold \
+                  prefill on the new grid reaches, and the resumed turn differs \
+                  from a cold one",
+        revert: &[Mutation {
+            path: MLX,
+            find: "s.point_grid == grid && grid.is_some_and(|g| g.is_cut(kept))",
+            replace: "grid.is_some_and(|g| g.is_cut(kept)) /* defect: the grid is not compared */",
+        }],
+        guards: &[core_mlx_lib(
+            "tests::a_point_cut_on_another_grid_is_not_resumed",
+        )],
+        ..PLAIN
+    },
+    Defect {
         name: "kv-disk-alloc-bomb",
         symptom: "a corrupt KV-disk record's u64 payload length was allocated \
                   unvalidated — a 280 TB request that ABORTS the process \
@@ -1617,11 +1657,11 @@ static DEFECTS: &[Defect] = &[
                   chunk keys without ever being clamped",
         revert: &[Mutation {
             path: MLX,
-            find: "        cache.full_attn_offset() + n\n",
-            replace: "        n // defect: the cached prefix is not counted\n",
+            find: "        let base = cache.full_attn_offset();\n        grid.pieces(base, base + n)",
+            replace: "        let base = 0; // defect: the cached prefix is not counted\n        grid.pieces(base, base + n)",
         }],
         guards: &[mlx(
-            "runner_native::imp::tests::the_chunk_clamp_counts_the_cached_prefix",
+            "runner_native::imp::tests::a_call_is_cut_at_the_position_the_cache_holds",
         )],
         extra: &["--ignored"],
         ..PLAIN
@@ -1804,14 +1844,15 @@ static DEFECTS: &[Defect] = &[
                   split-K splits Qwen3.5-9B's 32-output linear-attention gate \
                   projections 8 ways for a 2048-row chunk and 64 for 32 rows, \
                   so a dense turn cut 32 rows before its header changed its \
-                  reply (it was exact on MLX 0.30); on a mixture-of-experts \
-                  model GatherQMM tiles across the routed rows, and a 32-row \
-                  piece changed a Qwen3.6-35B-A3B reply after ~30 words. Points \
-                  go on the bulk pass's chunk boundaries only",
+                  reply (it was exact on MLX 0.30); a 32-row piece also changed \
+                  a Qwen3.6-35B-A3B reply after ~30 words (put down to \
+                  GatherQMM; tests/row_invariance.rs points at head-dim-256 \
+                  attention instead). Points go on the bulk pass's chunk \
+                  boundaries only",
         revert: &[Mutation {
             path: MLX,
-            find: "    let cuts: Vec<usize> = (start / chunk + 1..)\n        .map(|k| k * chunk)\n        .take_while(|&c| c < end)\n        .chain([end])\n        .collect();",
-            replace: "    let mark = boundary.saturating_sub(32).max(mark); // defect: cuts inside the chunk\n    let mut cuts: Vec<usize> = (start / chunk + 1..)\n        .map(|k| k * chunk)\n        .take_while(|&c| c < end)\n        .chain([mark, end])\n        .collect();\n    cuts.sort_unstable();\n    cuts.dedup();",
+            find: "    FeedPlan {\n        cuts: grid.cuts(start, end),\n        mark: Some(mark),\n    }",
+            replace: "    let mark = boundary.saturating_sub(32).max(mark); // defect: cuts inside the chunk\n    let mut cuts = grid.cuts(start, end);\n    cuts.push(mark);\n    cuts.sort_unstable();\n    cuts.dedup();\n    FeedPlan {\n        cuts,\n        mark: Some(mark),\n    }",
         }],
         guards: &[
             core_mlx_lib(
@@ -2189,7 +2230,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "safetensors-silent-truncation") => "qwen3_5_moe.rs",
         (_, "gemma4-safetensors-silent-truncation") => "gemma4_moe.rs",
         (_, "mtp-norm-double-fold") => "qwen3_5_mtp.rs",
-        (_, "prefill-budget-rounds-to-zero") => "prefill_budget.rs",
+        (_, "prefill-budget-rounds-to-zero") | (_, "prefill-grid-sized-by-prompt-length") => {
+            "prefill_budget.rs"
+        }
         (_, "gemma4-config-null-moe-fields") => "gemma4_config.rs",
         (_, "gemma-nonstreaming-grammar")
         | (_, "qwen-first-token-mask")
@@ -2269,7 +2312,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "rotating-cache-trims-against-offset") => "native_cache.rs",
         (_, "windowed-kernel-used-unchecked") => "gemma4_moe.rs",
         (_, "chat-turn-header-defeats-session-reuse")
-        | (_, "session-reuse-needs-a-nonstandard-field") => "session.rs",
+        | (_, "session-reuse-needs-a-nonstandard-field")
+        | (_, "session-point-on-another-grid") => "session.rs",
         (_, "rollback-cut-inside-a-chunk") => "session_feed.rs",
         (_, "bundled-server-writes-its-metallib-into-the-app") => "metallib.rs",
         (_, "release-bundle-ships-no-metallib") => "release.yml",
