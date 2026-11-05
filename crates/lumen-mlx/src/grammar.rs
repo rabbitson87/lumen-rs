@@ -215,6 +215,11 @@ pub struct Gemma4GrammarState {
     /// triggering entirely — the grammar then only ever constrains in
     /// [`GrammarMode::Eager`].
     lazy_trigger: Option<LazyTrigger>,
+    /// A [`GrammarMode::Lazy`] grammar whose call has completed waits for the
+    /// trigger again instead of finishing. Only where the grammar ends at the
+    /// call's own closer (Qwen's `</tool_call>`): Gemma 4's ends one token
+    /// before `<tool_call|>`, so a matcher waiting there would see the closer.
+    rearm: bool,
 }
 
 /// The token that activates a [`GrammarMode::Lazy`] grammar, and whether that
@@ -257,6 +262,7 @@ impl Gemma4GrammarState {
                 // emitted before it and is not part of the grammar.
                 in_grammar: false,
             }),
+            rearm: false,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -294,6 +300,7 @@ impl Gemma4GrammarState {
             // The whole assistant message is the JSON value — there is no
             // opener token to wait for, so this variant has no lazy trigger.
             lazy_trigger: None,
+            rearm: false,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -368,6 +375,7 @@ impl Gemma4GrammarState {
                 // it and is not a terminal in this grammar.
                 in_grammar: false,
             }),
+            rearm: false,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -397,14 +405,15 @@ impl Gemma4GrammarState {
     /// every required key is mandatory, so a quantized 35B can't emit
     /// `<function=read></function>` with empty params (the empty-param defect).
     ///
-    /// `opener_token` is the id flipped on in [`GrammarMode::Lazy`] when first
-    /// sampled. Qwen's `<tool_call>` opener can tokenize to multiple ids, so
-    /// the Lazy/auto path should NOT rely on a single trigger; prefer
-    /// [`GrammarMode::Eager`] with [`observe_prefill`] for the
-    /// `tool_choice=required`/named path where the opener is prefilled. The
-    /// argument is kept for completeness (and for an exact single-token opener
-    /// if the tokenizer provides one); pass `None` to leave the Gemma default
-    /// (harmless — it just never matches a Qwen sample).
+    /// `opener_token` is the id that wakes a [`GrammarMode::Lazy`] grammar.
+    /// Every shipped Qwen 3.5/3.6/3.8 tokenizer has `<tool_call>` as one added
+    /// id (248058), and llguidance gives a non-special added token its plain
+    /// bytes, so that id is also the grammar's first terminal. The loader
+    /// resolves it from the tokenizer and passes `None` when a tokenizer
+    /// splits the opener: a lazy grammar with no trigger never activates.
+    ///
+    /// A lazy grammar re-arms when a call completes, so each call of a
+    /// parallel turn is constrained, not only the first.
     pub fn new_qwen35_xml(
         factory: Arc<ParserFactory>,
         tools: &[Value],
@@ -432,6 +441,7 @@ impl Gemma4GrammarState {
                 token,
                 in_grammar: true,
             }),
+            rearm: true,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -443,6 +453,14 @@ impl Gemma4GrammarState {
     /// sampler to decide whether to compute the mask at all.
     pub fn is_active(&self) -> bool {
         !self.finished && self.matcher.is_some()
+    }
+
+    /// True iff the grammar is constraining now or will once its trigger
+    /// arrives: a lazy grammar waiting for the opener counts.
+    pub fn can_constrain(&self) -> bool {
+        !self.finished
+            && (self.matcher.is_some()
+                || (matches!(self.mode, GrammarMode::Lazy) && self.lazy_trigger.is_some()))
     }
 
     /// Stop constraining, permanently, and let the rest of the generation
@@ -506,9 +524,9 @@ impl Gemma4GrammarState {
     /// Observe a sampled token and advance internal state.
     ///
     /// In lazy mode, this also handles the activation transition: when the
-    /// model emits the trigger token (Gemma 4's `<|tool_call>`, id 48) for
-    /// the first time, the matcher is created so the *next* sampled token is
-    /// constrained.
+    /// model emits the trigger token (Gemma 4's `<|tool_call>`, id 48; Qwen's
+    /// `<tool_call>`) while no call is open, the matcher is created so the
+    /// *next* sampled token is constrained.
     ///
     /// Whether the trigger itself is then fed to that fresh matcher depends on
     /// [`LazyTrigger::in_grammar`]. For Gemma 4 it must not be: the Lark
@@ -538,7 +556,11 @@ impl Gemma4GrammarState {
             m.consume_token(token)
                 .map_err(|e| anyhow!("Matcher::consume_token({token}): {e}"))?;
             if m.is_stopped() {
-                self.finished = true;
+                if self.rearm && matches!(self.mode, GrammarMode::Lazy) {
+                    self.matcher = None;
+                } else {
+                    self.finished = true;
+                }
             }
         }
         Ok(())
@@ -591,8 +613,14 @@ impl Gemma4GrammarState {
         // `Matcher::new` accepts the `Result` directly so internal errors
         // (e.g. grammar compile failures) are kept on the matcher and
         // surfaced via `is_error()` / `get_error()` rather than panicking.
+        let started = std::time::Instant::now();
         let parser_result = self.factory.create_parser(self.schema.clone());
         let matcher = Matcher::new(parser_result);
+        eprintln!(
+            "[grammar] {:?} matcher built in {:.2} ms",
+            self.mode,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
         if matcher.is_error() {
             let err = matcher
                 .get_error()
@@ -828,19 +856,24 @@ fn qwen35_lark_grammar_string(tools: &[Value], calls: ToolCalls) -> Result<Strin
     for (rule_name, rule_rhs) in &body_rules {
         grammar.push_str(&format!("{rule_name}: {rule_rhs}\n"));
     }
-    // A parameter value: any bytes (incl. newlines) up to the framing newline
-    // that precedes `</parameter>`. Non-greedy so the FIRST `\n</parameter>`
-    // closes the value. The framing `\n` on each side matches the renderer's
+    // A parameter value and its closer: any bytes (incl. newlines), ended by
+    // the FIRST `\n</parameter>\n`, which is where the parser ends a value
+    // too. The framing `\n` on each side matches the renderer's
     // `<parameter=KEY>\nVALUE\n</parameter>`.
-    grammar.push_str("param_value: /(.|\\n)*?/\n");
+    //
+    // The end has to be the lexeme's own (`suffix`, which makes it lazy). A
+    // `*?` in the regex does not do it: llguidance matches a regex greedily,
+    // so `/(.|\n)*?/` followed by a `"\n</parameter>\n"` literal kept a parse
+    // in which the value had not ended yet. That parse accepts any byte, so
+    // from the first value on the grammar constrained nothing, and it never
+    // finished at `</tool_call>`.
+    grammar.push_str("param_value[suffix=\"\\n</parameter>\\n\"]: /(.|\\n)*/\n");
     // Generic well-formed parameter block — used by the permissive fallback
     // for tools whose schema isn't in the supported subset (unknown
     // `properties` shape or non-identifier keys). The key name is left free
     // (`/[^>\\n]*/`) but the surrounding tags are still enforced, so even the
     // fallback can't degenerate into unstructured output.
-    grammar.push_str(
-        "param_block: \"<parameter=\" /[^>\\n]*/ \">\\n\" param_value \"\\n</parameter>\\n\"\n",
-    );
+    grammar.push_str("param_block: \"<parameter=\" /[^>\\n]*/ \">\\n\" param_value\n");
     Ok(grammar)
 }
 
@@ -865,7 +898,7 @@ fn qwen35_body_for_object_schema(schema: &Value) -> Result<String> {
         rendered.insert(
             key.clone(),
             format!(
-                "({} param_value \"\\n</parameter>\\n\")",
+                "({} param_value)",
                 lark_literal(&format!("<parameter={key}>\n"))
             ),
         );
@@ -1237,34 +1270,81 @@ fn lark_const_literal(c: &Value) -> String {
     }
 }
 
-/// Build a real Gemma 4 vocab-aware [`TokEnv`] from `tokenizer.json` so
-/// llguidance masks line up with the model's actual token ids (vocab
-/// 262144). EOS is set to `<eos>` (id 1) and the chat-style turn delimiter
-/// `<turn|>` (id 106) is registered as `tok_end_of_turn` so the grammar
-/// stop machinery recognises both.
-pub fn build_tok_env_from_tokenizer_json<P: AsRef<Path>>(path: P) -> Result<TokEnv> {
+/// The ids llguidance treats as the end of the output.
+///
+/// They are ids in one tokenizer, so they come from the model the factory is
+/// built for. Gemma's `<eos>` is 1 and its `<turn|>` is 106; in Qwen's
+/// vocabulary those ids are `"` and `®`, which a grammar would then offer as
+/// the way to finish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndTokens {
+    pub eos: u32,
+    pub end_of_turn: Option<u32>,
+}
+
+impl EndTokens {
+    /// Gemma 4: `<eos>` and the `<turn|>` that ends an assistant turn.
+    pub const GEMMA4: Self = Self {
+        eos: TOK_EOS,
+        end_of_turn: Some(TOK_TURN_CLOSE),
+    };
+
+    /// A model's end-of-sequence ids, as its loader reports them: the first is
+    /// the one llguidance ends on, the second (if any) the end of a turn.
+    pub fn from_eos_ids(ids: &[u32]) -> Option<Self> {
+        let (&eos, rest) = ids.split_first()?;
+        Some(Self {
+            eos,
+            end_of_turn: rest.first().copied(),
+        })
+    }
+}
+
+/// Build a vocab-aware [`TokEnv`] from `tokenizer.json` so llguidance masks
+/// line up with the model's actual token ids, ending on `end`.
+pub fn build_tok_env_from_tokenizer_json<P: AsRef<Path>>(
+    path: P,
+    end: EndTokens,
+) -> Result<TokEnv> {
     let raw = std::fs::read_to_string(path.as_ref())
         .with_context(|| format!("read tokenizer.json: {:?}", path.as_ref()))?;
     let tj: Value = serde_json::from_str(&raw).context("parse tokenizer.json")?;
+    tok_env_from_tokenizer_value(&tj, end)
+}
+
+fn tok_env_from_tokenizer_value(tj: &Value, end: EndTokens) -> Result<TokEnv> {
     let token_bytes =
-        token_bytes_from_tokenizer_json(&tj).context("token_bytes_from_tokenizer_json")?;
+        token_bytes_from_tokenizer_json(tj).context("token_bytes_from_tokenizer_json")?;
     if token_bytes.is_empty() {
         return Err(anyhow!("tokenizer.json produced empty token table"));
     }
-    let mut info = TokRxInfo::new(token_bytes.len() as u32, TOK_EOS);
-    info.tok_end_of_turn = Some(TOK_TURN_CLOSE);
+    let mut info = TokRxInfo::new(token_bytes.len() as u32, end.eos);
+    info.tok_end_of_turn = end.end_of_turn;
     let trie = TokTrie::from(&info, &token_bytes);
     Ok(Arc::new(ApproximateTokEnv::new(trie)) as TokEnv)
 }
 
-/// Build a request-shareable [`ParserFactory`] backed by the real Gemma 4
-/// tokenizer. Construction is the expensive part (~10–50 ms — slicer
-/// precomputes general regex masks once); per-request `create_parser`
-/// calls are cheap. Cache the returned `Arc<ParserFactory>` for the
-/// lifetime of the backend.
-pub fn shared_factory_from_tokenizer<P: AsRef<Path>>(path: P) -> Result<Arc<ParserFactory>> {
-    let tok_env = build_tok_env_from_tokenizer_json(path)?;
-    let factory = ParserFactory::new_simple(&tok_env)
+/// Build a request-shareable [`ParserFactory`] for a model's tokenizer.
+/// Construction is the expensive part (slicer precomputes general regex masks
+/// once); per-request `create_parser` calls are cheap. Cache the returned
+/// `Arc<ParserFactory>` for the lifetime of the backend.
+pub fn shared_factory_from_tokenizer<P: AsRef<Path>>(
+    path: P,
+    end: EndTokens,
+) -> Result<Arc<ParserFactory>> {
+    factory_from_tok_env(&build_tok_env_from_tokenizer_json(path, end)?)
+}
+
+/// [`shared_factory_from_tokenizer`] from an already parsed `tokenizer.json`.
+pub fn shared_factory_from_tokenizer_value(
+    tj: &Value,
+    end: EndTokens,
+) -> Result<Arc<ParserFactory>> {
+    factory_from_tok_env(&tok_env_from_tokenizer_value(tj, end)?)
+}
+
+fn factory_from_tok_env(tok_env: &TokEnv) -> Result<Arc<ParserFactory>> {
+    let factory = ParserFactory::new_simple(tok_env)
         .map_err(|e| anyhow!("ParserFactory::new_simple: {e}"))?;
     Ok(Arc::new(factory))
 }
@@ -1867,6 +1947,75 @@ mod tests {
         state
             .observe(u32::from(b't'))
             .expect("matcher advanced past `<`, so `t` continues `<tool_call>`");
+    }
+
+    fn two_required() -> Vec<Value> {
+        vec![json!({
+            "type": "function",
+            "function": {
+                "name": "w",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
+                    "required": ["a", "b"],
+                },
+            },
+        })]
+    }
+
+    #[test]
+    fn a_required_parameter_after_a_value_is_still_required() {
+        // The value terminal used to be a greedy `/(.|\n)*?/`: a parse in which
+        // `a`'s value had not ended stayed alive, accepted any byte, and so
+        // let the call close without `b`.
+        let mut state = Gemma4GrammarState::new_qwen35_xml(
+            shared_factory_placeholder(),
+            &two_required(),
+            GrammarMode::Eager,
+            None,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build");
+        assert_eq!(
+            feed(
+                &mut state,
+                b"<tool_call>\n<function=w>\n<parameter=a>\nx\n</parameter>\n"
+            ),
+            None
+        );
+        assert_eq!(
+            feed(&mut state, b"</function>"),
+            Some(1),
+            "`</function>` with `b` missing must be rejected at its `/`"
+        );
+    }
+
+    #[test]
+    fn a_qwen_lazy_grammar_finishes_its_call_and_waits_for_the_next() {
+        let mut state = Gemma4GrammarState::new_qwen35_xml(
+            shared_factory_placeholder(),
+            &two_required(),
+            GrammarMode::Lazy,
+            Some(u32::from(b'<')),
+            ToolCalls::OneOrMore,
+        )
+        .expect("build");
+        let call = b"<tool_call>\n<function=w>\n<parameter=a>\nx\n</parameter>\n\
+                     <parameter=b>\ny\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(feed(&mut state, call), None);
+        assert!(
+            !state.is_active() && state.can_constrain(),
+            "after `</tool_call>` the grammar waits for the next opener"
+        );
+        assert_eq!(
+            feed(&mut state, b" ok "),
+            None,
+            "text between calls is free"
+        );
+        state
+            .observe(u32::from(b'<'))
+            .expect("the next opener wakes it");
+        assert!(state.is_active());
     }
 
     /// Drive a grammar with a byte string, returning the index of the first

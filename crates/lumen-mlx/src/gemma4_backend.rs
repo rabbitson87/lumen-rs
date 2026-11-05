@@ -30,7 +30,9 @@ pub(crate) mod imp {
     use crate::chat_io::{BackendStreamEvent, PromptSource};
     use crate::gemma4_chat::imp::{ChatMessage, ChatRole, Gemma4ChatTemplate, RenderOptions};
     use crate::gemma4_critical_correction::CorrectionTable;
-    use crate::grammar::{Gemma4GrammarState, GrammarMode, shared_factory_from_tokenizer};
+    use crate::grammar::{
+        EndTokens, Gemma4GrammarState, GrammarMode, shared_factory_from_tokenizer,
+    };
     use crate::jinja_chat::imp::{JinjaChatTemplate, JinjaRenderOptions};
     use llguidance::ParserFactory;
 
@@ -948,7 +950,7 @@ pub(crate) mod imp {
             self.grammar_factory
                 .get_or_init(|| {
                     let path = self.model_dir.join("tokenizer.json");
-                    match shared_factory_from_tokenizer(&path) {
+                    match shared_factory_from_tokenizer(&path, EndTokens::GEMMA4) {
                         Ok(f) => Some(f),
                         Err(e) => {
                             eprintln!(

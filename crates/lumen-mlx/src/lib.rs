@@ -648,6 +648,23 @@ fn lazy_head_boundary<'a>(
 /// factory for the Qwen 3.6 tool grammar (WS-C #2) — llguidance needs the raw
 /// JSON path (not the in-memory `Tokenizer`) to recover the byte-level token
 /// table its masks index into.
+/// The Qwen tool and thinking markers in `tokenizer`, by id. A tokenizer that
+/// splits one of them leaves the markers read as text and the auto tool
+/// grammar without a trigger, which is what this logs.
+fn tool_markers(tokenizer: Option<&TextTokenizer>) -> crate::qwen3_5_tools::QwenMarkerIds {
+    let Some(tok) = tokenizer else {
+        return Default::default();
+    };
+    let ids = crate::qwen3_5_tools::QwenMarkerIds::resolve(|t| tok.single_token_id(t));
+    if !ids.complete() {
+        eprintln!(
+            "[qwen35-backend] a tool/think marker is not one token in this tokenizer \
+             ({ids:?}): markers are read as text"
+        );
+    }
+    ids
+}
+
 fn resolve_tokenizer_json_path(model_id: &str) -> Result<PathBuf> {
     let local = std::path::Path::new(model_id);
     if local.is_dir() {
@@ -705,6 +722,12 @@ pub(crate) struct TokenScriptRunner {
     feeds: Vec<ScriptFeed>,
     positions: std::collections::HashMap<u64, usize>,
     marks: std::collections::HashMap<u64, usize>,
+    /// Logit-row width for a masked step: the vocabulary a grammar masks.
+    /// Zero until [`TokenScriptRunner::with_vocab`]; a masked step errors then.
+    vocab: usize,
+    /// Every masked step: the token the script had next, and the token the
+    /// mask left the step to choose.
+    masked: Vec<(u32, u32)>,
 }
 
 /// One prompt-side call a [`TokenScriptRunner`] saw, with the token count fed
@@ -730,7 +753,55 @@ impl TokenScriptRunner {
             feeds: Vec::new(),
             positions: std::collections::HashMap::new(),
             marks: std::collections::HashMap::new(),
+            vocab: 0,
+            masked: Vec::new(),
         }
+    }
+
+    /// Answer masked steps over a vocabulary of `vocab` ids.
+    pub(crate) fn with_vocab(&mut self, vocab: usize) -> &mut Self {
+        self.vocab = vocab;
+        self
+    }
+
+    /// The masked steps taken so far, as `(scripted, chosen)`.
+    pub(crate) fn masked_steps(&self) -> &[(u32, u32)] {
+        &self.masked
+    }
+
+    /// A step under a grammar: the script's next token is the model's
+    /// favourite, every other id ties below it, and the step takes the best id
+    /// the mask leaves (the lowest, among ties). A script that breaks the
+    /// grammar therefore shows where the mask overruled it.
+    fn decode_step_masked(
+        &mut self,
+        seq_id: u64,
+        _last_token: u32,
+        mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
+    ) -> Result<(u32, usize)> {
+        if self.vocab == 0 {
+            return Err(anyhow!("token-script: a masked step needs with_vocab"));
+        }
+        let scripted = self.pop();
+        let mut logits = vec![0.0f32; self.vocab];
+        if let Some(l) = logits.get_mut(scripted as usize) {
+            *l = 1.0;
+        }
+        mask(&mut logits)?;
+        let chosen = logits
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.is_finite())
+            .fold(None::<(usize, f32)>, |best, (i, &l)| match best {
+                Some((_, b)) if b >= l => best,
+                _ => Some((i, l)),
+            })
+            .map(|(i, _)| i as u32)
+            .ok_or_else(|| anyhow!("token-script: the mask left no token"))?;
+        self.masked.push((scripted, chosen));
+        let pos = self.positions.entry(seq_id).or_insert(0);
+        *pos += 1;
+        Ok((chosen, *pos))
     }
 
     fn fed(&mut self) -> u32 {
@@ -1053,6 +1124,10 @@ impl RunnerImpl {
         mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
     ) -> Result<(u32, usize)> {
         if let Self::Qwen4Exp(r) = self {
+            return r.decode_step_masked(seq_id, last_token, mask);
+        }
+        #[cfg(test)]
+        if let Self::Scripted(r) = self {
             return r.decode_step_masked(seq_id, last_token, mask);
         }
         self.native_mut()
@@ -1909,6 +1984,44 @@ fn qwen35_tool_grammar_eager_auto() -> bool {
     std::env::var("LUMEN_QWEN35_TOOL_GRAMMAR_EAGER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+lumen_flags::flag! {
+    /// Constrain a Qwen tool call in `tool_choice=auto` once the model opens it.
+    ///
+    /// The model writes freely until it emits `<tool_call>` (one token id in
+    /// every shipped Qwen tokenizer). From that token to `</tool_call>` the call
+    /// is masked by the request's tool grammar: a declared function name, every
+    /// required parameter, none twice. Then the grammar waits for the next
+    /// opener, so each call of a parallel turn is constrained.
+    ///
+    /// **`Behavior`**: it changes which tokens a call can contain. Off, an auto
+    /// request decodes unconstrained, as before; `tool_choice=required` and a
+    /// named tool are constrained either way.
+    pub(crate) qwen_tool_grammar_auto {
+        env: "LUMEN_QWEN_TOOL_GRAMMAR_AUTO",
+        default: false,
+        kind: Behavior,
+    }
+}
+
+lumen_flags::flag! {
+    /// Read Qwen's `<think>`, `</think>` and `<tool_call>` in the reply only when
+    /// the model emits them as their own token ids.
+    ///
+    /// The model can also spell those tags out of ordinary tokens, when it
+    /// quotes a prompt or writes about the format. Matched as text, that
+    /// spelling opened a tool call or a reasoning block the model never meant;
+    /// matched by id, it stays text. Inside a call the framing (`<function=`,
+    /// `<parameter=`, `</tool_call>`) is still read as text.
+    ///
+    /// **`Behavior`**: it changes how such a reply is split. Off, the tags are
+    /// matched as text, as before.
+    pub(crate) qwen_markers_by_id {
+        env: "LUMEN_QWEN_MARKERS_BY_ID",
+        default: true,
+        kind: Behavior,
+    }
 }
 
 /// Render the chat-template system-prompt block alone (no trailing assistant
@@ -3601,13 +3714,17 @@ pub struct MlxQwen35Backend {
     /// any family; see [`session`].
     sessions: session::Sessions,
     prefix_store: prefix_cache::PrefixCacheStore,
-    /// Lazily-built llguidance parser factory for the Qwen 3.6 tool-call
-    /// grammar (WS-C #2), backed by this model's `tokenizer.json`. `None`
-    /// inside the `Option` means construction failed (no tokenizer.json, or
-    /// the vocab table was empty) — such requests degrade gracefully to
-    /// unconstrained sampling rather than erroring. Built once on first
-    /// grammar-eligible request; the `Arc` is cloned per request.
+    /// The llguidance parser factory for the Qwen 3.6 tool-call grammar
+    /// (WS-C #2), backed by this model's `tokenizer.json`. `None` inside the
+    /// `Option` means construction failed (no tokenizer.json, or the vocab
+    /// table was empty) — such requests degrade gracefully to unconstrained
+    /// sampling rather than erroring. Built at load, so the first tool
+    /// request does not pay for it; the `Arc` is cloned per request.
     grammar_factory: OnceLock<Option<std::sync::Arc<llguidance::ParserFactory>>>,
+    /// The token ids of `<tool_call>`, `</tool_call>`, `<think>` and
+    /// `</think>` in this checkpoint's tokenizer: the auto tool grammar's
+    /// trigger, and the markers the reply parser reads by id.
+    tool_markers: crate::qwen3_5_tools::QwenMarkerIds,
     /// Whether THIS checkpoint's chat template declares `reasoning_effort`
     /// (Qwen 3.8 does; 3.5 and 3.6 do not). Decided at load by reading the
     /// shipped `chat_template.jinja` — see
@@ -3695,12 +3812,14 @@ impl MlxQwen35Backend {
         tokenizer: Tokenizer,
         vocab_size: usize,
     ) -> Self {
+        let tokenizer = TextTokenizer::from_hf(tokenizer);
         Self {
             runner: RunnerImpl::Scripted(TokenScriptRunner::new(script, eos)),
             model_id: "token-script".to_string(),
             eos_tokens: vec![eos],
             vocab_size,
-            tokenizer: Some(TextTokenizer::from_hf(tokenizer)),
+            tool_markers: tool_markers(Some(&tokenizer)),
+            tokenizer: Some(tokenizer),
             next_seq_id: AtomicU64::new(1),
             sessions: session::Sessions::new(),
             prefix_store: prefix_cache::PrefixCacheStore::from_env(),
@@ -3810,6 +3929,7 @@ impl MlxQwen35Backend {
             model_id: model_id.to_string(),
             eos_tokens,
             vocab_size,
+            tool_markers: tool_markers(tokenizer.as_ref()),
             tokenizer,
             next_seq_id: AtomicU64::new(1),
             sessions,
@@ -3839,6 +3959,18 @@ impl MlxQwen35Backend {
         {
             let target_vocab = me.vocab_size;
             me.try_load_draft_model_from_env(target_vocab);
+        }
+        // The grammar factory, built here rather than on the first tool
+        // request's time to first token. Only where a grammar can be applied.
+        #[cfg(feature = "mlx-native")]
+        if qwen35_tool_grammar_enabled() || qwen35_response_format_enabled() {
+            let t = std::time::Instant::now();
+            if me.grammar_factory().is_some() {
+                eprintln!(
+                    "[qwen35-backend] grammar factory built in {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
         Ok(me)
     }
@@ -4773,6 +4905,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill};
         let mut full = format_qwen3_chat_with_tools(messages, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill(tool_choice);
@@ -4794,6 +4927,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String, Vec<u32>)> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill};
         let prompt_only = format_qwen3_chat_with_tools(messages, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill(tool_choice);
@@ -4827,6 +4961,7 @@ impl MlxQwen35Backend {
         Vec<u32>,
         Vec<crate::qwen36_vision::PreparedImage>,
     )> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_and_images, qwen35_tool_choice_prefill,
         };
@@ -4895,6 +5030,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill,
         };
@@ -4914,6 +5050,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String, Vec<u32>)> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill,
         };
@@ -4949,6 +5086,7 @@ impl MlxQwen35Backend {
         Vec<u32>,
         Vec<crate::qwen36_vision::PreparedImage>,
     )> {
+        let thinking = crate::qwen3_5_tools::opens_thinking(thinking, tool_choice);
         use crate::chat_io::ChatTurn;
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_from_history_and_images, qwen35_tool_choice_prefill,
@@ -5011,26 +5149,42 @@ impl MlxQwen35Backend {
     /// once; the `Arc` is cloned per request. WS-C #2.
     fn grammar_factory(&self) -> Option<std::sync::Arc<llguidance::ParserFactory>> {
         self.grammar_factory
-            .get_or_init(|| match resolve_tokenizer_json_path(&self.model_id) {
-                Ok(path) => match crate::grammar::shared_factory_from_tokenizer(&path) {
-                    Ok(f) => Some(f),
-                    Err(e) => {
-                        eprintln!(
-                            "[qwen35-backend] grammar factory unavailable \
-                             (tools sample without grammar mask): {e:#}"
-                        );
-                        None
-                    }
-                },
+            .get_or_init(|| {
+                let Some(end) = crate::grammar::EndTokens::from_eos_ids(&self.eos_tokens) else {
+                    eprintln!(
+                        "[qwen35-backend] grammar factory: no end-of-sequence id \
+                         (tools sample without grammar mask)"
+                    );
+                    return None;
+                };
+                self.grammar_factory_ending_on(end)
+            })
+            .clone()
+    }
+
+    fn grammar_factory_ending_on(
+        &self,
+        end: crate::grammar::EndTokens,
+    ) -> Option<std::sync::Arc<llguidance::ParserFactory>> {
+        match resolve_tokenizer_json_path(&self.model_id) {
+            Ok(path) => match crate::grammar::shared_factory_from_tokenizer(&path, end) {
+                Ok(f) => Some(f),
                 Err(e) => {
                     eprintln!(
-                        "[qwen35-backend] grammar factory: tokenizer.json unresolved \
-                         (tools sample without grammar mask): {e:#}"
+                        "[qwen35-backend] grammar factory unavailable \
+                             (tools sample without grammar mask): {e:#}"
                     );
                     None
                 }
-            })
-            .clone()
+            },
+            Err(e) => {
+                eprintln!(
+                    "[qwen35-backend] grammar factory: tokenizer.json unresolved \
+                         (tools sample without grammar mask): {e:#}"
+                );
+                None
+            }
+        }
     }
 
     /// Build a per-request Qwen 3.6 tool-call grammar state (WS-C #2) from the
@@ -5040,8 +5194,9 @@ impl MlxQwen35Backend {
     /// an unknown tool, or the grammar fails to compile. Required/named build
     /// an **Eager** grammar (active from token 0) so a prefill-forced opener
     /// can't produce an empty-param body; `auto` builds a **Lazy** grammar
-    /// (off until the model starts a tool call) unless
-    /// `LUMEN_QWEN35_TOOL_GRAMMAR_EAGER=1`.
+    /// (off until the model emits `<tool_call>`) when
+    /// `LUMEN_QWEN_TOOL_GRAMMAR_AUTO` is on and the tokenizer has the opener as
+    /// one id, or an Eager one with `LUMEN_QWEN35_TOOL_GRAMMAR_EAGER=1`.
     fn build_qwen35_tool_grammar(
         &self,
         tools: &[crate::chat_io::ToolDef<'_>],
@@ -5101,11 +5256,26 @@ impl MlxQwen35Backend {
                     serde_json::json!({ "type": "function", "function": func })
                 })
                 .collect();
-            match Gemma4GrammarState::new_qwen35_xml(factory, &tools_json, mode, None, calls) {
+            // What wakes a lazy grammar. Without it the grammar never
+            // activates, so it is not built: the log would claim a grammar
+            // that constrains nothing.
+            let opener = self
+                .tool_markers
+                .id(crate::qwen3_5_tools::QwenMarker::ToolCallOpen);
+            let trigger = match mode {
+                // Active from the first step; there is nothing to wake.
+                GrammarMode::Eager => None,
+                GrammarMode::Lazy if qwen_tool_grammar_auto::get() && opener.is_some() => opener,
+                GrammarMode::Lazy => return None,
+            };
+            let t = std::time::Instant::now();
+            match Gemma4GrammarState::new_qwen35_xml(factory, &tools_json, mode, trigger, calls) {
                 Ok(state) => {
                     eprintln!(
-                        "[qwen35-backend] tool grammar active for {} tool(s) (mode={mode:?}, calls={calls:?})",
-                        tools.len()
+                        "[qwen35-backend] tool grammar for {} tool(s) (mode={mode:?}, \
+                         trigger={trigger:?}, calls={calls:?}) built in {:.2} ms",
+                        tools.len(),
+                        t.elapsed().as_secs_f64() * 1000.0
                     );
                     Some(state)
                 }
@@ -5981,7 +6151,9 @@ impl MlxQwen35Backend {
                 Default::default()
             },
             prepared,
-            thinking,
+            // The parser starts where the prompt left the reply: in
+            // reasoning only when the builders above left the block open.
+            crate::qwen3_5_tools::opens_thinking(thinking, tool_choice),
             on_event,
         )
     }
@@ -6065,6 +6237,13 @@ impl MlxQwen35Backend {
         // the prompt does.
         if !prefill_str.is_empty() {
             let _ = parser.feed(&prefill_str);
+        }
+        // What the model writes is read for markers by id; the prefill above
+        // is the template's own text.
+        let markers = (qwen_markers_by_id::get() && self.tool_markers.complete())
+            .then_some(self.tool_markers);
+        if markers.is_some() {
+            parser = parser.markers_by_id();
         }
 
         let debug_qwen_tools = std::env::var("LUMEN_QWEN35_TOOL_DEBUG").is_ok();
@@ -6185,11 +6364,11 @@ impl MlxQwen35Backend {
         #[cfg(feature = "mlx-native")]
         if hold_back_last {
             let held = *prompt_ids.last().expect("hold_back_last implies non-empty");
-            let stepped = {
-                let g = grammar
-                    .as_mut()
-                    .expect("hold_back_last implies an active grammar");
-                self.decode_step_grammar(seq_id, held, g)
+            // The replay above may have dropped the grammar the token was
+            // held back for: the step is then taken unmasked below.
+            let stepped = match grammar.as_mut() {
+                Some(g) => self.decode_step_grammar(seq_id, held, g),
+                None => Err(anyhow!("the prefill replay dropped the grammar")),
             };
             match stepped {
                 Ok((next, new_pos)) => {
@@ -6209,8 +6388,9 @@ impl MlxQwen35Backend {
                 }
             }
         }
+        // A lazy grammar sees the first token too: a reply that opens with a
+        // call opens it here.
         if let Some(g) = grammar.as_mut()
-            && g.is_active()
             && let Err(e) = g.observe(last)
         {
             eprintln!(
@@ -6226,19 +6406,22 @@ impl MlxQwen35Backend {
         // active, disable force-injection so the two don't fight. Computed
         // AFTER the prefill replay so a desync-dropped grammar correctly
         // re-enables the injector fallback.
-        let grammar_will_constrain = grammar.as_ref().is_some_and(|g| g.is_active());
+        let grammar_will_constrain = grammar
+            .as_ref()
+            .is_some_and(crate::grammar::Gemma4GrammarState::can_constrain);
         let force_active = !force_required.is_empty() && !grammar_will_constrain;
 
         // Detokenize + parser-feed for the first decoded token.
         let mut generated: Vec<u32> = vec![last];
         let mut detok = StreamDetok::tail();
-        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
-            if debug_qwen_tools {
-                eprintln!("[qwen35-tools] first decoded text: {text:?}");
-            }
-            for ev in parser.feed(&text) {
-                forward_parse_event(ev, &mut on_event)?;
-            }
+        let events = feed_newest(&mut parser, &mut detok, &generated, markers, |t| {
+            self.decode(t)
+        });
+        if debug_qwen_tools {
+            eprintln!("[qwen35-tools] first token {last}: {events:?}");
+        }
+        for ev in events {
+            forward_parse_event(ev, &mut on_event)?;
         }
         if self.eos_tokens.contains(&last) {
             self.remove_seq(seq_id).ok();
@@ -6246,6 +6429,7 @@ impl MlxQwen35Backend {
         }
 
         let t_decode = std::time::Instant::now();
+        let mut step_times = StepTimes::default();
         // WS-B Lever 1 (overlap scheduling) is NOT applied to this Qwen3.6
         // loop — intentionally left synchronous. The Gemma4 sampled path
         // (`gemma4_backend::decode_streaming_with_prompt`) gets the overlap;
@@ -6322,10 +6506,10 @@ impl MlxQwen35Backend {
                     last = next2;
                     pos = pos2;
                     generated.push(last);
-                    if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
-                        for ev in parser.feed(&text) {
-                            forward_parse_event(ev, &mut on_event)?;
-                        }
+                    for ev in feed_newest(&mut parser, &mut detok, &generated, markers, |t| {
+                        self.decode(t)
+                    }) {
+                        forward_parse_event(ev, &mut on_event)?;
                     }
                     if self.eos_tokens.contains(&last) {
                         break;
@@ -6340,6 +6524,7 @@ impl MlxQwen35Backend {
             // it only changes WHICH token is chosen, never the recurrence; the
             // chosen token is then fed through the next normal forward.
             let grammar_active = grammar.as_ref().is_some_and(|g| g.is_active());
+            let t_step = std::time::Instant::now();
             let (next, new_pos) = if grammar_active {
                 #[cfg(feature = "mlx-native")]
                 {
@@ -6372,18 +6557,30 @@ impl MlxQwen35Backend {
                     self.decode_step(seq_id, last, pos)?
                 }
             } else {
-                self.decode_step_chained(seq_id, last, pos)?
+                let stepped = self.decode_step_chained(seq_id, last, pos)?;
+                // The only steps a lazy grammar sees before it wakes: it
+                // waits here for the opener.
+                if let Some(e) = grammar.as_mut().and_then(|g| g.observe(stepped.0).err()) {
+                    eprintln!(
+                        "[qwen35-backend] grammar observe(unmasked) desynced \
+                         (dropping grammar): {e:#}"
+                    );
+                    grammar = None;
+                }
+                stepped
             };
+            step_times.add(grammar_active, t_step.elapsed());
             last = next;
             pos = new_pos;
             generated.push(next);
-            if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
-                if debug_qwen_tools {
-                    eprintln!("[qwen35-tools] step={step} text={text:?}");
-                }
-                for ev in parser.feed(&text) {
-                    forward_parse_event(ev, &mut on_event)?;
-                }
+            let events = feed_newest(&mut parser, &mut detok, &generated, markers, |t| {
+                self.decode(t)
+            });
+            if debug_qwen_tools {
+                eprintln!("[qwen35-tools] step={step} token={next}: {events:?}");
+            }
+            for ev in events {
+                forward_parse_event(ev, &mut on_event)?;
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -6405,7 +6602,7 @@ impl MlxQwen35Backend {
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
         let n_gen = generated.len();
         eprintln!(
-            "[mlx] seq {seq_id} done-tools: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s)",
+            "[mlx] seq {seq_id} done-tools: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s){step_times}",
             n_gen as f64 / (decode_ms / 1000.0)
         );
         if debug_qwen_tools {
@@ -7407,6 +7604,81 @@ fn flow_of(sink: Result<()>) -> ControlFlow<()> {
     }
 }
 
+/// Decode-step wall time in a tool loop, split by whether a grammar masked the
+/// step: what masking costs per token, read off the log.
+#[derive(Default)]
+struct StepTimes {
+    masked: (u32, std::time::Duration),
+    free: (u32, std::time::Duration),
+}
+
+impl StepTimes {
+    fn add(&mut self, masked: bool, took: std::time::Duration) {
+        let slot = if masked {
+            &mut self.masked
+        } else {
+            &mut self.free
+        };
+        slot.0 += 1;
+        slot.1 += took;
+    }
+}
+
+/// Empty without masked steps; otherwise ` masked=N@X.XXms free=M@Y.YYms`.
+impl std::fmt::Display for StepTimes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mean = |(n, t): (u32, std::time::Duration)| {
+            if n == 0 {
+                0.0
+            } else {
+                t.as_secs_f64() * 1000.0 / f64::from(n)
+            }
+        };
+        if self.masked.0 == 0 {
+            return Ok(());
+        }
+        write!(
+            f,
+            " masked={}@{:.2}ms free={}@{:.2}ms",
+            self.masked.0,
+            mean(self.masked),
+            self.free.0,
+            mean(self.free)
+        )
+    }
+}
+
+/// Feed `parser` what the newest token of `generated` adds.
+///
+/// Text goes through `detok`. When `markers` reads them by id and the newest
+/// token is a marker, the text before it goes first, then the marker on its
+/// own: a marker id is the only way such a tag is read, so text that merely
+/// spells one stays text.
+fn feed_newest(
+    parser: &mut crate::qwen3_5_tools::Qwen35ResponseParser,
+    detok: &mut StreamDetok,
+    generated: &[u32],
+    markers: Option<crate::qwen3_5_tools::QwenMarkerIds>,
+    decode: impl Fn(&[u32]) -> Result<String>,
+) -> Vec<crate::qwen3_5_tools::Qwen35ParseEvent> {
+    let Some((&newest, before)) = generated.split_last() else {
+        return Vec::new();
+    };
+    let Some(marker) = markers.and_then(|m| m.marker(newest)) else {
+        return detok
+            .next(generated, decode)
+            .map(|text| parser.feed(&text))
+            .unwrap_or_default();
+    };
+    let mut events = detok
+        .finish(before, &decode)
+        .map(|text| parser.feed(&text))
+        .unwrap_or_default();
+    events.extend(parser.feed_marker(marker));
+    detok.skip_to(generated.len());
+    events
+}
+
 /// Phase 2: bridges Qwen35ResponseParser events to the generic
 /// `BackendStreamEvent` shape the engine consumes. Mirrors the
 /// Gemma 4 `emit_token_event` adapter.
@@ -8200,6 +8472,243 @@ mod tests {
             .expect("tool decode loop");
         let consumed = backend.scripted_tokens_consumed();
         (parsed, consumed)
+    }
+
+    /// [`SCRIPT_TOKENIZER`] as a Qwen checkpoint has it: the four markers are
+    /// added tokens (so each is one id, and is read by id), `<eos>` is special
+    /// (so it decodes to nothing, as `<|im_end|>` does), the decoder is one
+    /// llguidance can read a vocabulary from, and `<` + `tool_call>` spell the
+    /// opener out of ordinary tokens.
+    #[cfg(feature = "mlx-native")]
+    const MARKER_TOKENIZER: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [
+            {"id": 1, "content": "<tool_call>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": false},
+            {"id": 9, "content": "</tool_call>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": false},
+            {"id": 11, "content": "<think>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": false},
+            {"id": 12, "content": "</think>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": false},
+            {"id": 10, "content": "<eos>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true}
+        ],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null,
+        "decoder": {"type": "Sequence", "decoders": [{"type": "ByteFallback"}, {"type": "Fuse"}]},
+        "model": {
+            "type": "WordLevel",
+            "unk_token": "<unk>",
+            "vocab": {
+                "<unk>": 0,
+                "<tool_call>": 1,
+                "\n": 2,
+                "<function=get_weather>": 3,
+                "<parameter=city>": 4,
+                "Seoul": 5,
+                "Tokyo": 6,
+                "</parameter>": 7,
+                "</function>": 8,
+                "</tool_call>": 9,
+                "<eos>": 10,
+                "<think>": 11,
+                "</think>": 12,
+                "<": 13,
+                "tool_call>": 14,
+                "get_weather>": 15
+            }
+        }
+    }"#;
+
+    /// Ids in [`MARKER_TOKENIZER`].
+    #[cfg(feature = "mlx-native")]
+    const MARKER_VOCAB: usize = 16;
+
+    /// `get_weather`, whose `city` is required.
+    #[cfg(feature = "mlx-native")]
+    fn weather_params() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"],
+        })
+    }
+
+    /// The tool decode loop over `script` with [`MARKER_TOKENIZER`], and the
+    /// grammar the backend itself builds for `get_weather` under `choice`.
+    /// Returns the reply and every masked step as `(scripted, chosen)`.
+    #[cfg(feature = "mlx-native")]
+    fn marker_loop(
+        script: Vec<u32>,
+        choice: crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> (crate::chat_io::ParsedResponse, Vec<(u32, u32)>) {
+        use crate::grammar::ToolCalls;
+        let mut backend = marker_backend(script);
+        let params = weather_params();
+        let tools = weather_tool(&params);
+        let grammar = backend.build_qwen35_tool_grammar(&tools, &choice, ToolCalls::OneOrMore);
+        let parsed = backend
+            .chat_with_tools_impl(
+                vec![42],
+                String::new(),
+                Vec::new(),
+                grammar,
+                ToolCalls::OneOrMore,
+                24,
+                7,
+                None,
+                None,
+                Default::default(),
+                Vec::new(),
+                false,
+                |_| Ok(()),
+            )
+            .expect("tool decode loop");
+        (parsed, backend.script_runner().masked_steps().to_vec())
+    }
+
+    /// A scripted backend with [`MARKER_TOKENIZER`] and a grammar factory over
+    /// it, ending on the script's `<eos>`.
+    #[cfg(feature = "mlx-native")]
+    fn marker_backend(script: Vec<u32>) -> MlxQwen35Backend {
+        use crate::grammar::{EndTokens, shared_factory_from_tokenizer_value};
+        let json: serde_json::Value = serde_json::from_str(MARKER_TOKENIZER).expect("json");
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(MARKER_TOKENIZER).expect("tokenizer");
+        let mut backend =
+            MlxQwen35Backend::with_token_script(script, SCRIPT_EOS, tokenizer, MARKER_VOCAB);
+        backend.script_runner().with_vocab(MARKER_VOCAB);
+        let end = EndTokens::from_eos_ids(&backend.eos_tokens).expect("eos");
+        let factory = shared_factory_from_tokenizer_value(&json, end).expect("factory");
+        assert!(backend.grammar_factory.set(Some(factory)).is_ok());
+        backend
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn weather_tool(params: &serde_json::Value) -> [crate::chat_io::ToolDef<'_>; 1] {
+        [crate::chat_io::ToolDef {
+            name: "get_weather",
+            description: None,
+            parameters: Some(params),
+            response: None,
+        }]
+    }
+
+    /// With thinking on, a forced call is still a call. The prompt used to end
+    /// `<think>\n<tool_call>\n<function=`, so the prefill sat inside the open
+    /// trace, the parser started in it, and the turn came back with the call
+    /// as its reasoning and no `tool_calls`.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn a_forced_call_with_thinking_on_is_a_call() {
+        use crate::chat_io::{PromptSource, ResolvedToolChoice};
+        use crate::grammar::ToolCalls;
+        // The prefill takes the first token (the step after it is the masked
+        // one); the model then completes `<function=` + `get_weather>`.
+        let script = vec![0, 15, 2, 4, 2, 5, 2, 7, 2, 8, 2, 9, SCRIPT_EOS];
+        let mut backend = marker_backend(script);
+        let params = weather_params();
+        let tools = weather_tool(&params);
+        let messages = vec![("user".to_string(), "weather in Seoul?".to_string())];
+        let parsed = backend
+            .chat_with_tools(
+                PromptSource::Flat(&messages),
+                &[],
+                24,
+                true,
+                7,
+                &tools,
+                &ResolvedToolChoice::Required,
+                ToolCalls::OneOrMore,
+                |_| Ok(()),
+                None,
+            )
+            .expect("tool decode loop");
+        assert_eq!(parsed.tool_calls.len(), 1, "{parsed:?}");
+        assert_eq!(parsed.tool_calls[0].name, "get_weather");
+        assert_eq!(parsed.tool_calls[0].arguments["city"], "Seoul");
+        assert_eq!(parsed.reasoning, "");
+    }
+
+    /// In `tool_choice=auto` a call the model opens is held to the schema: it
+    /// closes `get_weather` without the required `city`, and the mask puts the
+    /// parameter where the closer was. Without a trigger, or with a decode loop
+    /// that never shows the grammar an unmasked token, the auto grammar was
+    /// built, logged as active, and masked nothing.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn an_auto_call_that_breaks_the_schema_is_masked() {
+        use crate::chat_io::ResolvedToolChoice;
+        // <tool_call> \n <function=get_weather> \n </function> \n </tool_call> <eos>
+        let script = vec![1, 2, 3, 2, 8, 2, 9, SCRIPT_EOS];
+        let (_, masked) = qwen_tool_grammar_auto::with(true, || {
+            marker_loop(script.clone(), ResolvedToolChoice::Auto)
+        });
+        assert_eq!(
+            masked.first(),
+            Some(&(2, 2)),
+            "the step after the opener is the first one masked: {masked:?}"
+        );
+        assert!(
+            masked.contains(&(8, 4)),
+            "`</function>` with `city` missing must become `<parameter=city>`: {masked:?}"
+        );
+
+        let (parsed, masked) =
+            qwen_tool_grammar_auto::with(false, || marker_loop(script, ResolvedToolChoice::Auto));
+        assert!(
+            masked.is_empty(),
+            "flag off, auto masks nothing: {masked:?}"
+        );
+        assert_eq!(
+            parsed.tool_calls.len(),
+            1,
+            "and the call is parsed as written"
+        );
+    }
+
+    /// A lazy grammar re-arms when its call closes, so the second call of a
+    /// parallel turn is masked like the first.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn every_call_of_a_parallel_auto_turn_is_masked() {
+        use crate::chat_io::ResolvedToolChoice;
+        let mut script = scripted_call(5);
+        script.push(2);
+        script.extend([1, 2, 3, 2, 8, 2, 9, SCRIPT_EOS]);
+        let (_, masked) =
+            qwen_tool_grammar_auto::with(true, || marker_loop(script, ResolvedToolChoice::Auto));
+        assert!(
+            masked.contains(&(8, 4)),
+            "the second call, missing `city`, must be masked too: {masked:?}"
+        );
+    }
+
+    /// Prose that spells `<tool_call>` out of ordinary tokens stays prose. Read
+    /// as text, it opened a call the model never made and swallowed the rest of
+    /// the reply as its header.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn a_spelled_out_opener_stays_text() {
+        use crate::chat_io::ResolvedToolChoice;
+        // `<` `tool_call>` \n Seoul <eos>
+        let script = vec![13, 14, 2, 5, SCRIPT_EOS];
+        let (parsed, _) = qwen_markers_by_id::with(true, || {
+            marker_loop(script.clone(), ResolvedToolChoice::Auto)
+        });
+        assert_eq!(parsed.visible, "<tool_call>\nSeoul");
+        assert!(parsed.tool_calls.is_empty());
+
+        // The marker id itself still opens a call.
+        let (parsed, _) = qwen_markers_by_id::with(true, || {
+            marker_loop(scripted_call(6), ResolvedToolChoice::Auto)
+        });
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].arguments["city"], "Tokyo");
     }
 
     /// A checkpoint that does not declare `reasoning_effort` must report `None`

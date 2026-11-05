@@ -68,6 +68,8 @@ value → on.
 | `LUMEN_QWEN4_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::decode_probe::stage_sync` |
 | `LUMEN_QWEN4_TOKEN_COUNTERS` | off | Diagnostic | `lumen_mlx::decode_probe::token_counters` |
 | `LUMEN_QWEN4_WIDEN_SCALES` | on | Optimization | `lumen_mlx::qwen4_exp::model::widen_scales` |
+| `LUMEN_QWEN_MARKERS_BY_ID` | on | Behavior | `lumen_mlx::qwen_markers_by_id` |
+| `LUMEN_QWEN_TOOL_GRAMMAR_AUTO` | off | Behavior | `lumen_mlx::qwen_tool_grammar_auto` |
 | `LUMEN_SPARSE_DECODE` | off | Behavior | `lumen_mlx::native_attention::imp::sparse_decode` |
 | `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
 
@@ -914,6 +916,38 @@ Count the Metal command buffers, kernel dispatches and encoded primitives of eve
 
 Keep the resident quantized projections' scales and biases in f32 so the activations'
  matmul stops re-casting them on every call. Bit-identical (bf16 -> f32 is exact).
+
+### `LUMEN_QWEN_MARKERS_BY_ID`
+
+*Behavior, default on.*
+
+Read Qwen's `<think>`, `</think>` and `<tool_call>` in the reply only when
+ the model emits them as their own token ids.
+
+ The model can also spell those tags out of ordinary tokens, when it
+ quotes a prompt or writes about the format. Matched as text, that
+ spelling opened a tool call or a reasoning block the model never meant;
+ matched by id, it stays text. Inside a call the framing (`<function=`,
+ `<parameter=`, `</tool_call>`) is still read as text.
+
+ **`Behavior`**: it changes how such a reply is split. Off, the tags are
+ matched as text, as before.
+
+### `LUMEN_QWEN_TOOL_GRAMMAR_AUTO`
+
+*Behavior, default off.*
+
+Constrain a Qwen tool call in `tool_choice=auto` once the model opens it.
+
+ The model writes freely until it emits `<tool_call>` (one token id in
+ every shipped Qwen tokenizer). From that token to `</tool_call>` the call
+ is masked by the request's tool grammar: a declared function name, every
+ required parameter, none twice. Then the grammar waits for the next
+ opener, so each call of a parallel turn is constrained.
+
+ **`Behavior`**: it changes which tokens a call can contain. Off, an auto
+ request decodes unconstrained, as before; `tool_choice=required` and a
+ named tool are constrained either way.
 
 ### `LUMEN_SPARSE_DECODE`
 

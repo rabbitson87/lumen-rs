@@ -714,6 +714,18 @@ pub fn format_qwen3_chat_with_tools_from_history_and_images(
 /// must append this AFTER the generation prompt (`<|im_start|>assistant\n
 /// <think>...</think>\n\n`).
 ///
+/// Whether the reply opens inside `<think>`: thinking was asked for and the
+/// call is not forced.
+///
+/// A forced call's prefill ([`qwen35_tool_choice_prefill`]) is the start of
+/// the reply, so the reasoning block is closed before it, as the template
+/// writes a turn without thinking. Left open, the prefill landed inside the
+/// trace: the parser read the forced call as reasoning and the turn came back
+/// without it.
+pub fn opens_thinking(thinking: bool, choice: &ResolvedToolChoice<'_>) -> bool {
+    thinking && matches!(choice, ResolvedToolChoice::Auto | ResolvedToolChoice::None)
+}
+
 /// The opener is the template's, the function name the client's.
 pub fn qwen35_tool_choice_prefill(choice: &ResolvedToolChoice<'_>) -> PromptText {
     let mut s = PromptText::new();
@@ -732,6 +744,70 @@ pub fn qwen35_tool_choice_prefill(choice: &ResolvedToolChoice<'_>) -> PromptText
 // ─────────────────────────────────────────────────────────────────────────────
 // Response parser
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// A tag the parser reads as a control marker when it is its own token id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QwenMarker {
+    ToolCallOpen,
+    ToolCallClose,
+    ThinkOpen,
+    ThinkClose,
+}
+
+impl QwenMarker {
+    pub const ALL: [Self; 4] = [
+        Self::ToolCallOpen,
+        Self::ToolCallClose,
+        Self::ThinkOpen,
+        Self::ThinkClose,
+    ];
+
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::ToolCallOpen => "<tool_call>",
+            Self::ToolCallClose => "</tool_call>",
+            Self::ThinkOpen => "<think>",
+            Self::ThinkClose => "</think>",
+        }
+    }
+}
+
+/// The token id of each [`QwenMarker`] in one checkpoint's tokenizer.
+///
+/// Every shipped Qwen 3.5/3.6/3.8 tokenizer has all four as single added ids
+/// (248058, 248059, 248068, 248069), but they are entries in that tokenizer,
+/// not constants of the format, so they are read at load.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QwenMarkerIds {
+    ids: [Option<u32>; 4],
+}
+
+impl QwenMarkerIds {
+    /// Look each marker up with `single_id`, which answers only when the tag
+    /// encodes to exactly one id.
+    pub fn resolve(single_id: impl Fn(&str) -> Option<u32>) -> Self {
+        Self {
+            ids: QwenMarker::ALL.map(|m| single_id(m.text())),
+        }
+    }
+
+    pub fn id(&self, marker: QwenMarker) -> Option<u32> {
+        self.ids[marker as usize]
+    }
+
+    /// The marker `token` is, if any.
+    pub fn marker(&self, token: u32) -> Option<QwenMarker> {
+        QwenMarker::ALL
+            .into_iter()
+            .find(|&m| self.id(m) == Some(token))
+    }
+
+    /// Whether every marker has an id, which reading them by id needs: a
+    /// marker without one could only ever arrive as text.
+    pub fn complete(&self) -> bool {
+        self.ids.iter().all(Option::is_some)
+    }
+}
 
 /// Events emitted by `Qwen35ResponseParser` during incremental decode.
 /// Mirrors the family-agnostic event shape used by the Gemma 4 path so
@@ -777,6 +853,10 @@ pub struct Qwen35ResponseParser {
     in_think: bool,
     parsed_calls: Vec<ParsedToolCall>,
     pending: Option<PendingCall>,
+    /// `<tool_call>`, `<think>` and `</think>` outside a call arrive only
+    /// through [`Self::feed_marker`]; text that spells them is text. Set by
+    /// [`Self::markers_by_id`].
+    markers_by_id: bool,
 }
 
 #[derive(Debug)]
@@ -817,7 +897,77 @@ impl Qwen35ResponseParser {
             in_think: false,
             parsed_calls: Vec::new(),
             pending: None,
+            markers_by_id: false,
         }
+    }
+
+    /// From here on, the markers outside a call come only from
+    /// [`Self::feed_marker`]: the decode loop knows which tokens are marker
+    /// ids, and text the model spelled out of ordinary tokens stays text.
+    /// Feed the prompt's own prefill with [`Self::feed`] before this.
+    pub fn markers_by_id(mut self) -> Self {
+        self.markers_by_id = true;
+        self
+    }
+
+    /// The model emitted `marker` as its own token id.
+    ///
+    /// Outside a call, `<tool_call>`, `<think>` and `</think>` change state
+    /// here and nowhere else (with [`Self::markers_by_id`]). Anywhere else a
+    /// marker is the text it reads as: inside a call `</tool_call>` is read as
+    /// text, and inside reasoning `<tool_call>` is part of the trace, as it
+    /// always was.
+    pub fn feed_marker(&mut self, marker: QwenMarker) -> Vec<Qwen35ParseEvent> {
+        if !self.markers_by_id {
+            return self.feed(marker.text());
+        }
+        let opens_outside_a_call = match (&self.state, marker) {
+            (State::Visible | State::AfterThink, QwenMarker::ToolCallOpen)
+            | (State::Visible | State::AfterThink, QwenMarker::ThinkOpen)
+            | (State::Visible | State::AfterThink | State::Thinking, QwenMarker::ThinkClose) => {
+                true
+            }
+            _ => false,
+        };
+        if !opens_outside_a_call {
+            return self.feed(marker.text());
+        }
+        // A lone separator newline after `</think>` that the marker cut short
+        // was the separator, not the start of the answer.
+        if matches!(self.state, State::AfterThink) {
+            if self.buffer == "\n" {
+                self.buffer.clear();
+            }
+            self.state = State::Visible;
+        }
+        // Everything before the marker is settled: no text can still become
+        // one of these markers.
+        let mut events = self.feed("");
+        let flushed = std::mem::take(&mut self.buffer);
+        if !flushed.is_empty() {
+            match self.state {
+                State::Thinking => {
+                    self.reasoning.push_str(&flushed);
+                    events.push(Qwen35ParseEvent::Reasoning(flushed));
+                }
+                _ => {
+                    self.visible.push_str(&flushed);
+                    events.push(Qwen35ParseEvent::Text(flushed));
+                }
+            }
+        }
+        match (&self.state, marker) {
+            (State::Thinking, QwenMarker::ThinkClose) => self.state = State::AfterThink,
+            (_, QwenMarker::ToolCallOpen) => self.state = State::InToolCallHeader,
+            (_, QwenMarker::ThinkOpen) => {
+                self.state = State::Thinking;
+                self.in_think = true;
+            }
+            // An unbalanced `</think>` outside reasoning: dropped, as the
+            // text path drops it.
+            _ => {}
+        }
+        events
     }
 
     /// A parser for a turn whose **prompt** already opened the thinking block.
@@ -956,11 +1106,16 @@ impl Qwen35ResponseParser {
     fn try_advance_visible(&mut self, events: &mut Vec<Qwen35ParseEvent>) -> bool {
         // Look for the next interesting delimiter: <tool_call> or <think>
         // or </think>. Whatever comes first wins.
-        let candidates: &[(&'static str, DelimKind)] = &[
-            ("<tool_call>", DelimKind::ToolCallOpen),
-            ("<think>", DelimKind::ThinkOpen),
-            ("</think>", DelimKind::ThinkClose),
-        ];
+        // By id, these arrive through `feed_marker` and text is only text.
+        let candidates: &[(&'static str, DelimKind)] = if self.markers_by_id {
+            &[]
+        } else {
+            &[
+                ("<tool_call>", DelimKind::ToolCallOpen),
+                ("<think>", DelimKind::ThinkOpen),
+                ("</think>", DelimKind::ThinkClose),
+            ]
+        };
         let (delim_idx, delim_kind, delim_str) = self.next_delim(candidates);
         if let (Some(idx), Some(kind), Some(needle)) = (delim_idx, delim_kind, delim_str) {
             // Emit the prefix as visible text (if non-empty).
@@ -1005,7 +1160,10 @@ impl Qwen35ResponseParser {
     }
 
     fn try_advance_thinking(&mut self, events: &mut Vec<Qwen35ParseEvent>) -> bool {
-        if let Some(idx) = self.buffer.find("</think>") {
+        let close = (!self.markers_by_id)
+            .then(|| self.buffer.find("</think>"))
+            .flatten();
+        if let Some(idx) = close {
             let prefix = self.buffer[..idx].to_string();
             self.reasoning.push_str(&prefix);
             if !prefix.is_empty() {
@@ -1017,8 +1175,12 @@ impl Qwen35ResponseParser {
         } else {
             // Buffer might be split mid-delimiter. Drain everything
             // except a trailing `<` (which could be the start of
-            // `</think>`).
-            let keep = self.partial_suffix_len("</think>");
+            // `</think>`) — unless the close comes by id.
+            let keep = if self.markers_by_id {
+                0
+            } else {
+                self.partial_suffix_len("</think>")
+            };
             if self.buffer.len() > keep {
                 let chunk: String = self.buffer.drain(..self.buffer.len() - keep).collect();
                 self.reasoning.push_str(&chunk);
@@ -1221,6 +1383,9 @@ impl Qwen35ResponseParser {
     /// the start of a tracked delimiter. Equal to `buffer.len() -
     /// max(partial suffix of any tracked open delimiter)`.
     fn safe_visible_len(&self) -> usize {
+        if self.markers_by_id {
+            return self.buffer.len();
+        }
         let max_partial = [
             self.partial_suffix_len("<tool_call>"),
             self.partial_suffix_len("<think>"),
@@ -2866,5 +3031,103 @@ mod chunk_independence {
             (done.reasoning.as_str(), done.visible.as_str()),
             ("why <", "")
         );
+    }
+}
+
+#[cfg(test)]
+mod markers_by_id {
+    use super::{Qwen35ResponseParser, QwenMarker, QwenMarkerIds};
+
+    /// Feed `pieces` in order: `Ok` is text, `Err` a marker id the model
+    /// emitted.
+    fn run(
+        mut p: Qwen35ResponseParser,
+        pieces: &[Result<&str, QwenMarker>],
+    ) -> crate::chat_io::ParsedResponse {
+        for piece in pieces {
+            match piece {
+                Ok(text) => {
+                    p.feed(text);
+                }
+                Err(marker) => {
+                    p.feed_marker(*marker);
+                }
+            }
+        }
+        p.finish()
+    }
+
+    #[test]
+    fn spelled_markers_are_text_and_marker_ids_are_markers() {
+        use QwenMarker::*;
+        let by_id = || Qwen35ResponseParser::new().markers_by_id();
+        // Spelled: all of it is the answer.
+        let r = run(by_id(), &[Ok("use <tool_call> or <think>, then </think>.")]);
+        assert_eq!(r.visible, "use <tool_call> or <think>, then </think>.");
+        assert!(r.tool_calls.is_empty() && r.reasoning.is_empty());
+        // The same spelling read as text opens a call: the case this mode is for.
+        let r = run(Qwen35ResponseParser::new(), &[Ok("use <tool_call> x")]);
+        assert_eq!(r.visible, "use ");
+
+        // By id: a call, with its framing read as text inside it.
+        let r = run(
+            by_id(),
+            &[
+                Ok("ok "),
+                Err(ToolCallOpen),
+                Ok("\n<function=f>\n<parameter=k>\n<tool_call>\n</parameter>\n</function>\n"),
+                Err(ToolCallClose),
+                Ok(" done"),
+            ],
+        );
+        assert_eq!(r.visible, "ok  done");
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].arguments["k"], "<tool_call>");
+    }
+
+    #[test]
+    fn reasoning_ends_only_at_the_close_id() {
+        use QwenMarker::*;
+        let r = run(
+            Qwen35ResponseParser::with_thinking_open().markers_by_id(),
+            &[
+                Ok("the tag is </think> here"),
+                Err(ThinkClose),
+                Ok("\n\nanswer"),
+            ],
+        );
+        assert_eq!(r.reasoning, "the tag is </think> here");
+        assert_eq!(r.visible, "answer");
+
+        // A marker straight after the close takes the lone separator with it.
+        let r = run(
+            Qwen35ResponseParser::with_thinking_open().markers_by_id(),
+            &[
+                Ok("hm"),
+                Err(ThinkClose),
+                Ok("\n"),
+                Err(ToolCallOpen),
+                Ok("\n<function=f>\n</function>\n"),
+                Err(ToolCallClose),
+            ],
+        );
+        assert_eq!((r.reasoning.as_str(), r.visible.as_str()), ("hm", ""));
+        assert_eq!(r.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn a_tokenizer_missing_a_marker_is_incomplete() {
+        let all = QwenMarkerIds::resolve(|t| match t {
+            "<tool_call>" => Some(1),
+            "</tool_call>" => Some(2),
+            "<think>" => Some(3),
+            "</think>" => Some(4),
+            _ => None,
+        });
+        assert!(all.complete());
+        assert_eq!(all.marker(3), Some(QwenMarker::ThinkOpen));
+        assert_eq!(all.marker(5), None);
+        let split = QwenMarkerIds::resolve(|t| (t != "</think>").then_some(7));
+        assert!(!split.complete());
     }
 }

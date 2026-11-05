@@ -467,6 +467,14 @@ impl TextTokenizer {
         self.hf.id_to_token(id)
     }
 
+    /// The one id `text` encodes to, if it is a single token: an added token
+    /// such as `<tool_call>` that the vocabulary has as a whole.
+    pub fn single_token_id(&self, text: &str) -> Option<u32> {
+        let id = self.hf.token_to_id(text)?;
+        let encoded = self.hf.encode(text, false).ok()?;
+        (encoded.get_ids() == [id]).then_some(id)
+    }
+
     pub fn stats(&self) -> &Arc<TokenizeStats> {
         &self.stats
     }
