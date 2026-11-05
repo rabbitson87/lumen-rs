@@ -921,14 +921,16 @@ impl Qwen35ResponseParser {
         if !self.markers_by_id {
             return self.feed(marker.text());
         }
-        let opens_outside_a_call = match (&self.state, marker) {
-            (State::Visible | State::AfterThink, QwenMarker::ToolCallOpen)
-            | (State::Visible | State::AfterThink, QwenMarker::ThinkOpen)
-            | (State::Visible | State::AfterThink | State::Thinking, QwenMarker::ThinkClose) => {
-                true
-            }
-            _ => false,
-        };
+        let opens_outside_a_call = matches!(
+            (&self.state, marker),
+            (
+                State::Visible | State::AfterThink,
+                QwenMarker::ToolCallOpen | QwenMarker::ThinkOpen
+            ) | (
+                State::Visible | State::AfterThink | State::Thinking,
+                QwenMarker::ThinkClose
+            )
+        );
         if !opens_outside_a_call {
             return self.feed(marker.text());
         }
