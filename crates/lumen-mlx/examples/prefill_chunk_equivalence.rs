@@ -66,6 +66,8 @@ struct Run {
     tokens: Vec<u32>,
     prefill_ms: f64,
     peak: usize,
+    /// MLX's own high-water mark during the prefill, all allocations (weights included).
+    high_water: usize,
 }
 
 /// Prefill `prompt` at `chunk`, then greedily decode `n_gen` tokens. The
@@ -85,9 +87,11 @@ fn run_at_chunk(
     unsafe { std::env::set_var(CHUNK_ENV, chunk.to_string()) };
 
     let mut peak = get_active_memory().unwrap_or(0);
+    lumen_mlx::metal_memory::reset_peak_memory();
     let t0 = Instant::now();
     let (first, mut pos) = driver.prefill(seq_id, prompt)?;
     let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let high_water = lumen_mlx::metal_memory::get_peak_memory().unwrap_or(0);
     peak = peak.max(get_active_memory().unwrap_or(0));
 
     let mut tokens = vec![first];
@@ -108,6 +112,7 @@ fn run_at_chunk(
         tokens,
         prefill_ms,
         peak: peak.saturating_sub(baseline),
+        high_water,
     })
 }
 
@@ -173,10 +178,11 @@ fn main() -> Result<()> {
     for (k, &chunk) in chunks.iter().enumerate() {
         let run = run_at_chunk(driver, &prompt, chunk, n_gen, 1000 + k as u64, baseline)?;
         println!(
-            "  chunk={:<5} prefill={:>8.1} ms  peak={:>7.1} MB  first 8 tokens={:?}",
+            "  chunk={:<5} prefill={:>8.1} ms  peak={:>7.1} MB  high-water={:>7.1} MB  first 8 tokens={:?}",
             run.chunk,
             run.prefill_ms,
             run.peak as f64 / 1e6,
+            run.high_water as f64 / 1e6,
             &run.tokens[..run.tokens.len().min(8)],
         );
         runs.push(run);

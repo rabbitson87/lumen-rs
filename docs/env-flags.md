@@ -60,6 +60,7 @@ value → on.
 | `LUMEN_NATIVE_RMS_NORM_GATED_FUSED` | off | Optimization | `lumen_mlx::native_ssm::imp::rms_norm_gated_fused` |
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
 | `LUMEN_NATIVE_WIDEN_SCALES` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::widen_scales` |
+| `LUMEN_PREFILL_MEMORY_GUARD` | on | Behavior | `lumen_mlx::prefill_memory_guard` |
 | `LUMEN_PREFIX_EXACT_REUSE` | on | Behavior | `lumen_mlx::prefix_cache::exact_reuse` |
 | `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
@@ -825,6 +826,24 @@ Keep the affine projections' scales and biases in f32 so a matmul on the f32 res
  kernels read them as they are, faster than MLX reads the f32 copy, and only a
  prefill-sized matmul still casts them. On the 4-bit Qwen checkpoints that is every
  trunk projection, so the copy, and its memory, is gone there.
+
+### `LUMEN_PREFILL_MEMORY_GUARD`
+
+*Behavior, default on.*
+
+Refuse a prompt, before prefill, whose predicted prefill peak is past the GPU's working
+ set (`max_recommended_working_set_size`), with the same `PROMPT_REJECTED` 400 as the
+ token-count guard. A count says nothing about the machine: Qwen3.6-27B on a 36 GB Mac
+ peaks at ~26 GB for a 32K prompt, and pushing a much longer one through once rebooted
+ the machine.
+
+ The prediction (`prefill_budget::PrefillPeakModel`) is the memory in use (at least the
+ checkpoint's weight files, which MLX maps lazily), a fixed part per layer for one chunk,
+ what each prompt token keeps, and the largest chunk's bf16 scores. Measured on three
+ Qwen checkpoints at 4K-32K it is never under the high-water mark and at most 4 % over
+ the total. Qwen 3.5/3.6/3.8 (not Flash-Next, which plans its own memory, nor Gemma 4).
+
+ **`Behavior`**: it refuses prompts the count allows. `=0` leaves only the count.
 
 ### `LUMEN_PREFIX_EXACT_REUSE`
 

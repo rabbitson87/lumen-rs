@@ -183,6 +183,59 @@ pub fn clamp_chunk(
 /// Chunks the grid shrinks to are whole multiples of this many tokens.
 pub const GRID_QUANTUM: usize = 256;
 
+/// What a prefill holds at its peak beyond the memory already in use, as the model's shape
+/// predicts it: a fixed part for one chunk's activations, what every prompt token keeps (the
+/// full-attention K and V, and more), and the largest chunk's attention scores.
+///
+/// Fitted on three Qwen checkpoints (M3 Max, chunk 2048, prefill high-water mark at 4K-32K):
+/// the per-token part is the architecture's to within 1 % (KV plus the scores, stored bf16), and
+/// the fixed part tracks the layer count (85-98 MB a layer at a 2048-row chunk); against the
+/// measured high-water marks the total is never under and at most 4 % over (the table is in
+/// issue #17 and in this module's tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillPeakModel {
+    pub layers: usize,
+    pub heads: usize,
+    /// What one prompt token keeps resident: the full-attention layers' K and V, plus about
+    /// `2 * hidden` the measurements found beyond them.
+    pub bytes_per_token: u64,
+}
+
+/// The fixed part of a prefill's peak, per layer, at a 2048-row chunk (it grows with the chunk).
+pub const PEAK_FIXED_BYTES_PER_LAYER: u64 = 100_000_000;
+/// Bytes per attention score as the prefill keeps them (bf16), against the f32
+/// [`SCORES_BYTES_PER_ELEM`] the scores budget is projected in.
+pub const SCORES_STORED_BYTES: u64 = 2;
+
+impl PrefillPeakModel {
+    /// The peak a prefill of `len` tokens on `grid` adds to what is in use.
+    pub fn transient_bytes(&self, grid: &PrefillGrid, len: usize) -> u64 {
+        let fixed =
+            PEAK_FIXED_BYTES_PER_LAYER * self.layers as u64 * grid.requested() as u64 / 2048;
+        let kept = self.bytes_per_token.saturating_mul(len as u64);
+        let mut start = 0usize;
+        let mut scores = 0u64;
+        for end in grid.pieces(0, len) {
+            let q = (end - start) as u64;
+            scores = scores.max(
+                (self.heads as u64)
+                    .saturating_mul(q)
+                    .saturating_mul(end as u64)
+                    .saturating_mul(SCORES_STORED_BYTES),
+            );
+            start = end;
+        }
+        fixed.saturating_add(kept).saturating_add(scores)
+    }
+}
+
+/// A prefill predicted to need more than the GPU will keep resident (`working_set`, the
+/// device's `max_recommended_working_set_size`): past it command buffers fail, or the machine
+/// stalls on memory pressure. `resident` is what is in use before the prefill.
+pub fn exceeds_working_set(resident: u64, transient: u64, working_set: u64) -> bool {
+    resident.saturating_add(transient) > working_set
+}
+
 /// Where a bulk prefill cuts its chunks, as a function of position alone.
 ///
 /// The chunk starting at position `at` attends to `at` cached keys plus its
@@ -496,5 +549,101 @@ mod tests {
         assert!(d.chunk >= 1);
         let d = clamp_chunk(0, DEFAULT_SCORES_BUDGET_BYTES, 32, 4096);
         assert_eq!(d.chunk, 1, "a zero request must not become a zero chunk");
+    }
+}
+
+#[cfg(test)]
+mod peak_model {
+    use super::*;
+
+    fn grid(heads: usize) -> PrefillGrid {
+        PrefillGrid::new(2048, DEFAULT_SCORES_BUDGET_BYTES, heads)
+    }
+
+    /// The prediction against the prefill high-water marks measured on M3 Max (chunk 2048, bf16
+    /// KV): `(model, resident GB, [(tokens, high-water GB)])`. It may be over, never under, and
+    /// at most 5 % over the total.
+    #[test]
+    fn the_prediction_covers_the_measured_peaks_closely() {
+        // Qwen3.5-9B: 32 layers, 16 heads, 8 full-attention layers x 4 KV heads x 256, hidden 4096.
+        // Qwen3.6-27B: 64 layers, 24 heads, 16 full-attention layers x 4 x 256, hidden 5120.
+        // Qwen3.6-35B-A3B: 40 layers, 16 heads, 10 full-attention layers x 2 x 256, hidden 2048.
+        let kv = |full: u64, kv_heads: u64, hidden: u64| full * 2 * kv_heads * 256 * 2 + 2 * hidden;
+        let cases: [(PrefillPeakModel, f64, &[(usize, f64)]); 3] = [
+            (
+                PrefillPeakModel {
+                    layers: 32,
+                    heads: 16,
+                    bytes_per_token: kv(8, 4, 4096),
+                },
+                7.35,
+                &[
+                    (4096, 10.9016),
+                    (8192, 11.3380),
+                    (16384, 12.2108),
+                    (32768, 13.9553),
+                ],
+            ),
+            (
+                PrefillPeakModel {
+                    layers: 64,
+                    heads: 24,
+                    bytes_per_token: kv(16, 4, 5120),
+                },
+                15.24,
+                &[
+                    (4096, 21.3575),
+                    (8192, 22.0616),
+                    (16384, 23.4722),
+                    (32768, 26.2895),
+                ],
+            ),
+            (
+                PrefillPeakModel {
+                    layers: 40,
+                    heads: 16,
+                    bytes_per_token: kv(10, 2, 2048),
+                },
+                18.47,
+                &[(4096, 22.3342), (16384, 23.3068)],
+            ),
+        ];
+        for (model, resident, points) in cases {
+            for &(len, measured) in points {
+                let predicted =
+                    resident + model.transient_bytes(&grid(model.heads), len) as f64 / 1e9;
+                let over = predicted / measured - 1.0;
+                assert!(
+                    (0.0..=0.05).contains(&over),
+                    "{model:?} at {len}: predicted {predicted:.2} GB, measured {measured:.2} ({over:+.3})"
+                );
+            }
+        }
+    }
+
+    /// Past the uniform chunks the scores stop growing with the prompt (the chunk shrinks to
+    /// keep them in budget), so the peak grows only by what each token keeps.
+    #[test]
+    fn past_the_scores_budget_only_the_kept_bytes_grow() {
+        let m = PrefillPeakModel {
+            layers: 64,
+            heads: 24,
+            bytes_per_token: 75_776,
+        };
+        let g = grid(24);
+        let (a, b) = (
+            m.transient_bytes(&g, 100_000),
+            m.transient_bytes(&g, 110_000),
+        );
+        let kept = m.bytes_per_token * 10_000;
+        assert!(b > a && b - a <= kept + kept / 10, "{a} -> {b}");
+    }
+
+    #[test]
+    fn a_prefill_past_the_working_set_is_refused_and_one_inside_is_not() {
+        let gb = 1_000_000_000u64;
+        assert!(exceeds_working_set(15 * gb, 16 * gb, 30 * gb));
+        assert!(!exceeds_working_set(15 * gb, 15 * gb, 30 * gb));
+        assert!(!exceeds_working_set(u64::MAX, 0, u64::MAX));
     }
 }
