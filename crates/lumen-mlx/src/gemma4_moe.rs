@@ -6142,24 +6142,22 @@ pub(crate) mod imp {
             self.forward_array_last_token(&ids, cache)
         }
 
-        /// The prefill chunk for a prompt whose keys reach `kv_upper`:
-        /// `LUMEN_GEMMA4_PREFILL_CHUNK` (default 2048), clamped so one chunk's
-        /// attention scores over `kv_upper` keys stay inside
-        /// `LUMEN_GEMMA4_PREFILL_SCORES_GB`. Every prefill shares this rule.
-        pub fn prefill_chunk_decision(
-            &self,
-            kv_upper: usize,
-        ) -> crate::prefill_budget::ChunkDecision {
+        /// Where a prefill cuts its chunks: `LUMEN_GEMMA4_PREFILL_CHUNK`
+        /// tokens (default 2048), shrunk by position so each chunk's attention
+        /// scores over the keys before it and its own stay inside
+        /// `LUMEN_GEMMA4_PREFILL_SCORES_GB`. Every prefill shares this grid,
+        /// and it does not depend on the prompt's length (see
+        /// [`crate::prefill_budget::PrefillGrid`]).
+        pub fn prefill_grid(&self) -> crate::prefill_budget::PrefillGrid {
             let requested: usize = std::env::var("LUMEN_GEMMA4_PREFILL_CHUNK")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&n: &usize| n > 0)
                 .unwrap_or(2048);
-            crate::prefill_budget::clamp_chunk(
+            crate::prefill_budget::PrefillGrid::new(
                 requested,
                 crate::prefill_budget::scores_budget_from_env("LUMEN_GEMMA4_PREFILL_SCORES_GB"),
                 self.config().text_config.num_attention_heads,
-                kv_upper,
             )
         }
 
@@ -6176,28 +6174,36 @@ pub(crate) mod imp {
             input_ids: &[u32],
             cache: &mut NativeGemma4PromptCache,
         ) -> Result<Array> {
-            let chunk = self
-                .prefill_chunk_decision(cache.offset() + input_ids.len())
-                .chunk;
-            self.forward_last_token_chunked_by(input_ids, cache, chunk)
+            self.forward_last_token_chunked_by(input_ids, cache, self.prefill_grid())
         }
 
-        /// [`Self::forward_last_token_chunked`] in chunks of `chunk` tokens,
-        /// counted from the cache's offset: a feed split in two at a multiple
-        /// of `chunk` past that offset runs the very chunks one call would.
+        /// [`Self::forward_last_token_chunked`] in the pieces `grid` gives a
+        /// call starting at the cache's offset: from a cut, the grid's own
+        /// chunks, so a feed split in two at a cut runs the very chunks one call
+        /// would.
         pub fn forward_last_token_chunked_by(
             &self,
             input_ids: &[u32],
             cache: &mut NativeGemma4PromptCache,
-            chunk: usize,
+            grid: crate::prefill_budget::PrefillGrid,
         ) -> Result<Array> {
             if input_ids.is_empty() {
                 return Err(anyhow!("forward_last_token_chunked: empty input_ids"));
             }
-            let chunk = chunk.max(1);
             let report = prefill_chunk_log::get();
-            let n_chunks = input_ids.len().div_ceil(chunk);
-            let mut chunks = input_ids.chunks(chunk).enumerate().peekable();
+            let base = cache.offset();
+            let mut from = 0;
+            let pieces: Vec<&[u32]> = grid
+                .pieces(base, base + input_ids.len())
+                .into_iter()
+                .map(|end| {
+                    let piece = &input_ids[from..end - base];
+                    from = end - base;
+                    piece
+                })
+                .collect();
+            let n_chunks = pieces.len();
+            let mut chunks = pieces.into_iter().enumerate().peekable();
             loop {
                 let (idx, ids) = chunks.next().expect("non-empty input yields a chunk");
                 let t0 = report.then(Instant::now);

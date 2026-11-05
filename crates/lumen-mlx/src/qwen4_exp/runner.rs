@@ -1305,18 +1305,18 @@ impl Qwen4ExpRunner {
         Ok((next, tokens.len()))
     }
 
-    /// Write `seq_id`'s rollback point (the state after `prefix`, placed on a prefill grid of
-    /// `chunk`) to the disk tier. Returns whether anything was written.
+    /// Write `seq_id`'s rollback point (the state after `prefix`, a cut of the prefill grid
+    /// `grid_key` names) to the disk tier. Returns whether anything was written.
     pub(crate) fn persist_point(
         &mut self,
         seq_id: u64,
         prefix: &[u32],
-        chunk: usize,
+        grid_key: u64,
     ) -> Result<bool> {
         let Some(disk) = self.disk.as_ref() else {
             return Ok(false);
         };
-        let key = crate::kv_disk::point_key(chunk, prefix);
+        let key = crate::kv_disk::point_key(grid_key, prefix);
         if disk.contains(&key) {
             return Ok(false);
         }
@@ -1375,7 +1375,7 @@ impl Qwen4ExpRunner {
         let chunk = self.chunk.max(1);
         let last = prompt.len().saturating_sub(1) / chunk * chunk;
         for at in (chunk..=last).rev().step_by(chunk) {
-            let key = crate::kv_disk::point_key(chunk, &prompt[..at]);
+            let key = crate::kv_disk::point_key(chunk as u64, &prompt[..at]);
             let disk = self
                 .disk
                 .as_mut()
@@ -2037,8 +2037,8 @@ impl Runner for Qwen4ExpRunner {
         Ok(position)
     }
 
-    fn prefill_grid(&self, _n: usize) -> Option<PrefillGrid> {
-        Some(PrefillGrid { chunk: self.chunk })
+    fn prefill_grid(&self) -> Option<PrefillGrid> {
+        Some(PrefillGrid::new(self.chunk, u64::MAX, 1))
     }
 
     fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {

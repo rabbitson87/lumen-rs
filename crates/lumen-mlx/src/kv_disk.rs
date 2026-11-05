@@ -1383,15 +1383,17 @@ impl Drop for FileWriter {
     }
 }
 
-/// The store key of a session state persisted after `tokens` on a prefill
-/// grid of `chunk`: a content hash, so it is the same in every process (unlike
-/// session ids, which reset on restart) and a lookup needs only the prompt.
-/// The chunk is part of it because a state is only exact to resume on the grid
-/// it was computed on (see `session_feed`).
-pub fn point_key(chunk: usize, tokens: &[u32]) -> String {
+/// The store key of a session state persisted after `tokens`, a cut of the
+/// prefill grid `grid_key` names ([`crate::prefill_budget::PrefillGrid::key_at`]):
+/// a content hash, so it is the same in every process (unlike session ids,
+/// which reset on restart) and a lookup needs only the prompt. The grid is part
+/// of it because a state is only exact to resume on the grid it was computed on
+/// (see `session_feed`). A grid of uniform chunks is named by its chunk size,
+/// as every grid was before chunks shrank by position.
+pub fn point_key(grid_key: u64, tokens: &[u32]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update((chunk as u64).to_le_bytes());
+    h.update(grid_key.to_le_bytes());
     for t in tokens {
         h.update(t.to_le_bytes());
     }

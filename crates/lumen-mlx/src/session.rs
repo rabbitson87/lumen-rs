@@ -48,11 +48,11 @@ pub(crate) trait SessionRunner {
     fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)>;
     /// Drop `seq_id` and its KV.
     fn remove_seq(&mut self, seq_id: u64) -> Result<()>;
-    /// The shape of a bulk prefill of `n` tokens. `None` — the default —
-    /// means the runner cannot say, and then no prefill is ever cut to place
-    /// a rollback point, because nothing could tell whether the cut is exact.
-    /// A runner that returns a grid must implement the rollback pair too.
-    fn prefill_grid(&self, _n: usize) -> Option<PrefillGrid> {
+    /// Where a bulk prefill cuts its chunks. `None` — the default — means the
+    /// runner cannot say, and then no prefill is ever cut to place a rollback
+    /// point, because nothing could tell whether the cut is exact. A runner
+    /// that returns a grid must implement the rollback pair too.
+    fn prefill_grid(&self) -> Option<PrefillGrid> {
         None
     }
     /// Remember `seq_id`'s current state as the point [`Self::rollback`]
@@ -80,10 +80,11 @@ pub(crate) trait SessionRunner {
     ) -> Result<Option<(u32, usize)>> {
         Ok(None)
     }
-    /// Write `seq_id`'s rollback point — the state after `prefix`, placed on
-    /// a prefill grid of `chunk` — to the runner's disk tier. Returns whether
-    /// anything was written. Default: the runner has no disk tier.
-    fn persist_point(&mut self, _seq_id: u64, _prefix: &[u32], _chunk: usize) -> Result<bool> {
+    /// Write `seq_id`'s rollback point — the state after `prefix`, a cut of
+    /// the grid `grid_key` names ([`PrefillGrid::key_at`]) — to the runner's
+    /// disk tier. Returns whether anything was written. Default: the runner
+    /// has no disk tier.
+    fn persist_point(&mut self, _seq_id: u64, _prefix: &[u32], _grid_key: u64) -> Result<bool> {
         Ok(false)
     }
     /// Start the new `seq_id` from the longest persisted state `prompt`
@@ -125,6 +126,9 @@ pub(crate) struct SessionState {
     /// rollback point left at the conversation boundary, before the generation
     /// header. `None` when no point was placed.
     pub(crate) rollback_len: Option<usize>,
+    /// The grid the rollback point is a cut of. A resume from it is exact
+    /// only on that same grid, so a runner now on another grid prefills cold.
+    pub(crate) point_grid: Option<PrefillGrid>,
     pub(crate) last_access: Instant,
 }
 
@@ -352,7 +356,7 @@ pub(crate) fn feed<R: SessionRunner + ?Sized>(
     label: &str,
 ) -> Result<(u32, usize, Option<usize>)> {
     let (seq_id, from, end) = (start.seq_id, start.from, prompt.len());
-    let plan = match (boundary, runner.prefill_grid(end)) {
+    let plan = match (boundary, runner.prefill_grid()) {
         (Some(b), Some(grid)) => session_feed::plan_feed(from, end, grid, b),
         _ => session_feed::FeedPlan {
             cuts: vec![end],
@@ -425,8 +429,8 @@ pub(crate) fn held_tokens(mut prompt: Vec<u32>, generated: &[u32], position: usi
 /// Write a turn's rollback point to the runner's disk tier, after the turn.
 ///
 /// `prompt` is the turn's prompt and `point` the rollback point its sequence
-/// holds (what [`feed`] returned). The point is keyed on the grid this prompt
-/// was fed on, so a later prompt restores it only on that same grid. Errors
+/// holds (what [`feed`] returned). The point is keyed on the grid it is a cut
+/// of, so a later prompt restores it only on that same grid. Errors
 /// are logged, never returned: the reply is already out, and a missing disk
 /// copy only costs a later prefill.
 pub(crate) fn persist_point<R: SessionRunner + ?Sized>(
@@ -436,14 +440,14 @@ pub(crate) fn persist_point<R: SessionRunner + ?Sized>(
     prompt: &[u32],
     point: Option<usize>,
 ) {
-    let (Some(at), Some(grid)) = (point, runner.prefill_grid(prompt.len())) else {
+    let (Some(at), Some(grid)) = (point, runner.prefill_grid()) else {
         return;
     };
     if at == 0 || at > prompt.len() {
         return;
     }
     let t = Instant::now();
-    match runner.persist_point(seq_id, &prompt[..at], grid.chunk) {
+    match runner.persist_point(seq_id, &prompt[..at], grid.key_at(at)) {
         Ok(true) => eprintln!(
             "[mlx] seq {seq_id} session={key:?} persisted state at {at} to disk in {:.0}ms",
             t.elapsed().as_secs_f64() * 1000.0
@@ -548,11 +552,13 @@ impl Sessions {
         label: &str,
         alloc_seq: impl FnOnce() -> u64,
     ) -> Result<SessionStart> {
+        let grid = runner.prefill_grid();
         let found = self.map.get(key).map(|s| {
             (
                 s.seq_id,
                 s.extends(prompt_ids).then_some(s.tokens.len()),
-                s.resumes_at(prompt_ids),
+                s.resumes_at(prompt_ids)
+                    .filter(|&kept| s.point_grid == grid && grid.is_some_and(|g| g.is_cut(kept))),
                 s.rollback_len,
             )
         });
@@ -694,6 +700,7 @@ impl Sessions {
                 seq_id,
                 tokens,
                 rollback_len,
+                point_grid: runner.prefill_grid(),
                 last_access: Instant::now(),
             },
         );
@@ -845,6 +852,7 @@ mod tests {
             seq_id,
             tokens: vec![1, 2, 3],
             rollback_len: None,
+            point_grid: None,
             last_access,
         }
     }
@@ -854,6 +862,7 @@ mod tests {
             seq_id: 0,
             tokens,
             rollback_len: None,
+            point_grid: None,
             last_access,
         }
     }
