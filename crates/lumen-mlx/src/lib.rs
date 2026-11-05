@@ -2034,8 +2034,17 @@ lumen_flags::flag! {
     /// The model writes freely until it emits `<tool_call>` (one token id in
     /// every shipped Qwen tokenizer). From that token to `</tool_call>` the call
     /// is masked by the request's tool grammar: a declared function name, every
-    /// required parameter, none twice. Then the grammar waits for the next
-    /// opener, so each call of a parallel turn is constrained.
+    /// required parameter, none twice, in any order (up to six parameters; past
+    /// that, the schema's). Then the grammar waits for the next opener, so each
+    /// call of a parallel turn is constrained.
+    ///
+    /// Off by default because nothing measured needs it. On Qwen3.6-35B-A3B
+    /// (mxfp4) and Qwen3.5-9B, over a plain tool set and one built to trip a
+    /// model up (unusual parameter names, required flags, ten tools), greedy and
+    /// sampled, no call came out invalid without it and every reply was the same
+    /// with it. A masked step costs ~0.4 ms over a free one (+1 % decode in a tool
+    /// turn). What did go wrong is value types — booleans written `True` — which
+    /// the grammar does not constrain.
     ///
     /// **`Behavior`**: it changes which tokens a call can contain. Off, an auto
     /// request decodes unconstrained, as before; `tool_choice=required` and a
