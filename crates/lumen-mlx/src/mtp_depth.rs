@@ -226,6 +226,49 @@ mod tests {
         assert!((t - (50.0 + COST_RATE * 50.0)).abs() < 1e-9, "{t}");
     }
 
+    /// Tokens per millisecond the controller realizes over `n` cycles of the [`run`] sequence.
+    fn realized_rate(p: f64, base: f64, per: f64, n: usize) -> f64 {
+        let mut c = DepthController::new(MtpDepth::Auto { max: 3 });
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut draw = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut tokens, mut ms) = (0.0, 0.0);
+        for _ in 0..n {
+            let k = c.next();
+            let accepted = (0..k).take_while(|_| draw() < p).count();
+            let t = base + per * k as f64;
+            c.observe(k, accepted, t);
+            tokens += 1.0 + accepted as f64;
+            ms += t;
+        }
+        tokens / ms
+    }
+
+    /// Two counts that score within a couple of percent: whichever mix the controller settles
+    /// on, it gives up no more than its exploration to the better fixed count. A controller that
+    /// flapped on noisy estimates of near-equal scores would pay the worse count's rate and the
+    /// switching on top (issue #12's case on one checkpoint).
+    #[test]
+    fn near_equal_counts_cost_no_more_than_exploration() {
+        // p = 0.6, cycles of 100 / 120 / 140 ms: one draft 1.6 / 100 = 0.0160 tokens/ms, two
+        // 1.96 / 120 = 0.0163, three 2.18 / 140 = 0.0155.
+        let (p, base, per): (f64, f64, f64) = (0.6, 80.0, 20.0);
+        let fixed = |k: i32| {
+            let tokens: f64 = (0..=k).map(|d| p.powi(d)).sum();
+            tokens / (base + per * f64::from(k))
+        };
+        let best = (1..=3).map(fixed).fold(0.0, f64::max);
+        let rate = realized_rate(p, base, per, 4000);
+        assert!(
+            rate >= 0.97 * best,
+            "realized {rate:.5} against the best fixed {best:.5}"
+        );
+    }
+
     /// A fixed count is what every cycle runs.
     #[test]
     fn a_fixed_count_is_kept() {
