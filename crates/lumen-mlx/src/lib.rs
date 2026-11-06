@@ -6442,7 +6442,8 @@ impl MlxQwen35Backend {
 
         #[cfg(feature = "mlx-native")]
         let (mut last, mut pos) = if prepared_images.is_empty() {
-            self.make_room_for_prefix_feed(prefix_cache_key, prefill_ids, true);
+            let turn = self.tool_turn_marker(prefill_ids, thinking);
+            self.make_room_for_prefix_feed(prefix_cache_key, prefill_ids, true, turn);
             self.prefix_store.prefill_optionally_cached_with(
                 &mut self.runner,
                 seq_id,
@@ -6464,6 +6465,8 @@ impl MlxQwen35Backend {
                     "image input requires a build with the `mlx-native` feature"
                 ));
             }
+            let turn = self.tool_turn_marker(prefill_ids, thinking);
+            self.prefix_store.set_turn(turn);
             self.prefix_store.prefill_optionally_cached_with(
                 &mut self.runner,
                 seq_id,
@@ -6848,7 +6851,7 @@ impl MlxQwen35Backend {
         };
 
         self.prefix_store.evict_stale(&mut self.runner);
-        self.make_room_for_prefix_feed(Some(prefix_cache_key), &prompt_ids, false);
+        self.make_room_for_prefix_feed(Some(prefix_cache_key), &prompt_ids, false, None);
 
         // Boundary snapshot to durably persist to the L2 disk tier, captured in
         // the cache-write branch and flushed AFTER the decode loop so the write
@@ -7144,13 +7147,36 @@ impl MlxQwen35Backend {
             .make_room_for(&mut self.runner, None, kv_tokens, states);
     }
 
+    /// The prefix cache's turn marker for a tool prompt: its generation header
+    /// (`qwen3_generation_header(thinking)`, as the prompt builders render it) without the last
+    /// token. `None` when the header does not encode, or `prompt_ids` holds no occurrence of the
+    /// marker (then nothing would be cut, and the store keeps its old full-prompt snapshot).
+    fn tool_turn_marker(&self, prompt_ids: &[u32], thinking: bool) -> Option<Vec<u32>> {
+        let mut marker = self
+            .encode(crate::qwen3_5_tools::qwen3_generation_header(thinking))
+            .ok()?;
+        marker.pop();
+        (marker.len() > 1 && !prefix_cache::turn_cuts(prompt_ids, &marker).is_empty())
+            .then_some(marker)
+    }
+
     /// Before a prefix-cache prefill of `prompt_ids` under `key` (`head`: the path may snapshot a
     /// system prompt's head beside the prompt's own): hold the retained state to the memory the
     /// runner was planned for ([`session::memory_evict`]), giving up the cheapest first: the heads
     /// (the other conversations', then this prompt's own), then idle sessions (the least recently
     /// used), then the prefix snapshots (the least recently used), never the one the prompt forks.
     /// A runner without a budget keeps everything.
-    fn make_room_for_prefix_feed(&mut self, key: Option<&str>, prompt_ids: &[u32], head: bool) {
+    ///
+    /// `turn` is the prompt's turn marker for the prefix cache ([`Self::tool_turn_marker`]), or
+    /// `None` on a path without turn cuts; the plan and the prefill that follows both read it.
+    fn make_room_for_prefix_feed(
+        &mut self,
+        key: Option<&str>,
+        prompt_ids: &[u32],
+        head: bool,
+        turn: Option<Vec<u32>>,
+    ) {
+        self.prefix_store.set_turn(turn);
         let plan = self
             .prefix_store
             .plan_feed(&mut self.runner, key, prompt_ids, head);
