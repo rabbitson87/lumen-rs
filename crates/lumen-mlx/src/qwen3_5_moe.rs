@@ -5487,10 +5487,6 @@ mod imp {
                 last_h = Some(new_h);
                 last_tok = draft_tok;
             }
-            history
-                .kv
-                .truncate_to(fold_end)
-                .context("mtp_step1: cut the draft tail off the head cache")?;
             if let Some(t) = t_draft0 {
                 t_draft = t.elapsed().as_secs_f64() * 1000.0;
             }
@@ -5661,6 +5657,17 @@ mod imp {
             if let Some(t) = t_accept0 {
                 t_accept = t.elapsed().as_secs_f64() * 1000.0;
             }
+
+            // The drafts' rows leave the head cache only now. `truncate_to` evaluates the
+            // cache: cut before the verify was built, that eval held the host until the GPU
+            // had written the drafts' keys, and the verify graph was built that much later
+            // (with the GPU idle under the part of the build the drafter no longer covered).
+            // The drafter has run by now, so the eval waits for nothing; the head cache is
+            // not read again before the next cycle's fold.
+            history
+                .kv
+                .truncate_to(fold_end)
+                .context("mtp_step1: cut the draft tail off the head cache")?;
 
             // Next cycle's fold: the verify rows of the lead and the accepted
             // drafts (positions verify_base ..= verify_base + n_accepted), whose
