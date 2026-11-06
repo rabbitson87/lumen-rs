@@ -480,10 +480,11 @@ Keep the MTP head's own attention cache across draft cycles and prime it with th
 *Diagnostic, default off.*
 
 Time, in a greedy one-forward MTP cycle, the host's construction of the verify graph
- (from the verify forward's first op to the accept argmax) and the wait for the GPU
- that follows it, and print both per request on the `[mlx-mtp] ... done` line. The
- drafter is already running when the build starts, so a build longer than the
- drafter's GPU time is GPU idle.
+ (from the verify forward's first op to the accept argmax), the wait for the GPU
+ that follows it, and the gap from that wait's end to the next cycle's drafter
+ submit, and print them per request on the `[mlx-mtp] ... done` line. The drafter is
+ already running when the build starts, so a build longer than the drafter's GPU time
+ is GPU idle; in the gap nothing is queued at all, so all of it is.
 
  Reads `Instant` around calls that only build lazy graphs: nothing is evaluated
  earlier than without it, so tokens and timing are unchanged.

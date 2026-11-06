@@ -103,10 +103,11 @@ mod imp {
 
     lumen_flags::flag! {
         /// Time, in a greedy one-forward MTP cycle, the host's construction of the verify graph
-        /// (from the verify forward's first op to the accept argmax) and the wait for the GPU
-        /// that follows it, and print both per request on the `[mlx-mtp] ... done` line. The
-        /// drafter is already running when the build starts, so a build longer than the
-        /// drafter's GPU time is GPU idle.
+        /// (from the verify forward's first op to the accept argmax), the wait for the GPU
+        /// that follows it, and the gap from that wait's end to the next cycle's drafter
+        /// submit, and print them per request on the `[mlx-mtp] ... done` line. The drafter is
+        /// already running when the build starts, so a build longer than the drafter's GPU time
+        /// is GPU idle; in the gap nothing is queued at all, so all of it is.
         ///
         /// Reads `Instant` around calls that only build lazy graphs: nothing is evaluated
         /// earlier than without it, so tokens and timing are unchanged.
@@ -122,17 +123,31 @@ mod imp {
     static HOST_BUILD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static HOST_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static HOST_CYCLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// The gap's sum and how many cycles had one (every cycle after a request's first).
+    static HOST_GAP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static HOST_GAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    thread_local! {
+        /// When the last cycle's accept wait ended: the GPU has had nothing queued since.
+        static ACCEPTED_AT: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    }
 
-    /// The mean verify-graph build and GPU wait per cycle in milliseconds, and the cycle count,
-    /// since the last call; `None` when no cycle was timed.
-    pub fn take_mtp_host_timing() -> Option<(f64, f64, u64)> {
+    /// Per cycle since the last call, in milliseconds: the mean verify-graph build, GPU wait and
+    /// gap to the next drafter, and the cycle count; `None` when no cycle was timed.
+    pub fn take_mtp_host_timing() -> Option<(f64, f64, f64, u64)> {
         use std::sync::atomic::Ordering::Relaxed;
+        ACCEPTED_AT.set(None);
         let n = HOST_CYCLES.swap(0, Relaxed);
         let (b, w) = (
             HOST_BUILD_NS.swap(0, Relaxed),
             HOST_WAIT_NS.swap(0, Relaxed),
         );
-        (n > 0).then(|| (b as f64 / n as f64 / 1e6, w as f64 / n as f64 / 1e6, n))
+        let (g, gaps) = (HOST_GAP_NS.swap(0, Relaxed), HOST_GAPS.swap(0, Relaxed));
+        let gap = if gaps > 0 {
+            g as f64 / gaps as f64 / 1e6
+        } else {
+            0.0
+        };
+        (n > 0).then(|| (b as f64 / n as f64 / 1e6, w as f64 / n as f64 / 1e6, gap, n))
     }
 
     lumen_flags::flag! {
@@ -5472,10 +5487,6 @@ mod imp {
                 last_h = Some(new_h);
                 last_tok = draft_tok;
             }
-            history
-                .kv
-                .truncate_to(fold_end)
-                .context("mtp_step1: cut the draft tail off the head cache")?;
             if let Some(t) = t_draft0 {
                 t_draft = t.elapsed().as_secs_f64() * 1000.0;
             }
@@ -5498,6 +5509,15 @@ mod imp {
                 let ids = mlx_rs::ops::concatenate_axis(&lazy_drafts, 0)
                     .context("mtp_step1: gather the lazy drafts")?;
                 // Start the drafter now: the GPU runs it while the verify graph is built.
+                if mtp_host_timing::get()
+                    && let Some(t) = ACCEPTED_AT.take()
+                {
+                    HOST_GAP_NS.fetch_add(
+                        t.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    HOST_GAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 mlx_rs::transforms::async_eval([&ids]).context("mtp_step1: start the drafter")?;
                 Some(ids)
             } else {
@@ -5611,6 +5631,7 @@ mod imp {
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                             HOST_CYCLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            ACCEPTED_AT.set(Some(Instant::now()));
                         }
                         drafts = d.as_slice::<i32>().iter().map(|&x| x as u32).collect();
                     }
@@ -5636,6 +5657,17 @@ mod imp {
             if let Some(t) = t_accept0 {
                 t_accept = t.elapsed().as_secs_f64() * 1000.0;
             }
+
+            // The drafts' rows leave the head cache only now. `truncate_to` evaluates the
+            // cache: cut before the verify was built, that eval held the host until the GPU
+            // had written the drafts' keys, and the verify graph was built that much later
+            // (with the GPU idle under the part of the build the drafter no longer covered).
+            // The drafter has run by now, so the eval waits for nothing; the head cache is
+            // not read again before the next cycle's fold.
+            history
+                .kv
+                .truncate_to(fold_end)
+                .context("mtp_step1: cut the draft tail off the head cache")?;
 
             // Next cycle's fold: the verify rows of the lead and the accepted
             // drafts (positions verify_base ..= verify_base + n_accepted), whose
