@@ -6299,6 +6299,7 @@ impl MlxQwen35Backend {
             } else {
                 Default::default()
             },
+            crate::qwen3_5_tools::ParamTypes::from_tools(tools),
             prepared,
             // The parser starts where the prompt left the reply: in
             // reasoning only when the builders above left the block open.
@@ -6354,6 +6355,8 @@ impl MlxQwen35Backend {
         // loop injects a `<parameter=KEY>\n` opener before the model can close
         // a `<function=NAME>` block with a required param still missing.
         force_required: std::collections::HashMap<String, Vec<String>>,
+        // How each tool's parameter values are read (the request's schemas).
+        param_types: crate::qwen3_5_tools::ParamTypes,
         // Images to splice over the prompt's placeholder runs, in prompt order.
         // Empty for a text-only request, which then prefills byte-identically
         // to the pre-vision path.
@@ -6378,7 +6381,8 @@ impl MlxQwen35Backend {
             Qwen35ResponseParser::with_thinking_open()
         } else {
             Qwen35ResponseParser::new()
-        };
+        }
+        .with_param_types(param_types);
         // Prime the parser with the prefill so its state machine
         // transitions OUT of Visible BEFORE the model starts generating.
         // Only the call's name goes on from the prefill: a named tool's
@@ -8655,6 +8659,7 @@ mod tests {
                 None, // prefix caching off for this request
                 None,
                 Default::default(),
+                Default::default(),
                 Vec::new(),
                 false, // the scripted turn emits its own tags; no open block
                 |_| Ok(()),
@@ -8753,6 +8758,7 @@ mod tests {
                 None,
                 None,
                 Default::default(),
+                Default::default(),
                 Vec::new(),
                 false,
                 |_| Ok(()),
@@ -8850,6 +8856,7 @@ mod tests {
                         7,
                         None,
                         None,
+                        Default::default(),
                         Default::default(),
                         Vec::new(),
                         false,

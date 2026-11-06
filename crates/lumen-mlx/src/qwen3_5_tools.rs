@@ -864,6 +864,9 @@ pub struct Qwen35ResponseParser {
     /// through [`Self::feed_marker`]; text that spells them is text. Set by
     /// [`Self::markers_by_id`].
     markers_by_id: bool,
+    /// How each tool's values are read. Untyped unless
+    /// [`Self::with_param_types`].
+    param_types: ParamTypes,
     /// The parameter value being read, as far as it has been streamed.
     value: ValueStream,
 }
@@ -901,13 +904,16 @@ struct PendingCall {
 /// How much of the parameter value being read has gone out as
 /// [`Qwen35ParseEvent::ToolCallArgs`].
 ///
-/// A value becomes JSON only when it closes ([`parse_param_value`]), so it
-/// streams early only once its text can no longer be anything but a string:
-/// its first non-blank character is not one JSON can start with, or (for
-/// `t`, `f`, `n`) it has stopped spelling `true`, `false` or `null`. Anything
-/// else goes out whole at its close.
+/// A value is read only when it closes ([`ParamType::read`]), so it streams
+/// early only once its text can no longer be read as anything but that text
+/// ([`ParamType::streams_as_string`]): a declared string at once; an untyped
+/// value once its first non-blank character is not one JSON can start with,
+/// or (for `t`, `f`, `n`) it has stopped spelling `true`, `false` or `null`.
+/// Anything else goes out whole at its close.
 #[derive(Debug, Default)]
 struct ValueStream {
+    /// How the value is read, from its tool's schema.
+    ty: ParamType,
     /// Where the value starts in the buffer, past its framing newline. `None`
     /// until a byte has arrived to tell.
     start: Option<usize>,
@@ -927,8 +933,17 @@ impl Qwen35ResponseParser {
             parsed_calls: Vec::new(),
             pending: None,
             markers_by_id: false,
+            param_types: ParamTypes::default(),
             value: ValueStream::default(),
         }
+    }
+
+    /// Read each value by its tool's declared type: `True` is a boolean
+    /// where the schema says boolean, and `42` stays text where it says
+    /// string.
+    pub(crate) fn with_param_types(mut self, types: ParamTypes) -> Self {
+        self.param_types = types;
+        self
     }
 
     /// From here on, the markers outside a call come only from
@@ -1317,6 +1332,7 @@ impl Qwen35ResponseParser {
                 // closing twin in `try_advance_value`, once, wherever the
                 // chunks fall; taking it here too would also take a blank line
                 // that is the value's own.
+                let mut ty = ParamType::Untyped;
                 if let Some(pending) = self.pending.as_mut() {
                     let lead = if std::mem::replace(&mut pending.args_open, true) {
                         ","
@@ -1325,8 +1341,12 @@ impl Qwen35ResponseParser {
                     };
                     let key_json = serde_json::to_string(&key).expect("a string serializes");
                     events.push(Qwen35ParseEvent::ToolCallArgs(format!("{lead}{key_json}:")));
+                    ty = self.param_types.of(&pending.name, &key);
                 }
-                self.value = ValueStream::default();
+                self.value = ValueStream {
+                    ty,
+                    ..ValueStream::default()
+                };
                 self.state = State::InParameterValue { key };
                 true
             } else {
@@ -1399,11 +1419,12 @@ impl Qwen35ResponseParser {
                     return false;
                 }
             };
-            let value = parse_param_value(&raw);
+            let stream = std::mem::take(&mut self.value);
+            let value = stream.ty.read(&raw);
             if let Some(pending) = self.pending.as_mut() {
                 // The rest of the value: its unsent tail and closing quote
                 // when it was streaming as a string, the whole JSON otherwise.
-                let rest = match std::mem::take(&mut self.value).sent {
+                let rest = match stream.sent {
                     Some(sent) => format!("{}\"", json_string_body(&raw[sent..])),
                     None => serde_json::to_string(&value).expect("a JSON value serializes"),
                 };
@@ -1441,7 +1462,7 @@ impl Qwen35ResponseParser {
         let settled = &self.buffer[start..settled_end];
         let sent = match self.value.sent {
             Some(sent) => sent,
-            None if can_only_be_a_string(settled) => {
+            None if self.value.ty.streams_as_string(settled) => {
                 events.push(Qwen35ParseEvent::ToolCallArgs("\"".to_string()));
                 0
             }
@@ -1517,10 +1538,274 @@ enum DelimKind {
     ThinkClose,
 }
 
-/// Parse a parameter value the way the model emits it: strings are raw,
-/// JSON-shaped values (objects/arrays/numbers/bools/null) are
-/// `serde_json::from_str`-able. We attempt JSON first; on failure we
-/// fall back to the raw string.
+/// The declared types of each tool's parameters, as far as they decide how the
+/// text the model wrote for a value is read ([`ParamType`]).
+///
+/// Looked up by the name the model wrote. A name the server later repairs (an
+/// MCP namespace dropped) finds nothing here, and its values are read untyped,
+/// as before.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ParamTypes {
+    by_tool: std::collections::HashMap<String, std::collections::HashMap<String, ParamType>>,
+    /// The type of a parameter no tool declares.
+    otherwise: ParamType,
+}
+
+impl ParamTypes {
+    /// From the request's tool schemas (`parameters.properties`).
+    pub(crate) fn from_tools(tools: &[ToolDef<'_>]) -> Self {
+        let by_tool = tools
+            .iter()
+            .filter_map(|t| {
+                let props = t.parameters?.get("properties")?.as_object()?;
+                let types = props
+                    .iter()
+                    .map(|(key, spec)| (key.clone(), ParamType::of_schema(spec)))
+                    .collect();
+                Some((t.name.to_string(), types))
+            })
+            .collect();
+        Self {
+            by_tool,
+            otherwise: ParamType::Untyped,
+        }
+    }
+
+    /// Every parameter of every tool typed `ty`, for the parser contract.
+    pub(crate) fn all(ty: ParamType) -> Self {
+        Self {
+            by_tool: Default::default(),
+            otherwise: ty,
+        }
+    }
+
+    fn of(&self, tool: &str, key: &str) -> ParamType {
+        self.by_tool
+            .get(tool)
+            .and_then(|keys| keys.get(key))
+            .copied()
+            .unwrap_or(self.otherwise)
+    }
+}
+
+/// How a parameter's declared JSON Schema type reads the text the model wrote
+/// for its value. Qwen's template renders a string argument raw and anything
+/// else as JSON, so the model writes `<parameter=path>\nsrc/a.rs\n` and
+/// `<parameter=n>\n3\n` alike, and only the schema says which is which. The
+/// rules follow mlx-lm's qwen3_coder parser (as oMLX applies them), except
+/// that a string stays exactly the text written: no quotes are taken off it
+/// and `null` stays the word.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ParamType {
+    /// No type that decides it (undeclared, `object`, `array`, a `$ref`): JSON
+    /// when the text is JSON, the text otherwise.
+    #[default]
+    Untyped,
+    /// The text, whatever it looks like: a file's content may well be `42` or
+    /// `{"a": 1}`.
+    String,
+    /// `true`/`false` in any case (the model writes Python's `True`).
+    Boolean,
+    Integer,
+    Number,
+    /// `"type": [..]`, or `anyOf`/`oneOf` alternatives that each name a type:
+    /// JSON when it is one of them, `true`/`false` in any case when one is a
+    /// boolean, the text otherwise.
+    Union(JsonTypes),
+}
+
+/// A set of JSON Schema type names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JsonTypes(u8);
+
+impl JsonTypes {
+    pub(crate) const STRING: Self = Self(1);
+    pub(crate) const BOOLEAN: Self = Self(1 << 1);
+    pub(crate) const INTEGER: Self = Self(1 << 2);
+    pub(crate) const NUMBER: Self = Self(1 << 3);
+    pub(crate) const NULL: Self = Self(1 << 4);
+    pub(crate) const OBJECT: Self = Self(1 << 5);
+    pub(crate) const ARRAY: Self = Self(1 << 6);
+
+    pub(crate) const fn or(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    fn has(self, t: Self) -> bool {
+        self.0 & t.0 == t.0
+    }
+
+    /// `None` for a name that is not a JSON Schema type.
+    fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "string" => Self::STRING,
+            "boolean" => Self::BOOLEAN,
+            "integer" => Self::INTEGER,
+            "number" => Self::NUMBER,
+            "null" => Self::NULL,
+            "object" => Self::OBJECT,
+            "array" => Self::ARRAY,
+            _ => return None,
+        })
+    }
+
+    fn admits(self, value: &JsonValue) -> bool {
+        let integral = |n: &serde_json::Number| {
+            n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0)
+        };
+        match value {
+            JsonValue::Null => self.has(Self::NULL),
+            JsonValue::Bool(_) => self.has(Self::BOOLEAN),
+            JsonValue::Number(n) => {
+                self.has(Self::NUMBER) || (self.has(Self::INTEGER) && integral(n))
+            }
+            JsonValue::String(_) => self.has(Self::STRING),
+            JsonValue::Array(_) => self.has(Self::ARRAY),
+            JsonValue::Object(_) => self.has(Self::OBJECT),
+        }
+    }
+}
+
+impl ParamType {
+    /// The type `spec` (one entry of `properties`) declares.
+    pub(crate) fn of_schema(spec: &JsonValue) -> Self {
+        match spec.get("type") {
+            Some(JsonValue::String(name)) => Self::named(name),
+            Some(JsonValue::Array(names)) => {
+                Self::union(names.iter().map(|n| n.as_str().and_then(JsonTypes::named)))
+            }
+            Some(_) => Self::Untyped,
+            None => {
+                let alternatives: Vec<&JsonValue> = ["anyOf", "oneOf"]
+                    .iter()
+                    .filter_map(|k| spec.get(*k)?.as_array())
+                    .flatten()
+                    .collect();
+                // An alternative with no type of its own (`$ref`, `enum`,
+                // `const`) does not bound the value.
+                Self::union(alternatives.into_iter().map(|alt| {
+                    alt.get("type")
+                        .and_then(JsonValue::as_str)
+                        .and_then(JsonTypes::named)
+                }))
+            }
+        }
+    }
+
+    /// mlx-lm's names: loose (`str`, `int32`, `float`), as tool schemas are.
+    fn named(name: &str) -> Self {
+        let name = name.trim().to_ascii_lowercase();
+        if ["string", "str", "text", "varchar", "char", "enum"].contains(&name.as_str()) {
+            Self::String
+        } else if ["boolean", "bool", "binary"].contains(&name.as_str()) {
+            Self::Boolean
+        } else if ["int", "uint", "long", "short", "unsigned"]
+            .iter()
+            .any(|p| name.starts_with(p))
+        {
+            Self::Integer
+        } else if name.starts_with("num") || name.starts_with("float") {
+            Self::Number
+        } else {
+            Self::Untyped
+        }
+    }
+
+    /// Untyped when any member is not a type, or there is none.
+    fn union(members: impl Iterator<Item = Option<JsonTypes>>) -> Self {
+        let mut types = None::<JsonTypes>;
+        for member in members {
+            let Some(t) = member else {
+                return Self::Untyped;
+            };
+            types = Some(types.map_or(t, |all| all.or(t)));
+        }
+        types.map_or(Self::Untyped, Self::Union)
+    }
+
+    /// The value `raw` (the text between the framing newlines) stands for.
+    fn read(self, raw: &str) -> JsonValue {
+        let text = raw.trim();
+        match self {
+            Self::Untyped => parse_param_value(raw),
+            Self::String => JsonValue::String(raw.to_string()),
+            Self::Boolean => spelled_boolean(text)
+                .map(JsonValue::Bool)
+                .unwrap_or_else(|| parse_param_value(raw)),
+            Self::Integer => text
+                .parse::<i64>()
+                .map(JsonValue::from)
+                .unwrap_or_else(|_| parse_param_value(raw)),
+            Self::Number => spelled_number(text).unwrap_or_else(|| parse_param_value(raw)),
+            Self::Union(types) => {
+                if types.has(JsonTypes::BOOLEAN)
+                    && let Some(b) = spelled_boolean(text)
+                {
+                    return JsonValue::Bool(b);
+                }
+                match serde_json::from_str::<JsonValue>(text) {
+                    // A quoted string is the text itself, as for `String`.
+                    Ok(v) if !v.is_string() && types.admits(&v) => v,
+                    _ => JsonValue::String(raw.to_string()),
+                }
+            }
+        }
+    }
+
+    /// Whether a value whose text begins with `prefix` reads as that text
+    /// whatever follows, so it can go out on the stream before it closes.
+    /// A value that may still be read as something else waits for its close.
+    fn streams_as_string(self, prefix: &str) -> bool {
+        match self {
+            Self::String => true,
+            Self::Untyped => can_only_be_a_string(prefix),
+            Self::Union(types) => {
+                can_only_be_a_string(prefix)
+                    && !(types.has(JsonTypes::BOOLEAN) && may_spell_a_boolean(prefix))
+            }
+            // Short, and their parsers take more than JSON does (`+3`, `.5`).
+            Self::Boolean | Self::Integer | Self::Number => false,
+        }
+    }
+}
+
+fn spelled_boolean(text: &str) -> Option<bool> {
+    if text.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if text.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Whether `prefix` and what follows may still be `true` or `false` in any
+/// case, with blanks around it.
+fn may_spell_a_boolean(prefix: &str) -> bool {
+    let q = prefix.trim_start().as_bytes();
+    ["true", "false"].iter().any(|lit| {
+        let lit = lit.as_bytes();
+        if q.len() <= lit.len() {
+            lit[..q.len()].eq_ignore_ascii_case(q)
+        } else {
+            q[..lit.len()].eq_ignore_ascii_case(lit)
+                && q[lit.len()..].iter().all(u8::is_ascii_whitespace)
+        }
+    })
+}
+
+/// An integer when it is one (`3`, `3.0`), else the float.
+fn spelled_number(text: &str) -> Option<JsonValue> {
+    if let Ok(i) = text.parse::<i64>() {
+        return Some(i.into());
+    }
+    let f = text.parse::<f64>().ok().filter(|f| f.is_finite())?;
+    if f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0 {
+        return Some((f as i64).into());
+    }
+    serde_json::Number::from_f64(f).map(JsonValue::Number)
+}
+
 /// Whether a value whose text begins with `prefix` is a string whatever
 /// follows, as [`parse_param_value`] would read the whole: its first non-blank
 /// character cannot start JSON, or it can only have been `true`, `false` or
@@ -1551,6 +1836,9 @@ fn json_string_body(text: &str) -> String {
     quoted[1..quoted.len() - 1].to_string()
 }
 
+/// Read an untyped parameter value the way the model emits it: strings are
+/// raw, JSON-shaped values (objects/arrays/numbers/bools/null) are
+/// `serde_json::from_str`-able. JSON first; on failure, the raw string.
 fn parse_param_value(raw: &str) -> JsonValue {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -3256,13 +3544,161 @@ mod markers_by_id {
 }
 
 #[cfg(test)]
+mod param_types {
+    use super::{JsonTypes, ParamType, ParamTypes, Qwen35ResponseParser};
+    use crate::chat_io::ToolDef;
+    use serde_json::{Value, json};
+
+    /// Tool `f` whose one parameter `k` has schema `spec`.
+    fn types(spec: &Value) -> ParamTypes {
+        let params = json!({"type": "object", "properties": {"k": spec}});
+        ParamTypes::from_tools(&[ToolDef {
+            name: "f",
+            description: None,
+            parameters: Some(&params),
+            response: None,
+        }])
+    }
+
+    /// The value of `k` in a call of `f` that wrote `raw` for it.
+    fn read(spec: Value, raw: &str) -> Value {
+        let mut p = Qwen35ResponseParser::new().with_param_types(types(&spec));
+        p.feed(&format!(
+            "<tool_call>\n<function=f>\n<parameter=k>\n{raw}\n</parameter>\n</function>\n</tool_call>"
+        ));
+        let mut calls = p.finish().tool_calls;
+        assert_eq!(calls.len(), 1, "{raw:?}");
+        calls.remove(0).arguments["k"].take()
+    }
+
+    #[test]
+    fn a_boolean_is_read_in_any_case() {
+        for spec in [
+            json!({"type": "boolean"}),
+            json!({"type": ["boolean", "null"]}),
+            json!({"anyOf": [{"type": "boolean"}, {"type": "null"}]}),
+        ] {
+            for (raw, b) in [
+                ("True", true),
+                ("False", false),
+                ("true", true),
+                (" FALSE ", false),
+            ] {
+                assert_eq!(read(spec.clone(), raw), json!(b), "{spec} {raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_string_is_the_text_written_whatever_it_looks_like() {
+        for raw in [
+            "42",
+            "true",
+            "True",
+            "null",
+            "{\"a\": 1}",
+            "[1, 2]",
+            "\"quoted\"",
+            "-0.5",
+            "  padded ",
+        ] {
+            assert_eq!(read(json!({"type": "string"}), raw), json!(raw), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_number_is_read_by_its_type() {
+        assert_eq!(read(json!({"type": "integer"}), "5"), json!(5));
+        assert_eq!(read(json!({"type": "integer"}), " +7 "), json!(7));
+        assert_eq!(read(json!({"type": "number"}), "2.5"), json!(2.5));
+        assert_eq!(read(json!({"type": "number"}), "3.0"), json!(3));
+        assert_eq!(read(json!({"type": "number"}), ".5"), json!(0.5));
+        // Not a number: read as an untyped value is.
+        assert_eq!(read(json!({"type": "integer"}), "many"), json!("many"));
+        assert_eq!(read(json!({"type": "number"}), "inf"), json!("inf"));
+    }
+
+    #[test]
+    fn a_union_takes_json_of_its_types_and_the_text_otherwise() {
+        let optional_string = json!({"type": ["string", "null"]});
+        assert_eq!(read(optional_string.clone(), "null"), Value::Null);
+        assert_eq!(read(optional_string.clone(), "123"), json!("123"));
+        assert_eq!(read(optional_string.clone(), "True"), json!("True"));
+        assert_eq!(read(optional_string, "\"q\""), json!("\"q\""));
+        let optional_int = json!({"anyOf": [{"type": "integer"}, {"type": "null"}]});
+        assert_eq!(read(optional_int.clone(), "4"), json!(4));
+        assert_eq!(read(optional_int.clone(), "4.0"), json!(4.0));
+        assert_eq!(read(optional_int, "4.5"), json!("4.5"));
+    }
+
+    #[test]
+    fn what_no_type_decides_is_read_as_before() {
+        for spec in [
+            json!({}),
+            json!({"type": "object"}),
+            json!({"type": "datetime"}),
+            json!({"type": ["string", 5]}),
+            json!({"anyOf": [{"$ref": "#/x"}, {"type": "null"}]}),
+            json!({"anyOf": []}),
+        ] {
+            assert_eq!(ParamType::of_schema(&spec), ParamType::Untyped, "{spec}");
+        }
+        assert_eq!(
+            read(json!({"type": "object"}), "{\"a\": 1}"),
+            json!({"a": 1})
+        );
+        assert_eq!(read(json!({}), "True"), json!("True"));
+        assert_eq!(read(json!({}), "42"), json!(42));
+    }
+
+    #[test]
+    fn loose_type_names_are_read_as_mlx_lm_reads_them() {
+        for (name, ty) in [
+            ("str", ParamType::String),
+            ("int32", ParamType::Integer),
+            ("float", ParamType::Number),
+            (" Bool ", ParamType::Boolean),
+        ] {
+            assert_eq!(ParamType::of_schema(&json!({"type": name})), ty, "{name}");
+        }
+        assert_eq!(
+            ParamType::of_schema(&json!({"oneOf": [{"type": "string"}, {"type": "array"}]})),
+            ParamType::Union(JsonTypes::STRING.or(JsonTypes::ARRAY))
+        );
+    }
+
+    /// A parameter of another tool, or one the schema does not list, is read
+    /// untyped: the schema of `f.k` is not `g.k`'s.
+    #[test]
+    fn types_belong_to_their_tool() {
+        let mut p = Qwen35ResponseParser::new().with_param_types(types(&json!({"type": "string"})));
+        p.feed(
+            "<tool_call>\n<function=g>\n<parameter=k>\n42\n</parameter>\n</function>\n</tool_call>\
+             <tool_call>\n<function=f>\n<parameter=other>\n42\n</parameter>\n<parameter=k>\n\
+             42\n</parameter>\n</function>\n</tool_call>",
+        );
+        let calls = p.finish().tool_calls;
+        assert_eq!(calls[0].arguments, json!({"k": 42}));
+        assert_eq!(calls[1].arguments, json!({"other": 42, "k": "42"}));
+    }
+}
+
+#[cfg(test)]
 mod streamed_args {
-    use super::{Qwen35ParseEvent, Qwen35ResponseParser};
+    use super::{ParamTypes, Qwen35ParseEvent, Qwen35ResponseParser};
 
     /// Feed `chunks` and return, per chunk, the argument pieces it produced,
     /// plus the finished calls.
     fn pieces(chunks: &[&str]) -> (Vec<Vec<String>>, Vec<(String, serde_json::Value)>) {
-        let mut p = Qwen35ResponseParser::new();
+        pieces_typed(ParamTypes::default(), chunks)
+    }
+
+    /// [`pieces`] with values read as `types` says.
+    fn pieces_typed(
+        types: ParamTypes,
+        chunks: &[&str],
+    ) -> (Vec<Vec<String>>, Vec<(String, serde_json::Value)>) {
+        let mut p = Qwen35ResponseParser::new().with_param_types(types);
         let per_chunk = chunks
             .iter()
             .map(|c| {
@@ -3349,6 +3785,34 @@ mod streamed_args {
         assert_eq!(per_chunk[1], ["\"", "truth be told"]);
     }
 
+    /// A declared string is text whatever it begins with, so it goes out from
+    /// its first byte; a declared boolean may still be `True`, so it waits.
+    #[test]
+    fn a_declared_type_decides_what_streams_early() {
+        use super::ParamType;
+        let chunks = [
+            "<tool_call>\n<function=f>\n<parameter=k>\n4",
+            "2 is the answer",
+            "\n</parameter>\n</function>\n</tool_call>",
+        ];
+        let (per_chunk, calls) = pieces_typed(ParamTypes::all(ParamType::String), &chunks);
+        assert_eq!(per_chunk[0], ["{\"k\":", "\"", "4"]);
+        assert_eq!(calls[0].1, serde_json::json!({"k": "42 is the answer"}));
+        assert_eq!(
+            joined(&per_chunk),
+            serde_json::to_string(&calls[0].1).unwrap()
+        );
+        let (per_chunk, calls) = pieces_typed(
+            ParamTypes::all(ParamType::Boolean),
+            &[
+                "<tool_call>\n<function=f>\n<parameter=k>\nTru",
+                "e\n</parameter>\n</function>\n</tool_call>",
+            ],
+        );
+        assert_eq!(per_chunk[0], ["{\"k\":"], "`Tru` may still be `True`");
+        assert_eq!(calls[0].1, serde_json::json!({"k": true}));
+    }
+
     #[test]
     fn a_held_closer_prefix_is_not_sent_as_value_text() {
         let (per_chunk, calls) = pieces(&[
@@ -3377,6 +3841,12 @@ mod streamed_args {
             "<tool_call>\n<function=w>\n<parameter=a>\n1\n</parameter>\n<parameter=a>\nlater\n\
              </parameter>\n</function>\n</tool_call>",
             "<tool_call>\n<function=w>\n<parameter=a>\nnot closed",
+            // Values each type reads differently.
+            "<tool_call>\n<function=w>\n<parameter=a>\nTrue\n</parameter>\n<parameter=b>\n\
+             +3\n</parameter>\n<parameter=c>\n.5\n</parameter>\n<parameter=d>\n FALSE \n\
+             </parameter>\n<parameter=e>\nTruer\n</parameter>\n<parameter=f>\n{\"a\": 1}\n\
+             </parameter>\n<parameter=g>\nnull\n</parameter>\n<parameter=h>\ntr\n</parameter>\n\
+             <parameter=i>\n7.0\n</parameter>\n</function>\n</tool_call>",
         ];
         for text in texts {
             for density in 0..8u8 {
