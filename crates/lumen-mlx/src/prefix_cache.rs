@@ -292,6 +292,74 @@ pub trait SnapshotRunner {
     }
 }
 
+/// Where a prompt is cut at its turn boundaries: right after every occurrence of `marker`, the
+/// generation header without its last token, in ascending order.
+///
+/// A round's prompt ends in its generation header, and a later round's prompt holds that header
+/// again where the reply begins (a tool round renders the assistant turn with the same
+/// `<think>` block). The cuts depend only on the tokens before them, so every prompt that
+/// continues another cuts where that one did: the previous round's point (its last cut) is a cut
+/// of the next round's cold prefill, and resuming there computes every row as that cold prefill
+/// does. The header's last token is left out of the marker: a held-back grammar step feeds it on
+/// its own, and in the replayed turn it can merge with the reply's first token. The marker starts
+/// with `<|im_start|>`, which client text never encodes to, so only the template's headers match.
+pub(crate) fn turn_cuts(prompt: &[u32], marker: &[u32]) -> Vec<usize> {
+    if marker.is_empty() {
+        return Vec::new();
+    }
+    prompt
+        .windows(marker.len())
+        .enumerate()
+        .filter(|(_, w)| *w == marker)
+        .map(|(i, _)| i + marker.len())
+        .collect()
+}
+
+/// Feed `tokens[from..]` — a prefill when `from` is 0 — as one call per piece between the `cuts`
+/// that fall inside it, keeping a deep snapshot of the state at `mark` (one of those cuts, or the
+/// end): `(next token, position, snapshot)`. A snapshot that fails is skipped with a log line; one
+/// taken is released again if a later call fails, so nothing is left unowned.
+fn feed_at_cuts<R: SnapshotRunner + ?Sized>(
+    runner: &mut R,
+    seq_id: u64,
+    tokens: &[u32],
+    from: usize,
+    cuts: &[usize],
+    mark: Option<usize>,
+) -> Result<(u32, usize, Option<u64>)> {
+    let end = tokens.len();
+    let ends = cuts
+        .iter()
+        .copied()
+        .filter(|&c| c > from && c < end)
+        .chain(std::iter::once(end));
+    let (mut at, mut out, mut snap) = (from, (0, from), None);
+    for to in ends {
+        let fed = if at == 0 {
+            runner.prefill(seq_id, &tokens[..to])
+        } else {
+            runner.extend(seq_id, &tokens[at..to])
+        };
+        out = match fed {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(s) = snap {
+                    let _ = runner.release_snapshot(s);
+                }
+                return Err(e);
+            }
+        };
+        at = to;
+        if mark == Some(to) {
+            match runner.snapshot_state_deep(seq_id) {
+                Ok((s, _)) => snap = Some(s),
+                Err(e) => eprintln!("[mlx] prefix-cache: turn point at {to} skipped: {e:#}"),
+            }
+        }
+    }
+    Ok((out.0, out.1, snap))
+}
+
 /// [`SnapshotRunner::prefill_split`] as two calls: prefill to `at`, snapshot (when `keep`), extend
 /// the rest. A snapshot that fails is skipped with a log line (the prompt is still fed in the same
 /// two stages); one taken is released again if the extend fails, so nothing is left unowned.
@@ -416,6 +484,11 @@ pub struct PrefixCacheStore {
     /// Set by [`Self::plan_feed`] when the cold MISS it planned cannot afford a head snapshot
     /// beside its own: the next prefill goes without one.
     skip_head: bool,
+    /// The turn marker of the prompt being served ([`Self::set_turn`]): its generation header
+    /// without the last token. With it, a runner that is not cut-sensitive cuts every feed at the
+    /// turn boundaries ([`turn_cuts`]) and keeps its point at the last one, so the next round
+    /// resumes where its own cold prefill cuts too.
+    turn: Option<Vec<u32>>,
 }
 
 /// A snapshot waiting for [`PrefixCacheStore::flush_persist`].
@@ -448,6 +521,7 @@ impl PrefixCacheStore {
             incremental,
             pending_persist: None,
             skip_head: false,
+            turn: None,
         }
     }
 
@@ -464,6 +538,7 @@ impl PrefixCacheStore {
             incremental: false,
             pending_persist: None,
             skip_head: false,
+            turn: None,
         }
     }
 
@@ -484,6 +559,7 @@ impl PrefixCacheStore {
             incremental: false,
             pending_persist: None,
             skip_head: false,
+            turn: None,
         }
     }
 
@@ -499,6 +575,7 @@ impl PrefixCacheStore {
             incremental,
             pending_persist: None,
             skip_head: false,
+            turn: None,
         }
     }
 
@@ -516,6 +593,20 @@ impl PrefixCacheStore {
         self.prefill_optionally_cached_with(runner, seq_id, prompt_ids, key, move || {
             incremental_boundary
         })
+    }
+
+    /// The turn marker of the prompt about to be planned and fed (`None`: no turn cuts, the
+    /// feed and every HIT as before). Set before [`Self::plan_feed`] and the prefill of each
+    /// request, since both read it. Ignored by [`exact_reuse`], which keeps its own grid.
+    pub(crate) fn set_turn(&mut self, marker: Option<Vec<u32>>) {
+        self.turn = marker.filter(|m| !m.is_empty());
+    }
+
+    /// The cuts of `prompt_ids` at its turn boundaries, when a marker is set and the runner is
+    /// not on [`exact_reuse`]'s grid.
+    fn turns_of(&self, prompt_ids: &[u32], exact: bool) -> Option<Vec<usize>> {
+        let marker = self.turn.as_deref().filter(|_| !exact)?;
+        Some(turn_cuts(prompt_ids, marker))
     }
 
     pub fn enabled(&self) -> bool {
@@ -651,6 +742,13 @@ impl PrefixCacheStore {
             // nothing else but an identical prompt), so the suffix is fed in chunks counted from
             // it, and the state at the last grid point is kept for the next round.
             let resume = hit_resume(exact, origin, prompt_ids.len(), prefix.len());
+            // Turn cuts: the suffix is fed a turn at a time and the entry advances to the last
+            // turn this prompt reaches, not to its end.
+            let turns = self.turns_of(prompt_ids, exact.is_some());
+            let turn_mark = turns
+                .as_ref()
+                .and_then(|c| c.last().copied())
+                .filter(|&m| m > prefix.len());
             let mut point = None;
             let t = Instant::now();
             // Lock the source entry across fork+extend so a re-entrant eviction
@@ -669,10 +767,18 @@ impl PrefixCacheStore {
                             prefix.len(),
                         )
                     } else {
-                        let fed = match resume {
-                            Some((_, _, Some(mark))) => {
+                        let fed = match (resume, turns.as_deref()) {
+                            (Some((_, _, Some(mark))), _) => {
                                 runner.extend_marked(seq_id, suffix, Some(mark))
                             }
+                            (_, Some(cuts)) => feed_at_cuts(
+                                runner,
+                                seq_id,
+                                prompt_ids,
+                                prefix.len(),
+                                cuts,
+                                turn_mark,
+                            ),
                             _ => runner.extend(seq_id, suffix).map(|(l, p)| (l, p, None)),
                         };
                         match fed {
@@ -704,7 +810,7 @@ impl PrefixCacheStore {
             // Skipped on an empty suffix: the forked state already equals the
             // stored snapshot, so re-snapshotting would only churn ~3GB of KV.
             let mut advanced_to = prefix.len();
-            if suffix.is_empty() || exact.is_some() {
+            if suffix.is_empty() || exact.is_some() || (turns.is_some() && point.is_none()) {
                 self.set_in_use(key, idx, false);
                 if let Some(e) = self.entries.get_mut(key).and_then(|v| v.get_mut(idx)) {
                     e.last_access = Instant::now();
@@ -753,8 +859,15 @@ impl PrefixCacheStore {
                         .get(key)
                         .and_then(|v| v.get(idx))
                         .is_some_and(|e| e.pinned_boundary);
-                match runner.snapshot_state_deep(seq_id) {
-                    Ok((snap_id, _)) if matched_pinned => {
+                let advanced = match (point, turn_mark) {
+                    (Some(snap), Some(at)) => Ok((snap, at)),
+                    _ => runner
+                        .snapshot_state_deep(seq_id)
+                        .map(|(snap, _)| (snap, prompt_ids.len())),
+                };
+                let last_at = |upto: usize| (upto == prompt_ids.len()).then_some(last);
+                match advanced {
+                    Ok((snap_id, upto)) if matched_pinned => {
                         // The match was an incremental boundary head (Phase 0).
                         // KEEP it so future divergent prefix-sharing prompts can
                         // still fork it, and add the advanced full prompt as a
@@ -770,25 +883,25 @@ impl PrefixCacheStore {
                             key,
                             PrefixCacheEntry {
                                 master_snapshot_id: snap_id,
-                                prefix_tokens: prompt_ids.to_vec(),
+                                prefix_tokens: prompt_ids[..upto].to_vec(),
                                 last_access: Instant::now(),
                                 hits: 0,
-                                last_token: Some(last),
+                                last_token: last_at(upto),
                                 in_use: 0,
                                 pinned_boundary: false,
                                 grid_origin: None,
                             },
                         );
                         self.evict_stale(runner);
-                        advanced_to = prompt_ids.len();
+                        advanced_to = upto;
                         self.pending_persist = Some(PendingPersist {
                             snapshot_id: snap_id,
                             key: key.to_string(),
-                            prefix_tokens: prompt_ids.to_vec(),
-                            last_token: Some(last),
+                            prefix_tokens: prompt_ids[..upto].to_vec(),
+                            last_token: last_at(upto),
                         });
                     }
-                    Ok((snap_id, _)) => {
+                    Ok((snap_id, upto)) => {
                         // Replace the matched candidate in place with the advanced
                         // snapshot, releasing the superseded one. (Same key/index
                         // → single-entry behaviour is identical.)
@@ -798,10 +911,10 @@ impl PrefixCacheStore {
                             let hits = e.hits + 1;
                             *e = PrefixCacheEntry {
                                 master_snapshot_id: snap_id,
-                                prefix_tokens: prompt_ids.to_vec(),
+                                prefix_tokens: prompt_ids[..upto].to_vec(),
                                 last_access: Instant::now(),
                                 hits,
-                                last_token: Some(last),
+                                last_token: last_at(upto),
                                 in_use: 0,
                                 pinned_boundary: false,
                                 grid_origin: None,
@@ -810,12 +923,12 @@ impl PrefixCacheStore {
                         };
                         let _ = runner.release_snapshot(old);
                         self.evict_stale(runner);
-                        advanced_to = prompt_ids.len();
+                        advanced_to = upto;
                         self.pending_persist = Some(PendingPersist {
                             snapshot_id: snap_id,
                             key: key.to_string(),
-                            prefix_tokens: prompt_ids.to_vec(),
-                            last_token: Some(last),
+                            prefix_tokens: prompt_ids[..upto].to_vec(),
+                            last_token: last_at(upto),
                         });
                     }
                     Err(e) => {
@@ -918,6 +1031,74 @@ impl PrefixCacheStore {
                 self.entries.get(key).map(|v| v.len()).unwrap_or(0),
             );
             self.pending_persist = self.head_pending(key, prompt_ids);
+            return Ok((last, pos));
+        } else if let Some(cuts) = self.turns_of(prompt_ids, exact.is_some()) {
+            // Turn cuts: the head (when there is one), then one call per turn, the point kept at
+            // the last turn instead of the full prompt — where the next round's own cold prefill
+            // cuts too, so resuming there is that cold computation.
+            let head_at = incremental_boundary.filter(|_| do_incremental);
+            let from = head_at.unwrap_or(0);
+            let mark = cuts.last().copied().filter(|&c| c > from);
+            if let Some(b) = head_at {
+                runner.prefill(seq_id, &prompt_ids[..b])?;
+                if !skip_head {
+                    match runner.snapshot_state_deep(seq_id) {
+                        Ok((snap_b, _)) => self.insert_branch(
+                            runner,
+                            key,
+                            PrefixCacheEntry {
+                                master_snapshot_id: snap_b,
+                                prefix_tokens: prompt_ids[..b].to_vec(),
+                                last_access: Instant::now(),
+                                hits: 0,
+                                last_token: None,
+                                in_use: 0,
+                                pinned_boundary: true,
+                                grid_origin: Some(b),
+                            },
+                        ),
+                        Err(e) => eprintln!(
+                            "[mlx] prefix-cache: incremental boundary snapshot skipped \
+                             (boundary={b}): {e:#}"
+                        ),
+                    }
+                }
+            }
+            let (last, pos, point) = feed_at_cuts(runner, seq_id, prompt_ids, from, &cuts, mark)?;
+            if let (Some(snap), Some(m)) = (point, mark) {
+                let last_token = (m == prompt_ids.len()).then_some(last);
+                self.insert_branch(
+                    runner,
+                    key,
+                    PrefixCacheEntry {
+                        master_snapshot_id: snap,
+                        prefix_tokens: prompt_ids[..m].to_vec(),
+                        last_access: Instant::now(),
+                        hits: 0,
+                        last_token,
+                        in_use: 0,
+                        pinned_boundary: false,
+                        grid_origin: None,
+                    },
+                );
+                self.evict_stale(runner);
+                self.pending_persist = Some(PendingPersist {
+                    snapshot_id: snap,
+                    key: key.to_string(),
+                    prefix_tokens: prompt_ids[..m].to_vec(),
+                    last_token,
+                });
+                eprintln!(
+                    "[mlx] prefix-cache MISS (tools) key={key:?} stored snapshot={snap} \
+                     prefix_len={m} of {} (turn point; {} turn cuts) branches={}",
+                    prompt_ids.len(),
+                    cuts.len(),
+                    self.entries.get(key).map(|v| v.len()).unwrap_or(0),
+                );
+            }
+            if heads_only {
+                self.pending_persist = self.head_pending(key, prompt_ids);
+            }
             return Ok((last, pos));
         } else if do_incremental {
             let b = incremental_boundary.unwrap();
@@ -1276,8 +1457,18 @@ impl PrefixCacheStore {
     ///
     /// With `exact` (see [`exact_reuse`]) an entry off the cold grid (`grid_origin` `None`) is
     /// served to the identical prompt only: extending it would cut where no cold prefill does.
+    /// With a turn marker ([`Self::set_turn`]) the same holds for an entry that is neither a head
+    /// nor cut at a turn boundary (its prefix does not end with the marker).
     fn longest_hit(&self, key: &str, prompt_ids: &[u32], exact: bool) -> Option<usize> {
         let cands = self.entries.get(key)?;
+        let off_turn = |e: &PrefixCacheEntry| {
+            !exact
+                && !e.pinned_boundary
+                && self
+                    .turn
+                    .as_deref()
+                    .is_some_and(|m| !e.prefix_tokens.ends_with(m))
+        };
         let mut best: Option<(usize, usize)> = None; // (index, prefix_len)
         for (i, e) in cands.iter().enumerate() {
             let p = &e.prefix_tokens;
@@ -1285,7 +1476,9 @@ impl PrefixCacheStore {
                 continue;
             }
             let extends = prompt_ids.len() > p.len();
-            if !(extends || e.last_token.is_some()) || (exact && extends && e.grid_origin.is_none())
+            if !(extends || e.last_token.is_some())
+                || (exact && extends && e.grid_origin.is_none())
+                || (extends && off_turn(e))
             {
                 continue;
             }
@@ -1867,6 +2060,26 @@ mod tests {
         sweep_interruptions("extending hit", |store, runner| {
             let _ = store.prefill_optionally_cached(runner, 1, &[1, 2, 3], Some("k"), None);
             let _ = store.prefill_optionally_cached(runner, 2, &[1, 2, 3, 4, 5], Some("k"), None);
+        });
+    }
+
+    /// The turn-cut feeds (#29): a cold MISS with a head and a turn point, then two warm rounds,
+    /// each cut into one call per turn with snapshots between them.
+    #[test]
+    fn turn_rounds_survive_interruption_at_every_point() {
+        sweep_interruptions("turn rounds", |store, runner| {
+            store.set_turn(Some(MARKER.to_vec()));
+            for round in 0..3 {
+                let p = conversation(round);
+                let _ = store.prefill_optionally_cached(
+                    runner,
+                    round as u64 + 1,
+                    &p,
+                    Some("k"),
+                    Some(HEAD_LEN),
+                );
+            }
+            store.set_turn(None);
         });
     }
 
@@ -3219,5 +3432,158 @@ mod tests {
         assert!(log.iter().any(|l| l == "release(40)"), "{log:?}");
         assert!(branches.iter().all(|&(_, _, head)| !head), "{branches:?}");
         assert!(nothing_persisted);
+    }
+
+    // ───────────────── turn cuts (#29) ─────────────────
+
+    /// A runner whose state remembers the call boundaries that built it: every call appends its
+    /// end, a snapshot copies the list, a fork restores it. Two states are computed alike exactly
+    /// when their lists are equal — the calls are what MLX picks its kernels by.
+    #[derive(Default)]
+    struct CutRunner {
+        seqs: HashMap<u64, Vec<usize>>,
+        snaps: HashMap<u64, Vec<usize>>,
+        next_snap: u64,
+        /// Tokens fed to each sequence since it was last prefilled or forked.
+        fed: HashMap<u64, usize>,
+    }
+
+    impl CutRunner {
+        fn feed(&mut self, seq: u64, len: usize, fresh: bool) -> Result<(u32, usize)> {
+            let fed = self.fed.entry(seq).or_default();
+            *fed = if fresh { len } else { *fed + len };
+            let cuts = self.seqs.entry(seq).or_default();
+            if fresh {
+                cuts.clear();
+            }
+            let at = cuts.last().copied().unwrap_or(0) + len;
+            cuts.push(at);
+            Ok((7, at))
+        }
+    }
+
+    impl SnapshotRunner for CutRunner {
+        fn prefill(&mut self, seq: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.feed(seq, tokens.len(), true)
+        }
+        fn extend(&mut self, seq: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.feed(seq, tokens.len(), false)
+        }
+        fn snapshot_state_deep(&mut self, seq: u64) -> Result<(u64, usize)> {
+            let cuts = self.seqs.get(&seq).cloned().unwrap_or_default();
+            let at = cuts.last().copied().unwrap_or(0);
+            self.next_snap += 1;
+            self.snaps.insert(self.next_snap, cuts);
+            Ok((self.next_snap, at))
+        }
+        fn fork_from_snapshot(&mut self, snapshot_id: u64, dst: u64) -> Result<usize> {
+            let cuts = self.snaps[&snapshot_id].clone();
+            let at = cuts.last().copied().unwrap_or(0);
+            self.seqs.insert(dst, cuts);
+            self.fed.insert(dst, 0);
+            Ok(at)
+        }
+        fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
+            self.snaps.remove(&snapshot_id);
+            Ok(())
+        }
+    }
+
+    /// `<|im_start|>` and the rest of a generation header; `HEADER_END` is its last token.
+    const IM_START: u32 = 900;
+    const MARKER: [u32; 3] = [IM_START, 901, 902];
+    const HEADER_END: u32 = 903;
+    const HEAD_LEN: usize = 12;
+
+    /// A tool conversation's prompt after `rounds` rounds: a 12-token system+tools head, then per
+    /// round a header, the reply, the tool's result, and the next round's header at the end.
+    fn conversation(rounds: usize) -> Vec<u32> {
+        let mut p: Vec<u32> = (1..=HEAD_LEN as u32).collect();
+        for r in 0..=rounds {
+            p.extend(MARKER);
+            p.push(HEADER_END);
+            if r < rounds {
+                let reply = 3 + r % 4;
+                p.extend((0..reply).map(|i| 100 + i as u32));
+                p.extend((0..5 + r).map(|i| 200 + i as u32));
+            }
+        }
+        p
+    }
+
+    fn turn_store() -> PrefixCacheStore {
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        store.set_turn(Some(MARKER.to_vec()));
+        store
+    }
+
+    /// The cuts behind a cold prefill of `prompt`.
+    fn cold_cuts(prompt: &[u32]) -> Vec<usize> {
+        let (mut r, mut store) = (CutRunner::default(), turn_store());
+        store
+            .prefill_optionally_cached(&mut r, 1, prompt, Some("k"), Some(HEAD_LEN))
+            .expect("cold");
+        r.seqs[&1].clone()
+    }
+
+    #[test]
+    fn turn_cuts_follow_every_header_and_nothing_else() {
+        let p = conversation(2);
+        let cuts = turn_cuts(&p, &MARKER);
+        assert_eq!(cuts.len(), 3);
+        for &c in &cuts {
+            assert_eq!(&p[c - MARKER.len()..c], MARKER);
+            assert_eq!(p[c], HEADER_END, "the header's last token is past the cut");
+        }
+        assert!(turn_cuts(&p, &[]).is_empty());
+        assert!(turn_cuts(&[1, 2], &MARKER).is_empty());
+    }
+
+    /// Round after round, each warm turn resumes at the previous round's last turn and its state
+    /// is built by exactly the calls a cold prefill of its prompt makes; and it feeds only what is
+    /// new past that point (the header's last token plus the round).
+    #[test]
+    fn a_warm_tool_round_is_its_cold_prefill() {
+        for held_back in [false, true] {
+            let (mut r, mut store) = (CutRunner::default(), turn_store());
+            for round in 0..6 {
+                let full = conversation(round);
+                // An active grammar holds the prompt's last token back for a masked step.
+                let fed = &full[..full.len() - usize::from(held_back)];
+                store
+                    .prefill_optionally_cached(&mut r, 9, fed, Some("k"), Some(HEAD_LEN))
+                    .expect("round");
+                let ctx = format!("round {round} held_back={held_back}");
+                assert_eq!(r.seqs[&9], cold_cuts(fed), "{ctx}");
+                if round > 0 {
+                    let previous = *turn_cuts(&conversation(round - 1), &MARKER).last().unwrap();
+                    assert_eq!(
+                        r.fed[&9],
+                        fed.len() - previous,
+                        "{ctx}: fed past the last turn"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Before turn cuts, a round's snapshot was its full prompt. Such an entry (from an older
+    /// process's disk tier, or a prompt that held no marker) is not a cut of the next prompt's
+    /// cold prefill, so it is not extended: the round resumes from the head instead.
+    #[test]
+    fn a_full_prompt_snapshot_is_not_extended_under_turn_cuts() {
+        let mut r = CutRunner::default();
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let first = conversation(1);
+        store
+            .prefill_optionally_cached(&mut r, 1, &first, Some("k"), Some(HEAD_LEN))
+            .expect("old-style round");
+        store.set_turn(Some(MARKER.to_vec()));
+        let next = conversation(2);
+        store
+            .prefill_optionally_cached(&mut r, 2, &next, Some("k"), Some(HEAD_LEN))
+            .expect("round");
+        assert_eq!(r.seqs[&2], cold_cuts(&next));
+        assert_eq!(r.seqs[&2][0], HEAD_LEN, "forked from the head");
     }
 }
