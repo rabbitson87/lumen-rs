@@ -15,7 +15,9 @@
 mod imp {
     use anyhow::{Result, anyhow};
     use mlx_rs::{Array, Dtype};
+    use std::cell::OnceCell;
     use std::ffi::CString;
+    use std::thread::LocalKey;
 
     /// `Ok` for an mlx-c success status (0), otherwise an error naming the
     /// call. `call` is formatted only on failure.
@@ -351,19 +353,40 @@ mod imp {
             }
         }
     }
+
+    /// Runs `f` with this thread's kernel from `slot`, building it on first use.
+    ///
+    /// Constructing a kernel makes MLX search its whole source for every attribute it knows and
+    /// three names per input. A kernel on a decode path built per call pays that per layer per
+    /// step, and a handle carries no call's arguments, so one serves every dtype and size. A
+    /// failed build leaves the slot empty. MLX keeps one stream per thread and the engine decodes
+    /// on one thread, so the slot is a `thread_local`.
+    pub fn with_thread_kernel<R>(
+        slot: &'static LocalKey<OnceCell<MetalKernel>>,
+        build: impl FnOnce() -> Result<MetalKernel>,
+        f: impl FnOnce(&MetalKernel) -> Result<R>,
+    ) -> Result<R> {
+        slot.with(|cell| {
+            if cell.get().is_none() {
+                let _ = cell.set(build()?);
+            }
+            f(cell.get().ok_or_else(|| anyhow!("kernel slot empty"))?)
+        })
+    }
 }
 
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3b.5.d SSM kernel + future kernels.
-pub use imp::{MetalKernel, MetalKernelConfig};
+pub use imp::{MetalKernel, MetalKernelConfig, with_thread_kernel};
 
 // Smoke test — verify the FFI wrapper works with a minimal kernel before
 // we use it for the more complex SSM kernel. Mirrors the C example
 // `myexp` (`out[elem] = metal::exp(inp[elem])`).
 #[cfg(all(test, feature = "mlx-native"))]
 mod smoke_tests {
-    use super::imp::{MetalKernel, MetalKernelConfig};
+    use super::imp::{MetalKernel, MetalKernelConfig, with_thread_kernel};
     use mlx_rs::{Array, Dtype};
+    use std::cell::{Cell, OnceCell};
 
     /// The Metal language version MLX compiles run-time kernels with — the
     /// one the user's macOS supports, not the build machine's.
@@ -433,19 +456,68 @@ mod smoke_tests {
         myexp_smoke_kernel_works_as(Dtype::Bfloat16, 1e-2);
     }
 
-    fn myexp_smoke_kernel_works_as(dt: Dtype, max_rel: f32) {
-        let source = "uint elem = thread_position_in_grid.x;\n\
-                      float tmp = static_cast<float>(inp[elem]);\n\
-                      out[elem] = static_cast<T>(metal::exp(tmp));";
-        let kernel = MetalKernel::new(
+    fn myexp_kernel() -> anyhow::Result<MetalKernel> {
+        MetalKernel::new(
             "myexp",
             &["inp"],
             &["out"],
-            source,
+            "uint elem = thread_position_in_grid.x;\n\
+             float tmp = static_cast<float>(inp[elem]);\n\
+             out[elem] = static_cast<T>(metal::exp(tmp));",
             /* ensure_row_contiguous */ true,
             /* atomic_outputs */ false,
         )
-        .expect("MetalKernel::new must succeed");
+    }
+
+    /// A slot builds once per thread, keeps nothing from a failed build, and one handle serves
+    /// calls that differ in dtype.
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn a_thread_builds_its_kernel_once() {
+        thread_local! {
+            static SLOT: OnceCell<MetalKernel> = const { OnceCell::new() };
+        }
+        let builds = Cell::new(0);
+        let failed = with_thread_kernel(
+            &SLOT,
+            || {
+                builds.set(builds.get() + 1);
+                Err(anyhow::anyhow!("no kernel"))
+            },
+            |_| Ok(()),
+        );
+        assert!(failed.is_err());
+
+        let values = [0.0_f32, 1.0, 2.0, 3.0];
+        for (dt, max_rel) in [(Dtype::Float32, 1e-5), (Dtype::Bfloat16, 1e-2)] {
+            let input = Array::from_slice(&values, &[4]).as_dtype(dt).unwrap();
+            let config = MetalKernelConfig::new();
+            config.add_template_arg_dtype("T", dt).unwrap();
+            config.set_grid(4, 1, 1).unwrap();
+            config.set_thread_group(4, 1, 1).unwrap();
+            config.add_output_arg(&[4], dt).unwrap();
+            let out = with_thread_kernel(
+                &SLOT,
+                || {
+                    builds.set(builds.get() + 1);
+                    myexp_kernel()
+                },
+                |kernel| kernel.apply(&[&input], &config, 1),
+            )
+            .unwrap();
+            assert_eq!(out[0].dtype(), dt);
+            let out = out[0].as_dtype(Dtype::Float32).unwrap();
+            out.eval().unwrap();
+            for (&got, x) in out.as_slice::<f32>().iter().zip(values) {
+                let rel = (got - x.exp()).abs() / x.exp();
+                assert!(rel < max_rel, "{dt:?} exp({x}): got {got}");
+            }
+        }
+        assert_eq!(builds.get(), 2, "one failed build, then one that stays");
+    }
+
+    fn myexp_smoke_kernel_works_as(dt: Dtype, max_rel: f32) {
+        let kernel = myexp_kernel().expect("MetalKernel::new must succeed");
 
         let input_data: [f32; 4] = [0.0, 1.0, 2.0, 3.0];
         let input = Array::from_slice(&input_data, &[4]).as_dtype(dt).unwrap();

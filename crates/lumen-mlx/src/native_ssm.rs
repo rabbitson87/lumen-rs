@@ -221,6 +221,13 @@ mod imp {
         }
     "#;
 
+    thread_local! {
+        static GATED_DELTA: std::cell::OnceCell<crate::metal_kernel::MetalKernel> =
+            const { std::cell::OnceCell::new() };
+        static GATED_DELTA_CAPTURE: std::cell::OnceCell<crate::metal_kernel::MetalKernel> =
+            const { std::cell::OnceCell::new() };
+    }
+
     /// One pass of the delta-net SSM recurrence, dispatched as a single
     /// runtime-compiled Metal kernel via `mlx_fast_metal_kernel_*`. Mirrors
     /// `gated_delta_kernel(q, k, v, g, beta, state, mask=None)` from
@@ -260,7 +267,7 @@ mod imp {
         state_in: &Array,
         capture: bool,
     ) -> Result<Vec<Array>> {
-        use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
+        use crate::metal_kernel::{MetalKernel, MetalKernelConfig, with_thread_kernel};
 
         let fn_name = if capture {
             "gated_delta_step_kernel_capture"
@@ -289,31 +296,6 @@ mod imp {
                 "{fn_name}: head_k_dim must be a multiple of 32 (kernel uses simdgroup reduction over a tile of 32), got {head_k_dim}"
             ));
         }
-
-        // Each kernel is constructed with its name as a literal: `cargo xtask
-        // test` reads the names off `MetalKernel::new` calls to check that
-        // every kernel ran in its Metal 3.1 pass.
-        let (kernel, n_outputs) = if capture {
-            let kernel = MetalKernel::new(
-                "gated_delta_step_capture",
-                &["q", "k", "v", "g", "beta", "state_in", "T"],
-                &["y", "state_out", "state_per_pos"],
-                GATED_DELTA_CAPTURE_KERNEL_SOURCE,
-                /* ensure_row_contiguous */ true,
-                /* atomic_outputs */ false,
-            )?;
-            (kernel, 3)
-        } else {
-            let kernel = MetalKernel::new(
-                "gated_delta_step",
-                &["q", "k", "v", "g", "beta", "state_in", "T"],
-                &["y", "state_out"],
-                GATED_DELTA_KERNEL_SOURCE,
-                /* ensure_row_contiguous */ true,
-                /* atomic_outputs */ false,
-            )?;
-            (kernel, 2)
-        };
 
         let config = MetalKernelConfig::new();
         config.add_template_arg_dtype("InT", q.dtype())?;
@@ -346,7 +328,41 @@ mod imp {
         // T is a 0-d int scalar input. MLX dereferences scalar arrays at
         // call sites, so the kernel sees T as an int value.
         let t_scalar = Array::from_int(seq);
-        kernel.apply(&[q, k, v, g, beta, state_in, &t_scalar], &config, n_outputs)
+        let inputs = [q, k, v, g, beta, state_in, &t_scalar];
+        // Each kernel is constructed with its name as a literal: `cargo xtask
+        // test` reads the names off `MetalKernel::new` calls to check that
+        // every kernel ran in its Metal 3.1 pass.
+        if capture {
+            with_thread_kernel(
+                &GATED_DELTA_CAPTURE,
+                || {
+                    MetalKernel::new(
+                        "gated_delta_step_capture",
+                        &["q", "k", "v", "g", "beta", "state_in", "T"],
+                        &["y", "state_out", "state_per_pos"],
+                        GATED_DELTA_CAPTURE_KERNEL_SOURCE,
+                        /* ensure_row_contiguous */ true,
+                        /* atomic_outputs */ false,
+                    )
+                },
+                |kernel| kernel.apply(&inputs, &config, 3),
+            )
+        } else {
+            with_thread_kernel(
+                &GATED_DELTA,
+                || {
+                    MetalKernel::new(
+                        "gated_delta_step",
+                        &["q", "k", "v", "g", "beta", "state_in", "T"],
+                        &["y", "state_out"],
+                        GATED_DELTA_KERNEL_SOURCE,
+                        /* ensure_row_contiguous */ true,
+                        /* atomic_outputs */ false,
+                    )
+                },
+                |kernel| kernel.apply(&inputs, &config, 2),
+            )
+        }
     }
 
     /// Capture variant of the gated-delta kernel: identical recurrence, but
@@ -765,8 +781,6 @@ mod imp {
     }
 
     thread_local! {
-        /// MLX keeps one stream per thread and the engine decodes on one thread, so the kernel is
-        /// built once per thread, not per layer per step.
         static LINATTN_PREWORK: std::cell::OnceCell<crate::metal_kernel::MetalKernel> =
             const { std::cell::OnceCell::new() };
     }
@@ -794,7 +808,7 @@ mod imp {
         dv: i32,
         k_taps: i32,
     ) -> Result<LinAttnPrework> {
-        use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
+        use crate::metal_kernel::{MetalKernel, MetalKernelConfig, with_thread_kernel};
         if k_taps < 2 {
             return Err(anyhow::anyhow!(
                 "linattn_prework_fused: needs at least 2 conv taps, got {k_taps}"
@@ -842,9 +856,10 @@ mod imp {
         let eps_arr = Array::from_slice(&[eps], &[1]);
         // Each kernel is constructed with its name as a literal: `cargo xtask test` reads the
         // names off `MetalKernel::new` calls to check that every kernel ran in its Metal 3.1 pass.
-        let outs = LINATTN_PREWORK.with(|cell| {
-            if cell.get().is_none() {
-                let kernel = MetalKernel::new(
+        let outs = with_thread_kernel(
+            &LINATTN_PREWORK,
+            || {
+                MetalKernel::new(
                     "linattn_prework_fused",
                     &[
                         "conv_state",
@@ -862,12 +877,10 @@ mod imp {
                     LINATTN_PREWORK_SOURCE,
                     /* ensure_row_contiguous */ true,
                     /* atomic_outputs */ false,
-                )?;
-                let _ = cell.set(kernel);
-            }
-            cell.get()
-                .ok_or_else(|| anyhow::anyhow!("linattn_prework_fused: kernel missing"))?
-                .apply(
+                )
+            },
+            |kernel| {
+                kernel.apply(
                     &[
                         conv_state, mixed_qkv, conv_w, wq, wk, &eps_arr, b_pre, a_pre, a_log,
                         dt_bias,
@@ -875,7 +888,8 @@ mod imp {
                     &config,
                     6,
                 )
-        })?;
+            },
+        )?;
         let mut it = outs.into_iter();
         let mut next = |what: &str| {
             it.next()

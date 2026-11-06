@@ -23,9 +23,15 @@
 
 #[cfg(feature = "mlx-native")]
 mod imp {
-    use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
+    use crate::metal_kernel::{MetalKernel, MetalKernelConfig, with_thread_kernel};
     use anyhow::{Result, anyhow};
     use mlx_rs::{Array, Dtype};
+    use std::cell::OnceCell;
+
+    thread_local! {
+        static PASS1: OnceCell<MetalKernel> = const { OnceCell::new() };
+        static PASS2: OnceCell<MetalKernel> = const { OnceCell::new() };
+    }
 
     // Each lane's `D / 32` elements are handled as float4 quads. At 8 bits a
     // packed word is one quad, elements in order. At 4 bits a word holds eight
@@ -263,14 +269,6 @@ mod imp {
         let gqa = h / h_kv;
         let blocks = blocks_for(n, gqa);
 
-        let pass1 = MetalKernel::new(
-            "lumen_quantized_sdpa_decode_pass1",
-            &["q", "kw", "ks", "kb", "vw", "vs", "vb"],
-            &["partials", "sums", "maxs"],
-            PASS1_SOURCE,
-            /* ensure_row_contiguous */ false,
-            /* atomic_outputs */ false,
-        )?;
         let config = MetalKernelConfig::new();
         config.add_template_arg_int("D", d)?;
         config.add_template_arg_int("BITS", bits)?;
@@ -283,29 +281,35 @@ mod imp {
         config.add_output_arg(&[rows * d], Dtype::Float32)?;
         config.add_output_arg(&[rows], Dtype::Float32)?;
         config.add_output_arg(&[rows], Dtype::Float32)?;
-        let mut pass1_out = pass1
-            .apply(
-                &[
-                    queries, &keys.0, &keys.1, &keys.2, &values.0, &values.1, &values.2,
-                ],
-                &config,
-                3,
-            )?
-            .into_iter();
+        let mut pass1_out = with_thread_kernel(
+            &PASS1,
+            || {
+                MetalKernel::new(
+                    "lumen_quantized_sdpa_decode_pass1",
+                    &["q", "kw", "ks", "kb", "vw", "vs", "vb"],
+                    &["partials", "sums", "maxs"],
+                    PASS1_SOURCE,
+                    /* ensure_row_contiguous */ false,
+                    /* atomic_outputs */ false,
+                )
+            },
+            |kernel| {
+                kernel.apply(
+                    &[
+                        queries, &keys.0, &keys.1, &keys.2, &values.0, &values.1, &values.2,
+                    ],
+                    &config,
+                    3,
+                )
+            },
+        )?
+        .into_iter();
         let (partials, sums, maxs) = (
             pass1_out.next().expect("pass 1 partials"),
             pass1_out.next().expect("pass 1 sums"),
             pass1_out.next().expect("pass 1 maxs"),
         );
 
-        let pass2 = MetalKernel::new(
-            "lumen_quantized_sdpa_decode_pass2",
-            &["partials", "sums", "maxs"],
-            &["out"],
-            PASS2_SOURCE,
-            /* ensure_row_contiguous */ true,
-            /* atomic_outputs */ false,
-        )?;
         let config = MetalKernelConfig::new();
         config.add_template_arg_int("D", d)?;
         config.add_template_arg_int("BLOCKS", blocks)?;
@@ -313,11 +317,23 @@ mod imp {
         config.set_grid(d, b * h, 1)?;
         config.set_thread_group(d.min(1024), 1, 1)?;
         config.add_output_arg(&[b, h, 1, d], queries.dtype())?;
-        let out = pass2
-            .apply(&[&partials, &sums, &maxs], &config, 1)?
-            .into_iter()
-            .next()
-            .expect("pass 2 output");
+        let out = with_thread_kernel(
+            &PASS2,
+            || {
+                MetalKernel::new(
+                    "lumen_quantized_sdpa_decode_pass2",
+                    &["partials", "sums", "maxs"],
+                    &["out"],
+                    PASS2_SOURCE,
+                    /* ensure_row_contiguous */ true,
+                    /* atomic_outputs */ false,
+                )
+            },
+            |kernel| kernel.apply(&[&partials, &sums, &maxs], &config, 1),
+        )?
+        .into_iter()
+        .next()
+        .expect("pass 2 output");
         Ok(out)
     }
 }
