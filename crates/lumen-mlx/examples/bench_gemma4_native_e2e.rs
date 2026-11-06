@@ -20,14 +20,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-// lumen-rs Phase 1.6: MLX-side SDPA stage timing dump.
-// Implemented in mlx/fast.cpp (extern "C" public symbol so macOS ld
-// doesn't dead-strip the internal namespace counters in libmlx.a).
+// mlx-c wrapper stage timing.
 #[cfg(feature = "mlx-native")]
 unsafe extern "C" {
-    fn mlx_dump_sdpa_timing();
-    fn mlx_reset_sdpa_timing();
-    // mlx-c wrapper stage timing.
     fn mlxc_dump_sdpa_timing();
     fn mlxc_reset_sdpa_timing();
 }
@@ -100,12 +95,11 @@ fn main() -> Result<()> {
         }
     }
 
-    // Reset MLX-side + mlx-c + mlx-rs SDPA stage counters AFTER warmup
+    // Reset the mlx-c + mlx-rs SDPA stage counters AFTER warmup
     // so the breakdown reflects only the timed run. Counters accumulate
     // across all SDPA calls in the process — without reset, warmup's
     // calls dilute the averages.
     unsafe {
-        mlx_reset_sdpa_timing();
         mlxc_reset_sdpa_timing();
     }
     mlx_rs::fast::sdpa_timing::reset();
@@ -290,20 +284,9 @@ fn main() -> Result<()> {
         println!("  [breakdown:{label}] sum (4 buckets) = {sum:.3}ms/step ({suffix})");
     }
 
-    // MLX-side SDPA stage breakdown (per-call ns inside the C++ function).
-    // Dumps to stderr via the extern "C" entry point in mlx/fast.cpp.
-    if std::env::var("LUMEN_SDPA_TIMING_DUMP")
-        .map(|v| v != "0")
-        .unwrap_or(false)
-    {
-        unsafe {
-            mlx_dump_sdpa_timing();
-        }
-    }
-
     // mlx-c wrapper stage breakdown (input_extract / sdpa_call / output_wrap).
-    // Compared with MLX-side TOTAL, isolates the cost between Rust's
-    // `Array::try_from_op` and the C++ entry into mlx::core::SDPA.
+    // Isolates the cost between Rust's `Array::try_from_op` and the C++ entry
+    // into mlx::core::SDPA.
     if std::env::var("LUMEN_MLXC_SDPA_TIMING_DUMP")
         .map(|v| v != "0")
         .unwrap_or(false)
