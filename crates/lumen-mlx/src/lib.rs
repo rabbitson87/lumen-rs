@@ -7560,8 +7560,11 @@ impl MlxQwen35Backend {
             }
             let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
             let host = crate::qwen3_5_moe::take_mtp_host_timing()
-                .map(|(build, wait, n)| {
-                    format!(" host_build={build:.2}ms gpu_wait={wait:.2}ms over {n} cycles")
+                .map(|(build, wait, gap, n)| {
+                    format!(
+                        " host_build={build:.2}ms gpu_wait={wait:.2}ms gap={gap:.2}ms \
+                         over {n} cycles"
+                    )
                 })
                 .unwrap_or_default();
             eprintln!(
