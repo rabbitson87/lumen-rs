@@ -619,13 +619,32 @@ attention truncates, only the linear-attention state is kept) and the next turn
 winds back to it instead of prefilling the whole conversation, replies
 byte-identical.
 
-Placing the point means cutting the prefill, and a cut is exact only if every row
-is still computed as the bulk pass computes it. `session_feed::plan_feed` cuts
-only on the bulk pass's chunk grid, so each call is one of that pass's chunks:
-the point goes on the last chunk boundary before the header, and the next turn
-re-feeds from there — at most one chunk (on Qwen3.5-9B, 85 tokens resumed in
-0.2 s, a full 2,115 in 5 s, against 9–11 s cold at 4K). Cutting inside a chunk
-is not exact on either kind of model. On a mixture-of-experts model `GatherQMM`
+Placing the point means cutting the prefill, and a resume is exact only if every
+row was computed as that prompt's cold prefill computes it. `session_feed::plan_feed`
+gets there by cutting only on the bulk pass's chunk grid: the point goes on the
+last chunk boundary before the header, and the next turn re-feeds from there, up
+to one chunk (on Qwen3.5-9B, 85 tokens resumed in 0.2 s, a full 2,115 in 5 s,
+against 9–11 s cold at 4K; on Qwen3.6-35B-A3B at 35K, 0.2 to 4.9 s to add ~40
+tokens). `session_feed::plan_turns`, which the Qwen session path uses, removes
+most of that residue: a prefill also cuts where an assistant turn starts, whether
+or not a point is wanted, the point goes on the last cut before the header, and
+the next turn feeds what follows it. Those cuts depend only on the tokens before
+them, so any longer prompt's cold prefill makes the same calls and a resume still
+equals it, though neither equals one bulk pass in every bit.
+
+A cut adds a call, and a call costs far more than its rows do inside a bulk chunk
+(about 100 ms on Qwen3.6-35B-A3B at 14K). A cut at every turn made a cold prefill
+of 400 short turns four times slower, so `session_feed::kept_turns` skips a turn
+less than `MIN_TURN_GAP` tokens past the cut before it. That bounds what a turn
+re-feeds beyond what is new at the gap, and a turn of normal length gets its cut.
+At 256 a cold prefill costs 10–20 % more than on the grid alone, and a warm turn
+at 14K goes from ~2.2 s to ~0.3 s. A state fed this way has its own disk key
+(`session_feed::point_grid_key`), and it is written once per chunk of the grid,
+not per turn. Flash-Next stays on the grid: there is no local checkpoint to verify
+it on.
+
+A cut that a cold prefill does not make is not exact on either kind of model. On a
+mixture-of-experts model `GatherQMM`
 tiles across the rows routed to each expert, so a row depends on which rows
 share its call (a 128-row-floored cut on Qwen3.6-35B-A3B still differed from a
 cold prefill). On a dense model it was exact on MLX 0.30 with 32+ rows a piece,
@@ -656,6 +675,10 @@ worked example):
   `session::conversation_boundary` (it runs only when rollback points are on).
   If the header is not a clean suffix of the prompt, the turn gets no rollback
   point — never a wrong one.
+- optionally, where its assistant turns start, filtered by
+  `session_feed::kept_turns` and passed as `turns` to `position`, `session::feed`
+  and `restore_point`, for a resume with almost no residue. Without them the
+  point stays on the grid.
 
 Then run `a_rollback_point_changes_no_token` on a checkpoint of the family before
 turning it on: "a bulk prefill fed chunk by chunk is the same computation" is
