@@ -108,6 +108,14 @@ point mlx-c's `GIT_TAG` at it, bump the submodule on a matching mlx-rs
 branch, then bump the `rev` here. The force-push flow below is only for
 mlx-rs and mlx-c, which are pinned by SHA.
 
+**A fast-forward push to the MLX branch reaches clean builds, not an existing
+`target/`.** A build you already have keeps the MLX it fetched, and it still
+exits 0. To take the push, clear both profiles: `cargo clean -p mlx-sys` leaves
+release alone, so also run `cargo clean -p mlx-sys --release`. Then read the
+commit the rebuild fetched, in the directory `mlx_SOURCE_DIR` names in each
+profile's `CMakeCache.txt`. A push also changes what every older commit
+builds, so keep any symbol an older lumen-rs commit links.
+
 ### Bumping a fork SHA (when upstream has new commits to integrate)
 
 ```bash
