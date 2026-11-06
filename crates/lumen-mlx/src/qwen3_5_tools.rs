@@ -631,6 +631,7 @@ pub fn format_qwen3_chat_with_tools_from_history_and_images(
     tools: &[ToolDef<'_>],
     effort: Option<ReasoningEffort>,
 ) -> PromptText {
+    let turns = &*crate::chat_io::tool_results_in_call_order(turns);
     let mut s = PromptText::new();
     let mut idx = 0;
 
@@ -2098,6 +2099,52 @@ mod tests {
         let s = format_qwen3_chat_with_tools_from_history(&turns, false, &[], None);
         // Both tool_responses in ONE user turn.
         assert!(s.contains("<|im_start|>user\n<tool_response>\nr1\n</tool_response>\n<tool_response>\nr2\n</tool_response><|im_end|>"));
+    }
+
+    /// Results sent in the order they finished render as the template would
+    /// render them in call order: the template pairs them by position.
+    #[test]
+    fn parallel_results_render_in_call_order() {
+        let args = serde_json::json!({"city": "x"});
+        let calls = [
+            AssistantToolCall {
+                id: "c1",
+                name: "get_weather",
+                arguments: &args,
+            },
+            AssistantToolCall {
+                id: "c2",
+                name: "get_weather",
+                arguments: &args,
+            },
+        ];
+        let history = |first: (&'static str, &'static str),
+                       second: (&'static str, &'static str)| {
+            vec![
+                ChatTurn::User("q"),
+                ChatTurn::Assistant {
+                    text: "",
+                    tool_calls: &calls,
+                },
+                ChatTurn::Tool {
+                    tool_call_id: first.0,
+                    name: None,
+                    content: first.1,
+                },
+                ChatTurn::Tool {
+                    tool_call_id: second.0,
+                    name: None,
+                    content: second.1,
+                },
+            ]
+        };
+        let render = |turns: &[ChatTurn<'_>]| {
+            format_qwen3_chat_with_tools_from_history(turns, false, &[], None).into_string()
+        };
+        let in_order = render(&history(("c1", "Seoul 21C"), ("c2", "Paris 9C")));
+        let as_finished = render(&history(("c2", "Paris 9C"), ("c1", "Seoul 21C")));
+        assert_eq!(as_finished, in_order);
+        assert!(in_order.find("Seoul") < in_order.find("Paris"));
     }
 
     #[test]

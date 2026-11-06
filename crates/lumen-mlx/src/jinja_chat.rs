@@ -374,6 +374,7 @@ pub(crate) mod imp {
     }
 
     fn turns_to_json(turns: &[ChatTurn<'_>]) -> Result<JsonValue> {
+        let turns = &*crate::chat_io::tool_results_in_call_order(turns);
         let mut out = Vec::with_capacity(turns.len() + turns.iter().filter(|t| matches!(t, ChatTurn::Assistant { tool_calls, .. } if !tool_calls.is_empty())).count());
         for t in turns {
             match t {

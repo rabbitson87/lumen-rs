@@ -520,6 +520,7 @@ pub(crate) mod imp {
         ) -> Result<Vec<u32>> {
             use crate::chat_io::ChatTurn;
 
+            let turns = &*crate::chat_io::tool_results_in_call_order(turns);
             let mut out: Vec<u32> = Vec::with_capacity(64 + turns.len() * 64);
             out.push(TOK_BOS);
 
@@ -1139,6 +1140,55 @@ pub(crate) mod imp {
                 close_at,
                 closed.len() - 1,
                 "the closed channel must be the last thing before generation"
+            );
+        }
+
+        /// Gemma puts each result after the call it answers, by position:
+        /// results sent in the order they finished render as in call order.
+        #[test]
+        #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
+        fn parallel_results_render_after_their_calls() {
+            use crate::chat_io::{AssistantToolCall, ChatTurn};
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
+            let args = serde_json::json!({"city": "x"});
+            let calls = [
+                AssistantToolCall {
+                    id: "c1",
+                    name: "get_weather",
+                    arguments: &args,
+                },
+                AssistantToolCall {
+                    id: "c2",
+                    name: "get_weather",
+                    arguments: &args,
+                },
+            ];
+            let render = |first: (&str, &str), second: (&str, &str)| {
+                let turns = [
+                    ChatTurn::User("q"),
+                    ChatTurn::Assistant {
+                        text: "",
+                        tool_calls: &calls,
+                    },
+                    ChatTurn::Tool {
+                        tool_call_id: first.0,
+                        name: None,
+                        content: first.1,
+                    },
+                    ChatTurn::Tool {
+                        tool_call_id: second.0,
+                        name: None,
+                        content: second.1,
+                    },
+                ];
+                tpl.render_chat_history(&turns, &RenderOptions::default(), &[])
+                    .expect("render")
+            };
+            assert_eq!(
+                render(("c2", "Paris 9C"), ("c1", "Seoul 21C")),
+                render(("c1", "Seoul 21C"), ("c2", "Paris 9C"))
             );
         }
 
