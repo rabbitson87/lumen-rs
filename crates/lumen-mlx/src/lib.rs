@@ -2875,6 +2875,7 @@ impl MlxBackend {
                     visible: visible.into_owned(),
                     reasoning: reasoning.trim().to_string(),
                     tool_calls: Vec::new(),
+                    cut_call: false,
                     stop: m.take_stop(),
                 })
             }
@@ -3492,6 +3493,7 @@ impl MlxBackend {
                     visible: visible.into_owned(),
                     reasoning: reasoning.trim().to_string(),
                     tool_calls: Vec::new(),
+                    cut_call: false,
                     stop: m.take_stop(),
                 })
             }
@@ -5620,6 +5622,7 @@ impl MlxQwen35Backend {
                 visible: out,
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
+                cut_call: false,
                 stop: crate::chat_io::StopCause::EndOfTurn,
             });
         }
@@ -5685,6 +5688,7 @@ impl MlxQwen35Backend {
             visible: out,
             reasoning: String::new(),
             tool_calls: Vec::new(),
+            cut_call: false,
             stop: crate::chat_io::StopCause::after_decode(
                 &generated,
                 max_new_tokens,
@@ -10345,6 +10349,37 @@ mod tests {
         let (parsed, _) = tool_loop(scripted_call(5), crate::grammar::ToolCalls::OneOrMore, 6);
         assert!(parsed.tool_calls.is_empty());
         assert_eq!(parsed.stop, StopCause::MaxTokens);
+    }
+
+    /// A complete call, then a second one the budget cuts: the turn is not
+    /// the calls it reports, so it reports the cut. A budget that runs out
+    /// right after the last call closes still reports the calls.
+    #[test]
+    fn a_later_call_cut_by_the_budget_is_a_cut_turn() {
+        use crate::chat_io::StopCause;
+        let mut script = scripted_call(5);
+        script.push(2);
+        script.extend(scripted_call(6));
+        let first_and_a_half = scripted_call(5).len() + 1 + 6;
+        let (cut, _) = tool_loop(
+            script.clone(),
+            crate::grammar::ToolCalls::OneOrMore,
+            first_and_a_half,
+        );
+        assert_eq!(cut.tool_calls.len(), 1);
+        assert_eq!(cut.stop, StopCause::MaxTokens);
+        assert!(cut.cut_call);
+        assert!(!cut.reports_tool_calls());
+
+        let (closed, _) = tool_loop(
+            script.clone(),
+            crate::grammar::ToolCalls::OneOrMore,
+            script.len(),
+        );
+        assert_eq!(closed.tool_calls.len(), 2);
+        assert_eq!(closed.stop, StopCause::MaxTokens);
+        assert!(!closed.cut_call);
+        assert!(closed.reports_tool_calls());
     }
 
     #[test]

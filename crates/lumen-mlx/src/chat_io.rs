@@ -35,6 +35,9 @@ pub struct ParsedResponse {
     /// they leave the default; the decode loop that fed them sets it through
     /// [`Self::stopped`].
     pub stop: StopCause,
+    /// A tool call was still open when decoding stopped: it is not in
+    /// `tool_calls`, though its start may already be on the stream.
+    pub cut_call: bool,
 }
 
 impl ParsedResponse {
@@ -42,6 +45,16 @@ impl ParsedResponse {
     /// learns why it stopped only after the parser has built the response.
     pub fn stopped(self, stop: StopCause) -> Self {
         Self { stop, ..self }
+    }
+
+    /// Whether the turn reports its tool calls as its finish (`tool_calls` /
+    /// `tool_use`). Not when the budget cut a call short: the calls before it
+    /// are not the whole turn, and the cut one's partial arguments may
+    /// already be on the stream, so the client is told the turn was cut
+    /// (`length` / `max_tokens`). A budget that ran out after the last call
+    /// closed still reports the calls.
+    pub fn reports_tool_calls(&self) -> bool {
+        !self.tool_calls.is_empty() && !(self.cut_call && self.stop == StopCause::MaxTokens)
     }
 }
 
@@ -1004,5 +1017,45 @@ mod tool_result_order {
         let kept = tool_results_in_call_order(&turns);
         assert!(matches!(kept, Cow::Borrowed(_)));
         assert_eq!(results(&kept), ["z", "y", "2", "1"]);
+    }
+}
+
+#[cfg(test)]
+mod reports_tool_calls {
+    use super::{ParsedResponse, ParsedToolCall, StopCause};
+
+    fn response(calls: usize, cut_call: bool, stop: StopCause) -> ParsedResponse {
+        ParsedResponse {
+            tool_calls: (0..calls)
+                .map(|_| ParsedToolCall {
+                    name: "f".into(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect(),
+            cut_call,
+            stop,
+            ..Default::default()
+        }
+    }
+
+    /// Only a cut by the budget takes the calls' finish away: a call the model
+    /// left open and then ended its turn on is dropped, the closed ones stand.
+    #[test]
+    fn a_cut_call_takes_the_finish_only_when_the_budget_cut_it() {
+        use StopCause::{EndOfTurn, MaxTokens};
+        for (calls, cut, stop, reports) in [
+            (1, false, EndOfTurn, true),
+            (1, false, MaxTokens, true),
+            (1, true, MaxTokens, false),
+            (1, true, EndOfTurn, true),
+            (0, true, MaxTokens, false),
+            (0, false, EndOfTurn, false),
+        ] {
+            assert_eq!(
+                response(calls, cut, stop).reports_tool_calls(),
+                reports,
+                "{calls} calls, cut={cut}, {stop:?}"
+            );
+        }
     }
 }

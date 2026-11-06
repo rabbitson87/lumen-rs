@@ -1087,10 +1087,15 @@ impl Qwen35ResponseParser {
     /// Consume the parser and return the final structured response.
     pub fn finish(mut self) -> ParsedResponse {
         self.flush();
+        let cut_call = matches!(
+            self.state,
+            State::InToolCallHeader | State::InToolCallBody | State::InParameterValue { .. }
+        );
         ParsedResponse {
             visible: self.visible,
             reasoning: self.reasoning,
             tool_calls: self.parsed_calls,
+            cut_call,
             // Set by the decode loop that fed this parser.
             ..Default::default()
         }
