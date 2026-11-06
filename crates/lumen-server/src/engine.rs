@@ -813,7 +813,7 @@ impl InferenceEngine {
             None
         };
         let finish_reason =
-            FinishReason::resolve(parsed.stop, has_tool_calls, trimmed).openai_str();
+            FinishReason::resolve(parsed.stop, parsed.reports_tool_calls(), trimmed).openai_str();
 
         // Observability: bump lifetime counters for `GET /v1/loads`.
         let elapsed_s = gen_started.elapsed().as_secs_f64();
@@ -1021,7 +1021,6 @@ impl InferenceEngine {
         let output_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
-        let has_tool_calls = !parsed.tool_calls.is_empty();
         let content = anthropic_content_blocks(
             &parsed.reasoning,
             &parsed.visible,
@@ -1032,7 +1031,11 @@ impl InferenceEngine {
         // A matched stop sequence (only meaningful without tool calls) maps to
         // Anthropic's stop_reason="stop_sequence" + the matched string; a turn
         // the budget cut maps to "max_tokens".
-        let finish = FinishReason::resolve(parsed.stop, has_tool_calls, matched_stop.is_some());
+        let finish = FinishReason::resolve(
+            parsed.stop,
+            parsed.reports_tool_calls(),
+            matched_stop.is_some(),
+        );
         let (stop_reason, stop_seq_hit) = anthropic_stop(finish, matched_stop);
 
         Ok(AnthropicResponse {
@@ -1341,7 +1344,6 @@ impl InferenceEngine {
                 // Every call not already on the stream goes out now, one at a
                 // time as a start / arguments / stop trio, so the SSE layer
                 // can synthesize OpenAI `delta.tool_calls` chunks.
-                let has_tool_calls = !parsed.tool_calls.is_empty();
                 tool_stream
                     .into_inner()
                     .finish(&parsed.tool_calls, token_tx);
@@ -1356,8 +1358,11 @@ impl InferenceEngine {
                 // `response_format` loops ignore it and run on to the end; the
                 // matchers swallow everything after the stop, and the reason is
                 // still the stop, not the budget the loop then ran into.
-                let finish_reason =
-                    FinishReason::resolve(parsed.stop, has_tool_calls, stopped_by_seq.get());
+                let finish_reason = FinishReason::resolve(
+                    parsed.stop,
+                    parsed.reports_tool_calls(),
+                    stopped_by_seq.get(),
+                );
                 // Observability: bump lifetime counters for `GET /v1/loads`.
                 let elapsed_s = gen_started.elapsed().as_secs_f64();
                 let tok_per_sec = if elapsed_s > 0.0 {
@@ -1573,7 +1578,6 @@ impl InferenceEngine {
                 // Bug A: resolve abbreviated tool names (e.g. the model dropped
                 // an MCP namespace) by unique suffix match before emitting.
                 remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
-                let has_tool_calls = !parsed.tool_calls.is_empty();
                 tool_stream.finish(&parsed.tool_calls, token_tx);
                 let completion_tokens = completion_tokens_with_tools(
                     &self.backend,
@@ -1585,8 +1589,11 @@ impl InferenceEngine {
                 // not, and lands here with the matcher having swallowed the rest;
                 // the stream still ended at the sequence.
                 let matched = stops.matched().map(str::to_owned);
-                let finish_reason =
-                    FinishReason::resolve(parsed.stop, has_tool_calls, matched.is_some());
+                let finish_reason = FinishReason::resolve(
+                    parsed.stop,
+                    parsed.reports_tool_calls(),
+                    matched.is_some(),
+                );
                 let _ = token_tx.deliver(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
@@ -2845,7 +2852,11 @@ impl FinishReason {
     /// `stop` is the backend's account of why decoding ended. The other two
     /// are things only the engine knows, and they outrank it:
     /// - `has_tool_calls`: a turn that ends in tool calls reports them, even
-    ///   if the budget ran out after the last call closed.
+    ///   if the budget ran out after the last call closed. The routes pass
+    ///   [`ParsedResponse::reports_tool_calls`], which is false when the
+    ///   budget cut a call short: that turn is `Length`.
+    ///
+    /// [`ParsedResponse::reports_tool_calls`]: lumen_mlx::chat_io::ParsedResponse::reports_tool_calls
     /// - `trimmed`: the engine cut the text at a client stop sequence, or at
     ///   the end of the first complete JSON value for `response_format`. The
     ///   answer then ends where the request said it should, so it is complete

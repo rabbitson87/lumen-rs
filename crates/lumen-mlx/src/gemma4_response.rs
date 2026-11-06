@@ -325,6 +325,7 @@ pub(crate) mod imp {
                 visible,
                 reasoning,
                 tool_calls: self.tool_calls,
+                cut_call: matches!(self.state, ParseState::ToolCall),
                 // Set by the decode loop that fed this parser.
                 ..Default::default()
             })
