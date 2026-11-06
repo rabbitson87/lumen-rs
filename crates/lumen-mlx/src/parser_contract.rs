@@ -7,7 +7,21 @@
 //! cannot pass replay while still crashing the soak. Hidden from the docs; it
 //! exists for those two callers and the parser's own tests.
 
-use crate::qwen3_5_tools::{Qwen35ParseEvent, Qwen35ResponseParser};
+use crate::qwen3_5_tools::{
+    JsonTypes, ParamType, ParamTypes, Qwen35ParseEvent, Qwen35ResponseParser,
+};
+
+/// Each way a tool schema can have the parser read a value, every parameter
+/// typed alike: the contract holds for each.
+const PARAM_TYPES: [ParamType; 7] = [
+    ParamType::Untyped,
+    ParamType::String,
+    ParamType::Boolean,
+    ParamType::Integer,
+    ParamType::Number,
+    ParamType::Union(JsonTypes::BOOLEAN.or(JsonTypes::NULL)),
+    ParamType::Union(JsonTypes::STRING.or(JsonTypes::INTEGER).or(JsonTypes::NULL)),
+];
 
 /// Everything one run of the parser yields, to compare runs by.
 #[derive(Debug, PartialEq)]
@@ -23,6 +37,7 @@ pub(crate) struct Outcome {
 }
 
 /// Feed `chunks` to a fresh parser, in order, and finish it.
+#[cfg(test)]
 pub(crate) fn run(chunks: &[&str]) -> Outcome {
     run_with(Qwen35ResponseParser::new(), chunks)
 }
@@ -84,26 +99,43 @@ pub fn assert_qwen35_parser_contract(data: &[u8]) {
         }
     }
     chunks.push(&text[from..]);
-    let whole = run(&[&text]);
-    assert_eq!(whole.events.0, whole.visible, "{text:?}");
-    assert_eq!(whole.events.1, whole.reasoning, "{text:?}");
-    assert!(whole.events.2 >= whole.calls.len(), "{text:?}");
-    assert_streamed_args_are_the_calls(&whole, &text);
-    assert_eq!(run(&chunks), whole, "{text:?} as {chunks:?}");
+    for ty in PARAM_TYPES {
+        let run = |chunks: &[&str]| {
+            run_with(
+                Qwen35ResponseParser::new().with_param_types(ParamTypes::all(ty)),
+                chunks,
+            )
+        };
+        let whole = run(&[&text]);
+        assert_eq!(whole.events.0, whole.visible, "{text:?} {ty:?}");
+        assert_eq!(whole.events.1, whole.reasoning, "{text:?} {ty:?}");
+        assert!(whole.events.2 >= whole.calls.len(), "{text:?} {ty:?}");
+        assert_streamed_args_are_the_calls(&whole, &text);
+        assert_eq!(run(&chunks), whole, "{text:?} as {chunks:?} {ty:?}");
+    }
 }
 
 /// Each finished call's streamed pieces read back as exactly its arguments, in
 /// its key order. They are its serialization byte for byte while no key
 /// repeats; a repeated key leaves both values in the text, and reading it back
 /// keeps the first position and the last value, as the parser does.
+///
+/// Both sides are read back by the same parser, as a client reads the stream
+/// and the whole body: serde_json's default float parsing is not correctly
+/// rounded, so a 22-digit number read back once differs by an ulp from the
+/// value the parser took with a correctly rounded one.
 pub(crate) fn assert_streamed_args_are_the_calls(outcome: &Outcome, text: &str) {
     assert!(outcome.args.len() >= outcome.calls.len(), "{text:?}");
+    let read_back = |json: &str| {
+        let value: serde_json::Value = serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("{json:?} is not JSON ({e}) for {text:?}"));
+        serde_json::to_string(&value).expect("serializes")
+    };
     for (streamed, (_, arguments)) in outcome.args.iter().zip(&outcome.calls) {
-        let read: serde_json::Value = serde_json::from_str(streamed)
-            .unwrap_or_else(|e| panic!("streamed {streamed:?} is not JSON ({e}) for {text:?}"));
+        let whole = serde_json::to_string(arguments).expect("serializes");
         assert_eq!(
-            serde_json::to_string(&read).expect("serializes"),
-            serde_json::to_string(arguments).expect("serializes"),
+            read_back(streamed),
+            read_back(&whole),
             "streamed {streamed:?} for {text:?}"
         );
     }
