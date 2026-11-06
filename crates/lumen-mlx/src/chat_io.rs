@@ -158,6 +158,46 @@ pub struct AssistantToolCall<'a> {
     pub arguments: &'a JsonValue,
 }
 
+/// `turns` with each run of tool results in the order of the calls they
+/// answer.
+///
+/// The renderers pair a result with a call by position: Qwen's template never
+/// reads `tool_call_id`, and Gemma's puts the next result after each call. A
+/// client that runs parallel calls may send their results in the order they
+/// finished, and then the model read each result as the answer to another
+/// call. The run of `Tool` turns right after an `Assistant` turn is sorted by
+/// that turn's call ids; a result whose id names none of them keeps its place
+/// among the others after the rest. Only `Tool` turns move, and only within
+/// their run, so anything indexed by the other turns (their images) still
+/// lines up. Borrowed when nothing moves.
+pub fn tool_results_in_call_order<'t, 'a>(
+    turns: &'t [ChatTurn<'a>],
+) -> std::borrow::Cow<'t, [ChatTurn<'a>]> {
+    let mut sorted: Option<Vec<ChatTurn<'a>>> = None;
+    for (i, turn) in turns.iter().enumerate() {
+        let ChatTurn::Assistant { tool_calls, .. } = turn else {
+            continue;
+        };
+        let run = i + 1
+            ..i + 1
+                + turns[i + 1..]
+                    .iter()
+                    .take_while(|t| matches!(t, ChatTurn::Tool { .. }))
+                    .count();
+        let rank = |t: &ChatTurn<'_>| match t {
+            ChatTurn::Tool { tool_call_id, .. } => tool_calls
+                .iter()
+                .position(|c| c.id == *tool_call_id)
+                .unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        };
+        if !turns[run.clone()].is_sorted_by_key(rank) {
+            sorted.get_or_insert_with(|| turns.to_vec())[run].sort_by_key(rank);
+        }
+    }
+    sorted.map_or(std::borrow::Cow::Borrowed(turns), std::borrow::Cow::Owned)
+}
+
 /// What a chat request renders its prompt from: the flat `(role, content)`
 /// pairs, or the structured turns a tool-history request needs.
 ///
@@ -859,5 +899,110 @@ mod reasoning_effort_mapping_tests {
         ];
         let uniq: std::collections::HashSet<_> = tags.iter().collect();
         assert_eq!(uniq.len(), 3, "cache tags must distinguish every level");
+    }
+}
+
+#[cfg(test)]
+mod tool_result_order {
+    use super::{AssistantToolCall, ChatTurn, tool_results_in_call_order};
+    use std::borrow::Cow;
+
+    fn call<'a>(id: &'a str, args: &'a serde_json::Value) -> AssistantToolCall<'a> {
+        AssistantToolCall {
+            id,
+            name: "f",
+            arguments: args,
+        }
+    }
+
+    fn result(id: &str) -> ChatTurn<'_> {
+        ChatTurn::Tool {
+            tool_call_id: id,
+            name: None,
+            content: id,
+        }
+    }
+
+    /// The contents of the `Tool` turns, in order.
+    fn results(turns: &[ChatTurn<'_>]) -> Vec<String> {
+        turns
+            .iter()
+            .filter_map(|t| match t {
+                ChatTurn::Tool { content, .. } => Some(content.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn results_sent_as_they_finished_follow_their_calls() {
+        let args = serde_json::json!({});
+        let calls = [call("a", &args), call("b", &args), call("c", &args)];
+        let later = [call("d", &args)];
+        let turns = [
+            ChatTurn::User("q"),
+            ChatTurn::Assistant {
+                text: "",
+                tool_calls: &calls,
+            },
+            result("x"),
+            result("c"),
+            result("a"),
+            result("b"),
+            ChatTurn::User("next"),
+            ChatTurn::Assistant {
+                text: "",
+                tool_calls: &later,
+            },
+            result("d"),
+        ];
+        let ordered = tool_results_in_call_order(&turns);
+        assert_eq!(results(&ordered), ["a", "b", "c", "x", "d"]);
+        assert!(
+            matches!(ordered[6], ChatTurn::User("next")),
+            "other turns stay put"
+        );
+    }
+
+    #[test]
+    fn nothing_to_move_is_borrowed() {
+        let args = serde_json::json!({});
+        let calls = [call("a", &args), call("b", &args)];
+        let in_order = [
+            ChatTurn::Assistant {
+                text: "",
+                tool_calls: &calls,
+            },
+            result("a"),
+            result("b"),
+        ];
+        assert!(matches!(
+            tool_results_in_call_order(&in_order),
+            Cow::Borrowed(_)
+        ));
+        // Ids a client left out, and results after no assistant turn, give
+        // nothing to sort by: they keep the order they came in.
+        let unnamed = [call("", &args), call("", &args)];
+        let turns = [
+            result("z"),
+            result("y"),
+            ChatTurn::Assistant {
+                text: "",
+                tool_calls: &unnamed,
+            },
+            ChatTurn::Tool {
+                tool_call_id: "",
+                name: None,
+                content: "2",
+            },
+            ChatTurn::Tool {
+                tool_call_id: "",
+                name: None,
+                content: "1",
+            },
+        ];
+        let kept = tool_results_in_call_order(&turns);
+        assert!(matches!(kept, Cow::Borrowed(_)));
+        assert_eq!(results(&kept), ["z", "y", "2", "1"]);
     }
 }
