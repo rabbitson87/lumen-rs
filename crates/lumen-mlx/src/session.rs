@@ -10,8 +10,8 @@
 //! sessions.evict_stale(runner);
 //! let key = sessions.resolve_key(explicit_id, &prompt);
 //! let boundary = session::conversation_boundary(&prompt, || encode(header).ok());
-//! let start = sessions.position(runner, &key, &prompt, "", || alloc_seq())?;
-//! let (first, pos, point) = session::feed(runner, &key, &start, &prompt, boundary, "")?;
+//! let start = sessions.position(runner, &key, &prompt, &turns, "", || alloc_seq())?;
+//! let (first, pos, point) = session::feed(runner, &key, &start, &prompt, boundary, &turns, "")?;
 //! // … decode from `first` at `pos` on `start.seq_id` …
 //! sessions.store(runner, &key, start.seq_id, session::held_tokens(prompt, &generated, pos), point);
 //! ```
@@ -88,9 +88,15 @@ pub(crate) trait SessionRunner {
         Ok(false)
     }
     /// Start the new `seq_id` from the longest persisted state `prompt`
-    /// continues, with a rollback point there; returns its length. Default:
-    /// the runner has no disk tier, so never.
-    fn restore_point(&mut self, _seq_id: u64, _prompt: &[u32]) -> Result<Option<usize>> {
+    /// continues, with a rollback point there; returns its length. `turns` is
+    /// the prompt's turn cuts ([`session_feed::plan_turns`]); empty, the states
+    /// are on the grid. Default: the runner has no disk tier, so never.
+    fn restore_point(
+        &mut self,
+        _seq_id: u64,
+        _prompt: &[u32],
+        _turns: &[usize],
+    ) -> Result<Option<usize>> {
         Ok(None)
     }
     /// Bytes by which a feed that leaves `kv_tokens` tokens of KV (counting every copy that
@@ -353,10 +359,14 @@ pub(crate) fn feed<R: SessionRunner + ?Sized>(
     start: &SessionStart,
     prompt: &[u32],
     boundary: Option<usize>,
+    turns: &[usize],
     label: &str,
 ) -> Result<(u32, usize, Option<usize>)> {
     let (seq_id, from, end) = (start.seq_id, start.from, prompt.len());
     let plan = match (boundary, runner.prefill_grid()) {
+        (boundary, Some(grid)) if !turns.is_empty() => {
+            session_feed::plan_turns(from, end, grid, boundary, turns)
+        }
         (Some(b), Some(grid)) => session_feed::plan_feed(from, end, grid, b),
         _ => session_feed::FeedPlan {
             cuts: vec![end],
@@ -428,17 +438,25 @@ pub(crate) fn held_tokens(mut prompt: Vec<u32>, generated: &[u32], position: usi
 
 /// Write a turn's rollback point to the runner's disk tier, after the turn.
 ///
-/// `prompt` is the turn's prompt and `point` the rollback point its sequence
-/// holds (what [`feed`] returned). The point is keyed on the grid it is a cut
-/// of, so a later prompt restores it only on that same grid. Errors
-/// are logged, never returned: the reply is already out, and a missing disk
-/// copy only costs a later prefill.
+/// `prompt` is the turn's prompt, `point` the rollback point its sequence holds
+/// (what [`feed`] returned) and `previous` the one it started from. The point
+/// is keyed on the grid it is a cut of, so a later prompt restores it only on
+/// that same grid.
+///
+/// A state is written when the point reaches a new chunk of the grid, not on
+/// every turn: it holds the whole KV, and a point at a turn moves on each one.
+/// After a restart the rest is re-fed, at most about a chunk.
+///
+/// Errors are logged, never returned: the reply is already out, and a missing
+/// disk copy only costs a later prefill.
 pub(crate) fn persist_point<R: SessionRunner + ?Sized>(
     runner: &mut R,
     key: &str,
     seq_id: u64,
     prompt: &[u32],
     point: Option<usize>,
+    previous: Option<usize>,
+    turn_cuts: bool,
 ) {
     let (Some(at), Some(grid)) = (point, runner.prefill_grid()) else {
         return;
@@ -446,8 +464,12 @@ pub(crate) fn persist_point<R: SessionRunner + ?Sized>(
     if at == 0 || at > prompt.len() {
         return;
     }
+    if grid.cut_at_or_before(at) == grid.cut_at_or_before(previous.unwrap_or(0)) {
+        return;
+    }
     let t = Instant::now();
-    match runner.persist_point(seq_id, &prompt[..at], grid.key_at(at)) {
+    let grid_key = session_feed::point_grid_key(grid, at, turn_cuts);
+    match runner.persist_point(seq_id, &prompt[..at], grid_key) {
         Ok(true) => eprintln!(
             "[mlx] seq {seq_id} session={key:?} persisted state at {at} to disk in {:.0}ms",
             t.elapsed().as_secs_f64() * 1000.0
@@ -544,21 +566,27 @@ impl Sessions {
     /// there; otherwise a new, empty sequence from `alloc_seq`, dropping the old
     /// one. A rollback that fails is logged and treated as no match — the turn
     /// still gets a correct answer, only without the reuse.
+    ///
+    /// A rollback point is usable only at a cut of this prompt's own cold
+    /// prefill: a cut of the grid, or one of its `turns`.
     pub(crate) fn position<R: SessionRunner + ?Sized>(
         &mut self,
         runner: &mut R,
         key: &str,
         prompt_ids: &[u32],
+        turns: &[usize],
         label: &str,
         alloc_seq: impl FnOnce() -> u64,
     ) -> Result<SessionStart> {
         let grid = runner.prefill_grid();
+        let is_cut =
+            |at: usize| grid.is_some_and(|g| g.is_cut(at)) || turns.binary_search(&at).is_ok();
         let found = self.map.get(key).map(|s| {
             (
                 s.seq_id,
                 s.extends(prompt_ids).then_some(s.tokens.len()),
                 s.resumes_at(prompt_ids)
-                    .filter(|&kept| s.point_grid == grid && grid.is_some_and(|g| g.is_cut(kept))),
+                    .filter(|&kept| s.point_grid == grid && is_cut(kept)),
                 s.rollback_len,
             )
         });
@@ -603,7 +631,7 @@ impl Sessions {
             self.make_room(runner, key, kv_tokens, states);
         }
         let seq_id = alloc_seq();
-        match runner.restore_point(seq_id, prompt_ids) {
+        match runner.restore_point(seq_id, prompt_ids, turns) {
             Ok(Some(at)) => {
                 return Ok(SessionStart {
                     seq_id,
@@ -1138,7 +1166,7 @@ mod tests {
     fn positioning_a_new_prompt_makes_room_first() {
         let (mut sessions, mut runner) = three_sessions(260);
         let start = sessions
-            .position(&mut runner, "c", &[9, 9, 9], "", || 4)
+            .position(&mut runner, "c", &[9, 9, 9], &[], "", || 4)
             .unwrap();
         assert_eq!(start.how, SessionReuse::Fresh);
         // "c" (seq 3) diverged and went at once; 200 held + 3 fits 260, so "a" and "b" stay.
@@ -1147,7 +1175,7 @@ mod tests {
 
         let (mut sessions, mut runner) = three_sessions(120);
         sessions
-            .position(&mut runner, "new", &[9; 30], "", || 4)
+            .position(&mut runner, "new", &[9; 30], &[], "", || 4)
             .unwrap();
         assert_eq!(runner.dropped, vec![1, 2, 3]);
         assert!(sessions.map.is_empty());
@@ -1230,5 +1258,199 @@ mod tests {
         let reasons: Vec<&str> = victims.iter().map(|(_, r)| r.as_str()).collect();
         assert!(reasons.iter().any(|r| r.contains("TTL")));
         assert!(reasons.iter().any(|r| r.contains("LRU")));
+    }
+
+    /// Records the calls that built each sequence, carried through a rollback.
+    #[derive(Default)]
+    struct CutRunner {
+        seqs: HashMap<u64, CutSeq>,
+        fed: usize,
+        persisted: Vec<(usize, u64)>,
+    }
+
+    #[derive(Default)]
+    struct CutSeq {
+        /// Where each call ended.
+        calls: Vec<usize>,
+        /// How many of `calls` the rollback point keeps.
+        point: Option<usize>,
+    }
+
+    impl CutRunner {
+        /// One call, split on the grid as the native runner's bulk pass splits it.
+        fn call(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            let grid = self.prefill_grid().expect("a grid");
+            let seq = self.seqs.entry(seq_id).or_default();
+            let at = seq.calls.last().copied().unwrap_or(0);
+            seq.calls.extend(grid.pieces(at, at + tokens.len()));
+            self.fed += tokens.len();
+            Ok((0, at + tokens.len()))
+        }
+    }
+
+    impl SessionRunner for CutRunner {
+        fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.call(seq_id, tokens)
+        }
+        fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.call(seq_id, tokens)
+        }
+        fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
+            self.seqs.remove(&seq_id);
+            Ok(())
+        }
+        fn prefill_grid(&self) -> Option<PrefillGrid> {
+            Some(PrefillGrid::new(CHUNK, u64::MAX, 1))
+        }
+        fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
+            let seq = self.seqs.get_mut(&seq_id).expect("a sequence to mark");
+            seq.point = Some(seq.calls.len());
+            Ok(())
+        }
+        fn rollback(&mut self, seq_id: u64) -> Result<usize> {
+            let seq = self.seqs.get_mut(&seq_id).expect("a sequence to wind back");
+            seq.calls.truncate(seq.point.expect("a point"));
+            Ok(seq.calls.last().copied().unwrap_or(0))
+        }
+        fn persist_point(&mut self, _: u64, prefix: &[u32], grid_key: u64) -> Result<bool> {
+            self.persisted.push((prefix.len(), grid_key));
+            Ok(true)
+        }
+    }
+
+    const CHUNK: usize = 64;
+    /// How an assistant turn opens, replayed or generated.
+    const OPEN: [u32; 3] = [900, 901, 902];
+    /// What only a generation header has after [`OPEN`], as Qwen's empty think block.
+    const HEADER_END: [u32; 2] = [903, 904];
+
+    /// A plain chat of `rounds` finished rounds, as a generation prompt. Ids are distinct so a
+    /// wrong prefix cannot pass; the reply of each round is replayed without [`HEADER_END`].
+    fn chat(rounds: u32) -> (Vec<u32>, usize, Vec<usize>) {
+        let mut prompt: Vec<u32> = (1..=20).collect();
+        for r in 0..=rounds {
+            prompt.extend((0..5 + r % 4).map(|i| 1000 + 100 * r + i));
+            if r < rounds {
+                prompt.extend(OPEN);
+                prompt.extend((0..9 + r % 7).map(|i| 5000 + 100 * r + i));
+            }
+        }
+        let boundary = prompt.len();
+        prompt.extend(OPEN);
+        prompt.extend(HEADER_END);
+        let turns = prompt
+            .windows(OPEN.len())
+            .enumerate()
+            .filter(|(_, w)| *w == OPEN)
+            .map(|(i, _)| i)
+            .collect();
+        (prompt, boundary, turns)
+    }
+
+    struct Turn {
+        seq_id: u64,
+        how: SessionReuse,
+        point: Option<usize>,
+        started_at: Option<usize>,
+    }
+
+    /// One turn the way a family runs it: position, feed, and a reply of two tokens.
+    fn chat_turn(sessions: &mut Sessions, runner: &mut CutRunner, rounds: u32, gap: usize) -> Turn {
+        let (prompt, boundary, starts) = chat(rounds);
+        let grid = runner.prefill_grid().expect("a grid");
+        let turns = session_feed::kept_turns(&starts, grid, gap);
+        let start = sessions
+            .position(runner, "s", &prompt, &turns, "", || 100 + u64::from(rounds))
+            .expect("position");
+        let (_, pos, point) =
+            feed(runner, "s", &start, &prompt, Some(boundary), &turns, "").expect("feed");
+        let held = held_tokens(prompt, &[1, 2], pos + 1);
+        sessions.store(runner, "s", start.seq_id, held, point);
+        Turn {
+            seq_id: start.seq_id,
+            how: start.how,
+            point,
+            started_at: start.point,
+        }
+    }
+
+    /// With turn cuts a warm turn is its own cold prefill, call for call, feeds only what follows
+    /// the previous turn's point, and that point is never `gap` short of its boundary.
+    #[test]
+    fn a_warm_turn_is_its_cold_prefill_and_feeds_only_what_is_new() {
+        for gap in [0, 30, 100] {
+            let (mut sessions, mut warm) = (Sessions::new(), CutRunner::default());
+            let mut previous = None;
+            for rounds in 0..12 {
+                let (prompt, boundary, _) = chat(rounds);
+                let ctx = format!("gap {gap} round {rounds}");
+                warm.fed = 0;
+                let turn = chat_turn(&mut sessions, &mut warm, rounds, gap);
+
+                let mut cold = CutRunner::default();
+                let cold_turn = chat_turn(&mut Sessions::new(), &mut cold, rounds, gap);
+                assert_eq!(
+                    warm.seqs[&turn.seq_id].calls, cold.seqs[&cold_turn.seq_id].calls,
+                    "{ctx}: a warm state from other calls than its cold prefill"
+                );
+                assert_eq!(turn.point, cold_turn.point, "{ctx}");
+                assert!(boundary - turn.point.unwrap_or(0) < gap.max(1), "{ctx}");
+                match previous {
+                    Some(from) => {
+                        assert_eq!(turn.how, SessionReuse::Resume, "{ctx}");
+                        assert_eq!(warm.fed, prompt.len() - from, "{ctx}");
+                    }
+                    None => assert_eq!(turn.how, SessionReuse::Fresh, "{ctx}"),
+                }
+                previous = turn.point;
+            }
+        }
+    }
+
+    /// A point at a turn is no cut of a prompt that has no turns: `/v1/completions` prefills
+    /// cold on the grid, so resuming there would not match it.
+    #[test]
+    fn a_turn_point_serves_only_a_prompt_cut_at_that_turn() {
+        let (mut sessions, mut runner) = (Sessions::new(), CutRunner::default());
+        let turn = chat_turn(&mut sessions, &mut runner, 2, 0);
+        let at = turn.point.expect("a point");
+        assert_ne!(at % CHUNK, 0, "pick a round whose boundary is off the grid");
+
+        let (next, _, _) = chat(3);
+        let start = sessions
+            .position(&mut runner, "s", &next, &[], "", || 200)
+            .expect("position");
+        assert_eq!(start.how, SessionReuse::Fresh);
+    }
+
+    /// The state goes to disk once per chunk of the grid, whatever the number of turns, and
+    /// under a key no state fed on the grid alone has.
+    #[test]
+    fn a_turn_point_is_written_once_per_chunk() {
+        let (mut sessions, mut runner) = (Sessions::new(), CutRunner::default());
+        let grid = runner.prefill_grid().expect("a grid");
+        let mut expected = Vec::new();
+        let mut last_chunk = 0;
+        for rounds in 0..12 {
+            let turn = chat_turn(&mut sessions, &mut runner, rounds, 0);
+            let (prompt, _, _) = chat(rounds);
+            persist_point(
+                &mut runner,
+                "s",
+                turn.seq_id,
+                &prompt,
+                turn.point,
+                turn.started_at,
+                true,
+            );
+            let at = turn.point.expect("a point");
+            if grid.cut_at_or_before(at) != last_chunk {
+                last_chunk = grid.cut_at_or_before(at);
+                expected.push((at, session_feed::point_grid_key(grid, at, true)));
+            }
+        }
+        assert!(expected.len() > 2, "the chat must cross several chunks");
+        assert!(expected.len() < 12, "and hold turns that share one");
+        assert_eq!(runner.persisted, expected);
     }
 }

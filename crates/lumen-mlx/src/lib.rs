@@ -1290,13 +1290,18 @@ impl session::SessionRunner for RunnerImpl {
         self.native_mut()
             .map_or(Ok(false), |r| r.persist_point(seq_id, prefix, grid_key))
     }
-    fn restore_point(&mut self, seq_id: u64, prompt: &[u32]) -> Result<Option<usize>> {
+    fn restore_point(
+        &mut self,
+        seq_id: u64,
+        prompt: &[u32],
+        turns: &[usize],
+    ) -> Result<Option<usize>> {
         #[cfg(feature = "mlx-native")]
         if let Self::Qwen4Exp(r) = self {
             return r.restore_point(seq_id, prompt);
         }
         self.native_mut()
-            .map_or(Ok(None), |r| r.restore_point(seq_id, prompt))
+            .map_or(Ok(None), |r| r.restore_point(seq_id, prompt, turns))
     }
     fn memory_shortfall(&self, kv_tokens: usize, states: usize) -> u64 {
         memory_shortfall(self, kv_tokens, states)
@@ -7160,6 +7165,27 @@ impl MlxQwen35Backend {
             .then_some(marker)
     }
 
+    /// The assistant turns of this chat prompt the session path cuts at (see `session_feed`). A
+    /// replayed turn opens as the generation header does, and client text cannot encode that
+    /// opening. Empty on Flash-Next, which stays on its grid.
+    fn session_turns(&self, prompt_ids: &[u32]) -> Vec<usize> {
+        if prefix_cache::SnapshotRunner::cut_sensitive(&self.runner) {
+            return Vec::new();
+        }
+        let grid = session::SessionRunner::prefill_grid(&self.runner);
+        let (Some(grid), Ok(open)) = (
+            grid,
+            self.encode(crate::qwen3_5_tools::QWEN3_ASSISTANT_OPEN),
+        ) else {
+            return Vec::new();
+        };
+        let starts: Vec<usize> = prefix_cache::turn_cuts(prompt_ids, &open)
+            .into_iter()
+            .map(|cut| cut - open.len())
+            .collect();
+        session_feed::kept_turns(&starts, grid, session_feed::MIN_TURN_GAP)
+    }
+
     /// Before a prefix-cache prefill of `prompt_ids` under `key` (`head`: the path may snapshot a
     /// system prompt's head beside the prompt's own): hold the retained state to the memory the
     /// runner was planned for ([`session::memory_evict`]), giving up the cheapest first: the heads
@@ -7648,12 +7674,16 @@ impl MlxQwen35Backend {
             self.encode(crate::qwen3_5_tools::qwen3_generation_header(thinking))
                 .ok()
         });
+        let turns = self.session_turns(&prompt_ids);
         let next_seq_id = &self.next_seq_id;
-        let start =
-            self.sessions
-                .position(&mut self.runner, session_id, &prompt_ids, "", || {
-                    next_seq_id.fetch_add(1, Ordering::Relaxed)
-                })?;
+        let start = self.sessions.position(
+            &mut self.runner,
+            session_id,
+            &prompt_ids,
+            &turns,
+            "",
+            || next_seq_id.fetch_add(1, Ordering::Relaxed),
+        )?;
         self.make_room_for_session_feed(start.from, prompt_ids.len());
         let seq_id = start.seq_id;
         let (last, pos, point) = session::feed(
@@ -7662,6 +7692,7 @@ impl MlxQwen35Backend {
             &start,
             &prompt_ids,
             boundary,
+            &turns,
             "",
         )?;
 
@@ -7683,6 +7714,8 @@ impl MlxQwen35Backend {
             seq_id,
             &new_tokens[..prompt_len],
             point,
+            start.point,
+            !turns.is_empty(),
         );
         self.sessions
             .store(&mut self.runner, session_id, seq_id, new_tokens, point);
@@ -7719,6 +7752,7 @@ impl MlxQwen35Backend {
             &mut self.runner,
             session_id,
             &prompt_ids,
+            &[],
             " (completion)",
             || next_seq_id.fetch_add(1, Ordering::Relaxed),
         )?;
@@ -7730,6 +7764,7 @@ impl MlxQwen35Backend {
             &start,
             &prompt_ids,
             None,
+            &[],
             " (completion)",
         )?;
 
@@ -7745,6 +7780,8 @@ impl MlxQwen35Backend {
             seq_id,
             &new_tokens[..prompt_len],
             point,
+            start.point,
+            false,
         );
         self.sessions
             .store(&mut self.runner, session_id, seq_id, new_tokens, point);
@@ -8480,6 +8517,42 @@ mod tests {
             );
             assert_eq!(b.session_count(), 1, "the turn continues its own session");
         });
+    }
+
+    /// Far enough from the last cut, a turn gets a cut and the point, and the next turn feeds only
+    /// what follows it. Off, the calls are the same, so the flag cannot change an answer.
+    #[test]
+    fn a_long_enough_turn_resumes_from_its_own_start() {
+        let feeds = |on: bool| {
+            session_rollback_enabled::with(on, || {
+                let mut b = chat_backend(false);
+                b.script_runner().grid = Some(session_feed::PrefillGrid::new(2048, u64::MAX, 1));
+                let system = "S ".repeat(280);
+                let turn1 = [("system", system.as_str()), ("user", "U1")];
+                let first = chat_turn(&mut b, &turn1);
+                let turn2 = [
+                    ("system", system.as_str()),
+                    ("user", "U1"),
+                    ("assistant", "Blue"),
+                    ("user", "U2"),
+                ];
+                (first, chat_turn(&mut b, &turn2))
+            })
+        };
+        // 291 prompt tokens, a 4-token header from 287.
+        let (first, second) = feeds(true);
+        assert_eq!(
+            first,
+            vec![
+                ScriptFeed::Prefill(287),
+                ScriptFeed::Mark(287),
+                ScriptFeed::Extend(4)
+            ]
+        );
+        assert_eq!(second[0], ScriptFeed::Rollback(287), "{second:?}");
+
+        let (off, _) = feeds(false);
+        assert_eq!(off, vec![ScriptFeed::Prefill(287), ScriptFeed::Extend(4)]);
     }
 
     /// A point is resumed only on the grid it was cut on. Here the grid goes
@@ -9599,9 +9672,9 @@ mod tests {
 
     /// A conversation state restored from disk must not change a single token.
     ///
-    /// The disk tier stores a turn's rollback point — a state on the prefill
-    /// chunk grid — and a later process restores it into a fresh sequence and
-    /// feeds the rest on the same grid. That is the in-RAM resume, with a
+    /// The disk tier stores a turn's rollback point — a state at a cut of the
+    /// prefill — and a later process restores it into a fresh sequence and
+    /// feeds the rest on the same cuts. That is the in-RAM resume, with a
     /// write and a read in between, so the reply must equal a cold prefill of
     /// the same prompt token for token. The RAM copy is dropped before the
     /// second turn, so the only way to reuse anything is the disk.
@@ -9691,7 +9764,10 @@ mod tests {
         // Nothing in RAM: turn two can only reuse through the disk.
         let p2 = m.build_chat_input(&turn2, false, None).expect("prompt 2");
         let probe = 1_000_000;
-        let restored = native(m).restore_point(probe, &p2).expect("restore");
+        let turns = m.session_turns(&p2);
+        let restored = native(m)
+            .restore_point(probe, &p2, &turns)
+            .expect("restore");
         assert_eq!(
             restored,
             Some(point),
@@ -9818,7 +9894,10 @@ mod tests {
         );
         m.drop_session("a");
         let probe = 1_000_000;
-        let restored = native(m).restore_point(probe, &p2).expect("restore");
+        let turns = m.session_turns(&p2);
+        let restored = native(m)
+            .restore_point(probe, &p2, &turns)
+            .expect("restore");
         native(m).remove_seq(probe).ok();
         assert_eq!(
             restored,

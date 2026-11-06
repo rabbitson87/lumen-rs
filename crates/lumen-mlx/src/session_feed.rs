@@ -1,5 +1,5 @@
 //! How a chat session's prompt is fed so the next turn can resume it from the
-//! conversation boundary — without changing a single logit of this one.
+//! conversation boundary, with the same numbers a cold prefill gives it.
 //!
 //! A Qwen generation prompt ends in a header (`<|im_start|>assistant\n<think>…`)
 //! that the next turn does not reproduce: 3.5 and 3.6 templates drop the
@@ -38,8 +38,16 @@
 //! `tests/row_invariance.rs` pins these regimes without weights, so an MLX
 //! bump that moves one fails there first.
 //!
-//! The cost is in the next turn, which re-feeds from the last chunk boundary
-//! before the header instead of from the header itself: at most one chunk.
+//! On the grid alone the cost is in the next turn, which re-feeds from the last
+//! chunk boundary before the header instead of from the header itself: up to
+//! one chunk, seconds at long context. So where a family names its turns,
+//! [`plan_turns`] also cuts every prefill where an assistant turn starts, and
+//! the next turn feeds only what follows that cut. Those pieces are not the
+//! bulk pass's chunks, so a prompt's numbers differ from one bulk pass by
+//! rounding. What stays exact is the turn against its own cold prefill: the
+//! cuts depend only on the tokens before them, so any longer prompt makes the
+//! same calls. Each cut adds a call, and short calls are dear, so
+//! [`kept_turns`] skips the turns too close to the cut before them.
 
 pub(crate) use crate::prefill_budget::PrefillGrid;
 
@@ -83,9 +91,58 @@ pub(crate) fn plan_feed(start: usize, end: usize, grid: PrefillGrid, boundary: u
     }
 }
 
+/// How far past the cut before it a turn must start to get a cut of its own.
+pub(crate) const MIN_TURN_GAP: usize = 256;
+
+/// The turn starts of `starts` (ascending) that get a cut: those at least `gap` past the cut
+/// before them, the grid's or a kept turn's.
+///
+/// What this skips is what the next turn re-feeds, so `gap` trades that against a cold prefill: a
+/// call costs far more than its rows do inside a bulk chunk. Each choice reads only the positions
+/// before it, so a longer prompt keeps the same turns.
+pub(crate) fn kept_turns(starts: &[usize], grid: PrefillGrid, gap: usize) -> Vec<usize> {
+    let mut last = 0;
+    let mut kept = Vec::new();
+    for &turn in starts {
+        last = last.max(grid.cut_at_or_before(turn));
+        if turn - last >= gap {
+            kept.push(turn);
+            last = turn;
+        }
+    }
+    kept
+}
+
+/// Plan the feed of `prompt[start..end]` for a prompt cut at its turns ([`kept_turns`]). Each one
+/// is a cut alongside the grid's whether or not a point is wanted, so leaving one changes no call.
+/// The point goes on the last cut at or before `boundary`, if this feed makes one.
+pub(crate) fn plan_turns(
+    start: usize,
+    end: usize,
+    grid: PrefillGrid,
+    boundary: Option<usize>,
+    turns: &[usize],
+) -> FeedPlan {
+    let mut cuts = grid.cuts(start, end);
+    cuts.extend(turns.iter().copied().filter(|&t| start < t && t < end));
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mark = boundary
+        .filter(|&b| b < end)
+        .and_then(|b| cuts.iter().rev().copied().find(|&cut| cut <= b));
+    FeedPlan { cuts, mark }
+}
+
+/// What names `grid` in the disk key of the state at `at`. A state fed with turn cuts was computed
+/// by other calls than one fed on the grid alone, so the two never share a key: a resume would not
+/// match the cold prefill.
+pub(crate) fn point_grid_key(grid: PrefillGrid, at: usize, turn_cuts: bool) -> u64 {
+    grid.key_at(at) ^ if turn_cuts { 1 << 62 } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FeedPlan, PrefillGrid, plan_feed};
+    use super::{FeedPlan, PrefillGrid, kept_turns, plan_feed, plan_turns, point_grid_key};
 
     /// A grid of `chunk`-token chunks whose budget never binds.
     fn uniform(chunk: usize) -> PrefillGrid {
@@ -219,5 +276,83 @@ mod tests {
         assert_eq!(plan_feed(500, 900, grid(), 400).mark, None);
         assert_eq!(plan_feed(500, 900, grid(), 500).mark, None);
         assert_eq!(plan_feed(0, 900, grid(), 900).mark, None);
+    }
+
+    /// Every turn of a conversation, warm from the turn before, makes the calls its own cold
+    /// prefill makes past that point, and the point is always the conversation boundary.
+    #[test]
+    fn a_turn_resumes_on_the_cuts_of_its_cold_prefill() {
+        // Several per chunk, one on a grid cut, none for a while, a run of very short turns.
+        let starts = [300, 1200, 2048, 2900, 7000, 7010, 7020, 11_000];
+        let mut from = 0;
+        for k in 0..starts.len() {
+            let (turns, boundary) = (&starts[..=k], Some(starts[k]));
+            let end = starts[k] + 7;
+            let cold = plan_turns(0, end, grid(), boundary, turns);
+            let warm = plan_turns(from, end, grid(), boundary, turns);
+            assert_eq!(cold.mark, boundary);
+            assert_eq!(warm.mark, boundary);
+            for cut in turns.iter().copied().chain(grid().cuts(0, end)) {
+                assert!(cold.cuts.contains(&cut), "{cut} missing from {cold:?}");
+            }
+            assert!(cold.cuts.windows(2).all(|w| w[0] < w[1]), "{cold:?}");
+            let tail: Vec<usize> = cold.cuts.iter().copied().filter(|&c| c > from).collect();
+            assert_eq!(warm.cuts, tail, "turn {k}");
+            from = starts[k];
+        }
+    }
+
+    /// Whether a point is wanted changes no call: rollback points stay an optimization.
+    #[test]
+    fn leaving_a_point_changes_no_cut() {
+        let turns = [300, 1200, 4090];
+        let with = plan_turns(0, 4100, grid(), Some(4090), &turns);
+        let without = plan_turns(0, 4100, grid(), None, &turns);
+        assert_eq!(with.cuts, without.cuts);
+        assert_eq!(with.mark, Some(4090));
+        assert_eq!(without.mark, None);
+    }
+
+    /// A prompt that adds nothing past the point still ends its calls where its cold prefill
+    /// does, and leaves no new point.
+    #[test]
+    fn a_retry_of_a_turn_keeps_its_point_and_the_cuts() {
+        let plan = plan_turns(4090, 4100, grid(), Some(4090), &[300, 4090]);
+        assert_eq!(plan.cuts, vec![4096, 4100]);
+        assert_eq!(plan.mark, None);
+    }
+
+    /// A turn close to the last cut gets none, whichever kind that cut is, and the choice for
+    /// any turn is the same in every longer prompt.
+    #[test]
+    fn a_turn_is_kept_by_its_distance_from_the_cut_before_it() {
+        let starts = [100, 300, 400, 600, 2050, 2100, 2400, 2500];
+        let kept = kept_turns(&starts, grid(), 256);
+        // 100: under the gap from 0. 400: from 300. 2050: from the grid's 2048. 2500: from 2400.
+        assert_eq!(kept, vec![300, 600, 2400]);
+        for n in 0..starts.len() {
+            let prefix: Vec<usize> = kept.iter().copied().filter(|&k| k <= starts[n]).collect();
+            assert_eq!(kept_turns(&starts[..=n], grid(), 256), prefix);
+        }
+    }
+
+    /// A turn with no cut of its own leaves the point where it was, or on the grid cut it
+    /// crossed; a warm turn from there still matches its cold prefill.
+    #[test]
+    fn a_turn_without_a_cut_keeps_the_last_one_as_its_point() {
+        let turns = [300, 600];
+        let plan = plan_turns(600, 700, grid(), Some(690), &turns);
+        assert_eq!((plan.cuts, plan.mark), (vec![700], None));
+
+        let plan = plan_turns(600, 2100, grid(), Some(2090), &turns);
+        assert_eq!((plan.cuts, plan.mark), (vec![2048, 2100], Some(2048)));
+    }
+
+    /// States computed on different cuts never answer for each other on disk.
+    #[test]
+    fn turn_states_and_grid_states_never_share_a_disk_key() {
+        let at = 4096;
+        assert_eq!(point_grid_key(grid(), at, false), grid().key_at(at));
+        assert_ne!(point_grid_key(grid(), at, true), grid().key_at(at));
     }
 }

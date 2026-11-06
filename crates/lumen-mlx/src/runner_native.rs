@@ -2227,9 +2227,9 @@ mod imp {
 
         /// Start `seq_id` from the longest session state on disk that `prompt`
         /// continues, and leave a rollback point there. Only states at cuts of
-        /// the prefill grid are candidates — each cut's content key is probed
-        /// from the latest back — so feeding the rest of the prompt from there
-        /// is exactly a cold prefill's computation.
+        /// its cold prefill are candidates (the grid's and its `turns`): each
+        /// one's content key is probed from the latest back, so feeding the
+        /// rest of the prompt from there is exactly a cold prefill's computation.
         ///
         /// Returns the restored length, or `None` when the tier is off or
         /// nothing matches. A state that fails to load is logged and skipped.
@@ -2237,6 +2237,7 @@ mod imp {
             &mut self,
             seq_id: u64,
             prompt: &[u32],
+            turns: &[usize],
         ) -> Result<Option<usize>> {
             if self.disk.is_none() || self.seqs.contains_key(&seq_id) {
                 return Ok(None);
@@ -2244,10 +2245,15 @@ mod imp {
             let Some(grid) = self.prefill_grid() else {
                 return Ok(None);
             };
+            let turn_cuts = !turns.is_empty();
             let mut cuts = grid.cuts(0, prompt.len());
             cuts.pop();
+            cuts.extend_from_slice(turns);
+            cuts.sort_unstable();
+            cuts.dedup();
             for at in cuts.into_iter().rev() {
-                let key = crate::kv_disk::point_key(grid.key_at(at), &prompt[..at]);
+                let grid_key = crate::session_feed::point_grid_key(grid, at, turn_cuts);
+                let key = crate::kv_disk::point_key(grid_key, &prompt[..at]);
                 let disk = self
                     .disk
                     .as_mut()
@@ -3576,6 +3582,7 @@ mod imp {
             &mut self,
             _seq_id: u64,
             _prompt: &[u32],
+            _turns: &[usize],
         ) -> Result<Option<usize>> {
             Ok(None)
         }

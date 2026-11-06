@@ -580,6 +580,10 @@ pub fn format_qwen3_chat_with_tools_and_images(
     s
 }
 
+/// How every assistant turn opens, replayed or generated: what a replay and
+/// [`qwen3_generation_header`] have in common.
+pub const QWEN3_ASSISTANT_OPEN: &str = "<|im_start|>assistant\n";
+
 /// The trailing **generation header** that `format_qwen3_chat_with_tools`
 /// (and the `_from_history` variant) append after the last rendered message.
 ///
