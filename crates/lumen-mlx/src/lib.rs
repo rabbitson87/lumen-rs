@@ -791,6 +791,11 @@ impl TokenScriptRunner {
         &self.masked
     }
 
+    /// Sequences prefilled and not removed: what the native runner would still be holding KV for.
+    pub(crate) fn live_seqs(&self) -> usize {
+        self.positions.len()
+    }
+
     /// A step under a grammar: the script's next token is the model's
     /// favourite, every other id ties below it, and the step takes the best id
     /// the mask leaves (the lowest, among ties). A script that breaks the
@@ -6593,9 +6598,8 @@ impl MlxQwen35Backend {
         if debug_qwen_tools {
             eprintln!("[qwen35-tools] first token {last}: {events:?}");
         }
-        for ev in events {
-            forward_parse_event(ev, &mut on_event)?;
-        }
+        let mut sink = ToolEventSink::new(on_event);
+        sink.forward(events);
         if self.eos_tokens.contains(&last) {
             self.remove_seq(seq_id).ok();
             return Ok(parser.finish());
@@ -6627,6 +6631,11 @@ impl MlxQwen35Backend {
         //      have to be rolled back on the injection/grammar-desync paths.
         // Correctness first: Qwen3.6 stays on the exact synchronous path.
         for step in 1..max_new_tokens {
+            // The sink has what it needs. Read here for the reason the next
+            // check is: one place covers every feed that can end the decode.
+            if sink.done {
+                break;
+            }
             // `parallel_tool_calls: false` — the parser has consumed a
             // `</tool_call>` and the client asked for exactly one call.
             //
@@ -6667,9 +6676,7 @@ impl MlxQwen35Backend {
                     let (next2, pos2) = self.runner.extend(seq_id, &combined)?;
                     generated.extend_from_slice(&inj_tokens);
                     detok.skip_to(generated.len());
-                    for ev in parser.feed(&inj) {
-                        forward_parse_event(ev, &mut on_event)?;
-                    }
+                    sink.forward(parser.feed(&inj));
                     if debug_qwen_tools {
                         eprintln!("[qwen35-tools] forced required param {key:?}");
                     }
@@ -6679,11 +6686,13 @@ impl MlxQwen35Backend {
                     last = next2;
                     pos = pos2;
                     generated.push(last);
-                    for ev in feed_newest(&mut parser, &mut detok, &generated, markers, |t| {
-                        self.decode(t)
-                    }) {
-                        forward_parse_event(ev, &mut on_event)?;
-                    }
+                    sink.forward(feed_newest(
+                        &mut parser,
+                        &mut detok,
+                        &generated,
+                        markers,
+                        |t| self.decode(t),
+                    ));
                     if self.eos_tokens.contains(&last) {
                         break;
                     }
@@ -6752,9 +6761,7 @@ impl MlxQwen35Backend {
             if debug_qwen_tools {
                 eprintln!("[qwen35-tools] step={step} token={next}: {events:?}");
             }
-            for ev in events {
-                forward_parse_event(ev, &mut on_event)?;
-            }
+            sink.forward(events);
             if self.eos_tokens.contains(&next) {
                 eprintln!(
                     "[mlx] seq {seq_id} EOS-tools at step {step} ({:.1} tok/s)",
@@ -6765,13 +6772,9 @@ impl MlxQwen35Backend {
         }
         // Tokens still held back for a character they might have completed.
         if let Some(text) = detok.finish(&generated, |t| self.decode(t)) {
-            for ev in parser.feed(&text) {
-                forward_parse_event(ev, &mut on_event)?;
-            }
+            sink.forward(parser.feed(&text));
         }
-        for ev in parser.flush() {
-            forward_parse_event(ev, &mut on_event)?;
-        }
+        sink.forward(parser.flush());
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
         let n_gen = generated.len();
         eprintln!(
@@ -7933,6 +7936,37 @@ fn feed_newest(
     events
 }
 
+/// The tool loop's side of the server's sink. An `Err` means what it means to the plain loops
+/// ([`flow_of`]): the decode ends, the turn still finishes. Handing it up the stack would skip
+/// `remove_seq`, leaving the sequence's KV in the runner, and lose the parse.
+///
+/// Once the sink has answered `Err` it hears nothing more, the rest of that feed included. The
+/// parser keeps reading, so the reply holds what was decoded.
+struct ToolEventSink<F> {
+    on_event: F,
+    done: bool,
+}
+
+impl<F> ToolEventSink<F>
+where
+    F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+{
+    fn new(on_event: F) -> Self {
+        Self {
+            on_event,
+            done: false,
+        }
+    }
+
+    fn forward(&mut self, events: Vec<crate::qwen3_5_tools::Qwen35ParseEvent>) {
+        if !self.done {
+            self.done = events
+                .into_iter()
+                .any(|ev| flow_of(forward_parse_event(ev, &mut self.on_event)).is_break());
+        }
+    }
+}
+
 /// Phase 2: bridges Qwen35ResponseParser events to the generic
 /// `BackendStreamEvent` shape the engine consumes. Mirrors the
 /// Gemma 4 `emit_token_event` adapter.
@@ -8750,29 +8784,41 @@ mod tests {
         calls: crate::grammar::ToolCalls,
         max_new_tokens: usize,
     ) -> (crate::chat_io::ParsedResponse, usize) {
+        let (parsed, backend) = tool_loop_into(script, calls, max_new_tokens, |_| Ok(()));
+        let consumed = backend.scripted_tokens_consumed();
+        (parsed.expect("tool decode loop"), consumed)
+    }
+
+    /// [`tool_loop`] into `on_event`, returning the loop's result and the backend it ran on.
+    fn tool_loop_into<F>(
+        script: Vec<u32>,
+        calls: crate::grammar::ToolCalls,
+        max_new_tokens: usize,
+        on_event: F,
+    ) -> (Result<crate::chat_io::ParsedResponse>, MlxQwen35Backend)
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
         let tokenizer =
             <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER).expect("script tokenizer");
         let mut backend = MlxQwen35Backend::with_token_script(script, SCRIPT_EOS, tokenizer, 11);
-        let parsed = backend
-            .chat_with_tools_impl(
-                vec![42],      // prompt: one arbitrary token
-                String::new(), // no tool_choice prefill
-                Vec::new(),
-                None, // no grammar — the case where a grammar-derived cap goes inert
-                calls,
-                max_new_tokens,
-                7,
-                None, // prefix caching off for this request
-                None,
-                Default::default(),
-                Default::default(),
-                Vec::new(),
-                false, // the scripted turn emits its own tags; no open block
-                |_| Ok(()),
-            )
-            .expect("tool decode loop");
-        let consumed = backend.scripted_tokens_consumed();
-        (parsed, consumed)
+        let parsed = backend.chat_with_tools_impl(
+            vec![42],      // prompt: one arbitrary token
+            String::new(), // no tool_choice prefill
+            Vec::new(),
+            None, // no grammar — the case where a grammar-derived cap goes inert
+            calls,
+            max_new_tokens,
+            7,
+            None, // prefix caching off for this request
+            None,
+            Default::default(),
+            Default::default(),
+            Vec::new(),
+            false, // the scripted turn emits its own tags; no open block
+            on_event,
+        );
+        (parsed, backend)
     }
 
     /// [`SCRIPT_TOKENIZER`] as a Qwen checkpoint has it: the four markers are
@@ -10839,6 +10885,51 @@ mod tests {
             );
             assert_eq!(parsed.visible, "Blue".repeat(decoded));
         }
+    }
+
+    /// RED before: the tool loop passed the sink's `Err` up with `?`, past `remove_seq`. A
+    /// streaming tool request that ended on a stop sequence, or on a client gone, left its whole
+    /// KV in the runner for the life of the process, and took its parse with it, so the stream
+    /// finished with `completion_tokens: 0`. The loop now ends and finishes the turn, as the
+    /// plain loops do. Covers a sink done on the first token, which comes out ahead of the loop.
+    #[test]
+    fn a_sink_ends_the_tool_loop_and_the_turn_still_finishes() {
+        use crate::chat_io::BackendStreamEvent;
+        use crate::grammar::ToolCalls;
+        for (cut_after, visible) in [(None, 8), (Some(1), 1), (Some(3), 3)] {
+            let mut texts = 0;
+            let script = [5, 6].repeat(4);
+            let (parsed, mut backend) = tool_loop_into(script, ToolCalls::OneOrMore, 8, |ev| {
+                if let BackendStreamEvent::Text(_) = ev {
+                    texts += 1;
+                    if cut_after.is_some_and(|n| texts >= n) {
+                        return Err(anyhow!("stop sequence"));
+                    }
+                }
+                Ok(())
+            });
+            let parsed = parsed.expect("a stop sequence is not an error");
+            assert_eq!(backend.scripted_tokens_consumed(), visible, "{cut_after:?}");
+            assert_eq!(texts, visible, "the sink hears nothing after its `Err`");
+            assert_eq!(parsed.visible.matches(['S', 'T']).count(), visible);
+            assert_eq!(backend.script_runner().live_seqs(), 0, "{cut_after:?}");
+        }
+    }
+
+    /// A call after a stop sequence must not reach the client: past its `Err` a sink hears
+    /// nothing, the rest of the feed or the text the parser let go of at the end.
+    #[test]
+    fn a_tool_sink_hears_nothing_after_its_err() {
+        use crate::qwen3_5_tools::Qwen35ParseEvent::Text;
+        let mut heard = 0;
+        let mut sink = ToolEventSink::new(|_| {
+            heard += 1;
+            Err(anyhow!("stop sequence"))
+        });
+        sink.forward(vec![Text("a".into()), Text("b".into())]);
+        sink.forward(vec![Text("c".into())]);
+        assert!(sink.done);
+        assert_eq!(heard, 1);
     }
 
     /// The guard is on images only: the same loop given no image still reuses

@@ -1352,12 +1352,10 @@ impl InferenceEngine {
                     &parsed.visible,
                     &parsed.tool_calls,
                 );
-                // A stop sequence or a complete JSON value ends the stream
-                // through the `stopped_by_seq` arm below — when the backend
-                // ends its decode loop on the sink's error. Qwen's plain and
-                // `response_format` loops ignore it and run on to the end; the
-                // matchers swallow everything after the stop, and the reason is
-                // still the stop, not the budget the loop then ran into.
+                // A stop sequence or a complete JSON value ends here too: Qwen's
+                // loops end on the sink's error and finish the turn. (Gemma's
+                // hands the error back, to the `stopped_by_seq` arm below.) The
+                // reason is the stop even if that token also spent the budget.
                 let finish_reason = FinishReason::resolve(
                     parsed.stop,
                     parsed.reports_tool_calls(),
