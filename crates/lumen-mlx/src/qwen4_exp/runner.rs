@@ -33,9 +33,10 @@ lumen_flags::flag! {
     /// `qwen4_exp_lowbit_pack` instead of the checkpoint's own: `bits,group,recipe`, such as
     /// `3,64,lsq`. The experts take less room, so the pool holds more of them and fewer are read
     /// from the SSD. **It is a different model:** replies differ from the checkpoint's. Measured at
-    /// 3 bits on the checkpoint's own greedy replies, 97.16% of 2,357 positions pick the same
-    /// token, against 99.75% for the checkpoint's own two-row pass. Prefill and decode both read
-    /// the copy, and persisted state is kept apart from the checkpoint's. Off unless set.
+    /// 3 bits on the checkpoint's own greedy replies, 96.22% of 6,140 positions pick the same
+    /// token, against 99.75% for the checkpoint's own two-row pass. Prefill, decode and the draft
+    /// head all read the copy, and persisted state is kept apart from the checkpoint's. A copy
+    /// that holds no draft head serves without drafts. Off unless set.
     pub(crate) expert_copy {
         env: "LUMEN_QWEN4_EXPERT_COPY",
         default: false,
@@ -831,10 +832,16 @@ impl Qwen4ExpRunner {
                 dir.display()
             );
         }
-        if mode == MtpMode::On && copy.is_some() {
-            bail!("LUMEN_QWEN4_MTP=on: the draft head does not run on an expert copy yet");
+        let head_copied = match copy {
+            Some(spec) => crate::offload::lowbit_holds_head(dir, spec)?,
+            None => true,
+        };
+        if mode == MtpMode::On && !head_copied {
+            bail!(
+                "LUMEN_QWEN4_MTP=on but the expert copy {copy:?} holds no draft head: build it again with qwen4_exp_lowbit_pack"
+            );
         }
-        let use_head = head_there && mode != MtpMode::Off && copy.is_none();
+        let use_head = head_there && head_copied && mode != MtpMode::Off;
         eprintln!("{}", plan_line(device, &choice, &plan, use_head));
         let model = Qwen4ExpModel::load_with(
             dir,
@@ -2619,15 +2626,25 @@ mod tests {
     fn tiny_runner_with(chunk: usize, mtp: MtpMode, budget: Option<u64>) -> Qwen4ExpRunner {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/qwen4exp_tiny");
+        tiny_runner_on(&dir, chunk, mtp, budget, None)
+    }
+
+    fn tiny_runner_on(
+        dir: &std::path::Path,
+        chunk: usize,
+        mtp: MtpMode,
+        budget: Option<u64>,
+        expert_copy: Option<LowbitSpec>,
+    ) -> Qwen4ExpRunner {
         let model = Qwen4ExpModel::load_with(
-            &dir,
+            dir,
             LoadOptions {
                 expert_budget_bytes: budget,
                 ngram: NgramSource::Auto,
                 mtp,
                 scores_budget_bytes: 0,
                 low_experts: None,
-                expert_copy: None,
+                expert_copy,
             },
         )
         .expect("tiny replica");
@@ -2754,15 +2771,35 @@ mod tests {
     fn speculative_rounds_emit_what_plain_decoding_emits() {
         // Experts resident, and the trunk's and the head's served from one pool.
         for budget in [None, Some(1u64)] {
-            speculative_rounds_match_plain(budget);
+            speculative_rounds_match_plain(|mtp| tiny_runner_with(16, mtp, budget));
         }
     }
 
-    fn speculative_rounds_match_plain(budget: Option<u64>) {
+    #[test]
+    fn speculative_rounds_on_a_copy_emit_what_plain_decoding_on_it_emits() {
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qwen4exp_tiny");
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "config.json",
+            "model.safetensors",
+            "mtp.json",
+            "mtp.safetensors",
+        ] {
+            std::fs::copy(src.join(name), tmp.path().join(name)).unwrap();
+        }
+        let spec = LowbitSpec::new(2, 32, crate::offload::lowbit::Recipe::LeastSquares).unwrap();
+        crate::offload::build_lowbit_pack(tmp.path(), 4, spec).unwrap();
+        speculative_rounds_match_plain(|mtp| {
+            tiny_runner_on(tmp.path(), 16, mtp, Some(1), Some(spec))
+        });
+    }
+
+    fn speculative_rounds_match_plain(runner: impl Fn(MtpMode) -> Qwen4ExpRunner) {
         let prompt = fixture_prompt();
         let steps = 24;
 
-        let mut plain = tiny_runner_with(16, MtpMode::Off, budget);
+        let mut plain = runner(MtpMode::Off);
         let (t0, _) = plain.prefill(1, &prompt).unwrap();
         let mut expected = vec![t0];
         let mut last = t0;
@@ -2772,7 +2809,7 @@ mod tests {
             last = next;
         }
 
-        let mut spec = tiny_runner_with(16, MtpMode::On, budget);
+        let mut spec = runner(MtpMode::On);
         let (s0, _) = spec.prefill(1, &prompt).unwrap();
         assert_eq!(s0, t0);
         // The draft of each round is the token the plain loop emits next, except every third

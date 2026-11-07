@@ -1234,6 +1234,19 @@ fn replica_copy() -> tempfile::TempDir {
     tmp
 }
 
+/// [`replica_copy`], with the draft head.
+fn replica_with_head() -> tempfile::TempDir {
+    let tmp = replica_copy();
+    add_head(tmp.path());
+    tmp
+}
+
+fn add_head(dir: &Path) {
+    for name in ["mtp.json", "mtp.safetensors"] {
+        std::fs::copy(fixture_dir().join(name), dir.join(name)).unwrap();
+    }
+}
+
 fn with_low_experts(dir: &Path, spec: LowbitSpec) -> Qwen4ExpModel {
     crate::offload::build_lowbit_pack(dir, 4, spec).expect("low-bit pack");
     let budget = 400 << 20;
@@ -1407,15 +1420,97 @@ fn a_multi_token_feed_reads_the_copy_too() {
 }
 
 #[test]
-fn a_copy_needs_a_pool_and_no_draft_head_and_its_pack() {
+fn a_copy_needs_a_pool_and_its_pack() {
     let tmp = replica_copy();
     let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
     assert!(Qwen4ExpModel::load_with(tmp.path(), copy_options(spec, Some(400 << 20))).is_err());
     crate::offload::build_lowbit_pack(tmp.path(), 4, spec).unwrap();
     assert!(Qwen4ExpModel::load_with(tmp.path(), copy_options(spec, None)).is_err());
-    let with_head = LoadOptions {
+}
+
+/// The head's logits over the reference's rows, with a fixed input from the reference, so that
+/// only the head's own experts can move them.
+fn head_logits(model: &Qwen4ExpModel) -> Vec<f32> {
+    let want = mtp_outputs(&fixture_dir());
+    let ids: Vec<u32> = want["mtp_ids"]
+        .as_slice::<i32>()
+        .iter()
+        .map(|&t| t as u32)
+        .collect();
+    let out = model
+        .mtp_logits_for_test(&ids[1..], &want["mtp_multi_in"], &[47])
+        .unwrap();
+    host_f32(&out[0])
+}
+
+fn head_copy_options(spec: LowbitSpec) -> LoadOptions {
+    LoadOptions {
         mtp: MtpMode::On,
         ..copy_options(spec, Some(400 << 20))
+    }
+}
+
+#[test]
+fn the_draft_head_reads_its_experts_at_the_width_of_the_copy() {
+    let tmp = replica_with_head();
+    let own = head_logits(&load_with_head(tmp.path(), Some(400 << 20)));
+    // A copy at the checkpoint's own width and groups refits the same levels. Read at any other
+    // width its records would be noise, or would not fit the kernel at all.
+    let same = LowbitSpec::new(4, 32, Recipe::LeastSquares).unwrap();
+    let coarse = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
+    let moved = |spec: LowbitSpec| {
+        crate::offload::build_lowbit_pack(tmp.path(), 4, spec).unwrap();
+        let model = Qwen4ExpModel::load_with(tmp.path(), head_copy_options(spec)).unwrap();
+        assert!(model.has_mtp());
+        distance(&head_logits(&model), &own)
     };
-    assert!(Qwen4ExpModel::load_with(tmp.path(), with_head).is_err());
+    let (near, far) = (moved(same), moved(coarse));
+    assert!(near < 0.2 * far, "{near} against {far}");
+    let size = own.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(far > 0.0 && far < 0.2 * size, "{far} of {size}");
+}
+
+#[test]
+fn the_heads_experts_in_a_copy_leave_the_trunk_alone() {
+    let tokens = [3u32, 14, 15, 92, 65];
+    let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
+    let logits = |dir: &Path| {
+        crate::offload::build_lowbit_pack(dir, 4, spec).unwrap();
+        let model = Qwen4ExpModel::load_with(dir, copy_options(spec, Some(400 << 20))).unwrap();
+        last_logits(&model, &tokens)
+    };
+    assert_eq!(
+        logits(replica_with_head().path()),
+        logits(replica_copy().path())
+    );
+}
+
+#[test]
+fn a_copy_that_holds_no_head_serves_only_without_drafts() {
+    let tmp = replica_with_head();
+    let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
+    let path = crate::offload::build_lowbit_pack(tmp.path(), 4, spec).unwrap();
+    assert!(crate::offload::lowbit_holds_head(tmp.path(), spec).unwrap());
+    // A pack from before copies held the head: the same bytes, without the header's word for it.
+    let bytes = std::fs::read(&path).unwrap();
+    let (key, old) = (b"draft_head", b"other_head");
+    let at = bytes.windows(key.len()).position(|w| w == key).unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&file, old, at as u64).unwrap();
+    assert!(!crate::offload::lowbit_holds_head(tmp.path(), spec).unwrap());
+
+    Qwen4ExpModel::load_with(tmp.path(), copy_options(spec, Some(400 << 20))).unwrap();
+}
+
+#[test]
+fn a_copy_of_another_head_is_not_served() {
+    let tmp = replica_with_head();
+    let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
+    crate::offload::build_lowbit_pack(tmp.path(), 4, spec).unwrap();
+    Qwen4ExpModel::load_with(tmp.path(), head_copy_options(spec)).unwrap();
+    let file = tmp.path().join("mtp.safetensors");
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes.push(0);
+    std::fs::write(&file, bytes).unwrap();
+    assert!(Qwen4ExpModel::load_with(tmp.path(), head_copy_options(spec)).is_err());
 }

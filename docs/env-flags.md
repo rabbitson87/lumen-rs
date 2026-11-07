@@ -911,9 +911,10 @@ Serve Flash-Next's routed experts from a low-bit copy built with
  `qwen4_exp_lowbit_pack` instead of the checkpoint's own: `bits,group,recipe`, such as
  `3,64,lsq`. The experts take less room, so the pool holds more of them and fewer are read
  from the SSD. **It is a different model:** replies differ from the checkpoint's. Measured at
- 3 bits on the checkpoint's own greedy replies, 97.16% of 2,357 positions pick the same
- token, against 99.75% for the checkpoint's own two-row pass. Prefill and decode both read
- the copy, and persisted state is kept apart from the checkpoint's. Off unless set.
+ 3 bits on the checkpoint's own greedy replies, 96.22% of 6,140 positions pick the same
+ token, against 99.75% for the checkpoint's own two-row pass. Prefill, decode and the draft
+ head all read the copy, and persisted state is kept apart from the checkpoint's. A copy
+ that holds no draft head serves without drafts. Off unless set.
 
 ### `LUMEN_QWEN4_KV_BF16`
 

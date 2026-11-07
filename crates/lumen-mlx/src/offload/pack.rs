@@ -26,7 +26,9 @@
 //! A low-bit copy (`experts.2b64.lsq.lpack`, see [`super::lowbit`]) is a file of the same shape
 //! whose records were fitted again at fewer bits. Its header names its quantization and the
 //! weights it was made from as `source_fingerprint`. It is a different model, not a cache of
-//! this one, so nothing opens it unless asked to.
+//! this one, so nothing opens it unless asked to. When the checkpoint has a draft head, the copy
+//! holds the head's experts too, as one more layer, and its header says `draft_head`. The head's
+//! file is one of the shards `source_fingerprint` covers, so another head is other weights.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
@@ -36,7 +38,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::expert_store::{ExpertStore, LayerRanges, RoleRange};
+use super::expert_store::{ExpertStore, LayerRanges, MTP_LAYER, RoleRange};
 use super::lowbit::{self, Fidelity, LowbitSpec, PackedProj, PackedProjMut, ScaleType};
 
 /// File name of the pack inside a checkpoint directory.
@@ -586,8 +588,9 @@ fn plan_lowbit(
     Ok((plans, RoleSlot::lay_out(roles)))
 }
 
-/// Build `spec`'s low-bit copy of `source`, whose experts are `src_bits` bits. Returns where it
-/// went and how close each projection stayed.
+/// Build `spec`'s low-bit copy of `source`, whose experts are `src_bits` bits, and of the draft
+/// head's next to it when there is one. Returns where it went and how close each projection
+/// stayed.
 pub(crate) fn build_lowbit(
     dir: &Path,
     source: &ExpertStore,
@@ -603,6 +606,11 @@ pub(crate) fn build_lowbit(
     let (plans, slots) = plan_lowbit(first, src_bits, spec)?;
     let mut head = serde_json::Map::new();
     head.insert("source_fingerprint".into(), json!(fingerprint(source)?));
+    let mut copied = source.clone();
+    copied.add_mtp_layer(dir)?;
+    if copied.layers.contains_key(&MTP_LAYER) {
+        head.insert("draft_head".into(), json!(true));
+    }
     head.insert(
         "lowbit".into(),
         json!({"bits": spec.bits, "group_size": spec.group_size, "recipe": spec.recipe.name()}),
@@ -612,7 +620,7 @@ pub(crate) fn build_lowbit(
     let dest = lowbit_path(dir, spec);
     write_pack(
         &dest,
-        source,
+        &copied,
         &slots,
         head,
         |tensors, e, rec| {
@@ -655,18 +663,31 @@ pub(crate) fn build_lowbit(
     Ok((dest, named))
 }
 
+/// Does `spec`'s copy in `dir` hold the draft head's experts? `false` when there is no copy.
+pub(crate) fn lowbit_holds_head(dir: &Path, spec: LowbitSpec) -> Result<bool> {
+    let path = lowbit_path(dir, spec);
+    let Ok(file) = File::open(&path) else {
+        return Ok(false);
+    };
+    let (v, _) = read_pack(&file, &path).with_context(|| format!("pack {}", path.display()))?;
+    Ok(v["draft_head"] == json!(true))
+}
+
 /// `spec`'s low-bit copy of `source`, as a store, if the file exists; an error if it does but
-/// was not made from these weights at this quantization.
+/// was not made from these weights at this quantization. The store has layer [`MTP_LAYER`] only
+/// `with_mtp`, and then the copy has to hold it.
 pub(crate) fn open_lowbit(
     dir: &Path,
     source: &ExpertStore,
     spec: LowbitSpec,
+    with_mtp: bool,
 ) -> Result<Option<ExpertStore>> {
     let path = lowbit_path(dir, spec);
     let Ok(file) = File::open(&path) else {
         return Ok(None);
     };
-    let (v, store) = read_pack(&file, &path).with_context(|| format!("pack {}", path.display()))?;
+    let (v, mut store) =
+        read_pack(&file, &path).with_context(|| format!("pack {}", path.display()))?;
     let want = fingerprint(source)?;
     let got = v["source_fingerprint"].as_str().unwrap_or_default();
     if got != want {
@@ -689,6 +710,14 @@ pub(crate) fn open_lowbit(
         if p.n_experts != l.n_experts || !p.roles.keys().eq(l.roles.keys()) {
             bail!("{}: layer {layer} differs from the shards", path.display());
         }
+    }
+    if !with_mtp {
+        store.layers.remove(&MTP_LAYER);
+    } else if !store.layers.contains_key(&MTP_LAYER) {
+        bail!(
+            "{} holds no draft head: build the copy again",
+            path.display()
+        );
     }
     Ok(Some(store))
 }
