@@ -11,6 +11,10 @@
 //! `(scale, bias)` for those codes, which cannot raise the squared error, and starts from both
 //! the min-max fit and one sized for the group's spread.
 //!
+//! The two `top` recipes keep the source's own groups and the top bits of its codes, so that the
+//! bits left out are all it takes to get the source's codes back. That costs quality: most weights
+//! sit in the middle of a group's range, so they share few of the levels.
+//!
 //! This is lossy by design, and it is not what the exact path serves.
 
 use anyhow::{Result, bail};
@@ -22,6 +26,10 @@ pub enum Recipe {
     MinMax,
     /// Alternating least squares.
     LeastSquares,
+    /// The source's top bits, read as the middle of the codes they stand for.
+    Top,
+    /// The source's top bits, with `(scale, bias)` solved for them.
+    TopFit,
 }
 
 impl Recipe {
@@ -29,14 +37,23 @@ impl Recipe {
         match self {
             Self::MinMax => "minmax",
             Self::LeastSquares => "lsq",
+            Self::Top => "top",
+            Self::TopFit => "topfit",
         }
+    }
+
+    /// Are the codes the source's top bits?
+    fn keeps_top_bits(self) -> bool {
+        matches!(self, Self::Top | Self::TopFit)
     }
 
     pub fn parse(raw: &str) -> Result<Self> {
         match raw {
             "minmax" => Ok(Self::MinMax),
             "lsq" => Ok(Self::LeastSquares),
-            other => bail!("recipe {other:?} is not `minmax` or `lsq`"),
+            "top" => Ok(Self::Top),
+            "topfit" => Ok(Self::TopFit),
+            other => bail!("recipe {other:?} is not `minmax`, `lsq`, `top` or `topfit`"),
         }
     }
 }
@@ -262,6 +279,26 @@ fn fit_spread(xs: &[f32], top: f32) -> (f32, f32) {
     (scale, mean - scale * top * 0.5)
 }
 
+/// The least-squares `(scale, bias)` for these codes. Every weight on one code leaves no slope to
+/// fit, and the bias takes the mean.
+fn solve(xs: &[f32], codes: &[f32]) -> (f32, f32) {
+    let n = xs.len() as f64;
+    let (mut sq, mut sx, mut sqq, mut sqx) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for (&q, &x) in codes.iter().zip(xs) {
+        let (q, x) = (f64::from(q), f64::from(x));
+        sq += q;
+        sx += x;
+        sqq += q * q;
+        sqx += q * x;
+    }
+    let d = n * sqq - sq * sq;
+    if d <= 0.0 {
+        return (0.0, (sx / n) as f32);
+    }
+    let scale = ((n * sqx - sq * sx) / d) as f32;
+    (scale, ((sx - f64::from(scale) * sq) / n) as f32)
+}
+
 /// Rounds of assign-then-solve. Two levels' worth of a 64-weight group settles in a few.
 const REFINE_ROUNDS: usize = 8;
 
@@ -279,22 +316,7 @@ fn refine(xs: &[f32], top: f32, start: (f32, f32), codes: &mut [f32]) -> (f32, f
         if !changed {
             break;
         }
-        let n = xs.len() as f64;
-        let (mut sq, mut sx, mut sqq, mut sqx) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        for (&q, &x) in codes.iter().zip(xs) {
-            let (q, x) = (f64::from(q), f64::from(x));
-            sq += q;
-            sx += x;
-            sqq += q * q;
-            sqx += q * x;
-        }
-        let d = n * sqq - sq * sq;
-        if d <= 0.0 {
-            // Every weight took one code: nothing to fit a slope to.
-            return (0.0, (sx / n) as f32);
-        }
-        scale = ((n * sqx - sq * sx) / d) as f32;
-        bias = ((sx - f64::from(scale) * sq) / n) as f32;
+        (scale, bias) = solve(xs, codes);
     }
     (scale, bias)
 }
@@ -310,7 +332,7 @@ fn fit_group(
     let held = |(s, b): (f32, f32)| (scale_type.held(s), scale_type.held(b));
     let min_max = fit_min_max(xs, top);
     match recipe {
-        Recipe::MinMax => held(min_max),
+        Recipe::MinMax | Recipe::Top | Recipe::TopFit => held(min_max),
         Recipe::LeastSquares => {
             let spread = fit_spread(xs, top);
             // A candidate is judged as stored: that is what gets served.
@@ -350,6 +372,18 @@ pub(crate) fn requantize(
             spec.group_size
         );
     }
+    let keeps = spec.recipe.keeps_top_bits();
+    if keeps && (spec.group_size != src.group_size || spec.bits >= src.bits) {
+        bail!(
+            "{} {} bits in groups of {} are not the top bits of {} in groups of {}",
+            spec.recipe.name(),
+            spec.bits,
+            spec.group_size,
+            src.bits,
+            src.group_size
+        );
+    }
+    let shift = src.bits.saturating_sub(spec.bits);
     let t = src.scale_type;
     let src_groups = src.cols / src.group_size;
     let dst_groups = src.cols / spec.group_size;
@@ -372,6 +406,7 @@ pub(crate) fn requantize(
     let mut dst_words = vec![0u32; dst_row / 4];
     let mut row = vec![0f32; src.cols];
     let mut codes = vec![0f32; spec.group_size];
+    let mut fits = vec![(0f32, 0f32); src_groups];
 
     for r in 0..src.rows {
         let weight = &src.weight[r * src_row..(r + 1) * src_row];
@@ -382,6 +417,7 @@ pub(crate) fn requantize(
         let scales = floats_of(&src.scales[at..at + len], t);
         let biases = floats_of(&src.biases[at..at + len], t);
         for (g, (s, b)) in scales.zip(biases).enumerate() {
+            fits[g] = (s, b);
             let start = g * src.group_size;
             for (i, x) in row[start..start + src.group_size].iter_mut().enumerate() {
                 *x = s * read_code(&src_words, start + i, src.bits) as f32 + b;
@@ -390,9 +426,29 @@ pub(crate) fn requantize(
 
         dst_words.fill(0);
         for (g, xs) in row.chunks_exact(spec.group_size).enumerate() {
-            let (fs, fb) = fit_group(xs, top, spec.recipe, t, &mut codes);
+            let start = g * spec.group_size;
+            let kept = |i: usize| (read_code(&src_words, start + i, src.bits) >> shift) as f32;
+            let (fs, fb) = match spec.recipe {
+                Recipe::Top => {
+                    let (s, b) = fits[g];
+                    let step = (1u32 << shift) as f32;
+                    (t.held(s * step), t.held(b + s * (step - 1.0) / 2.0))
+                }
+                Recipe::TopFit => {
+                    for (i, c) in codes.iter_mut().enumerate() {
+                        *c = kept(i);
+                    }
+                    let (s, b) = solve(xs, &codes);
+                    (t.held(s), t.held(b))
+                }
+                _ => fit_group(xs, top, spec.recipe, t, &mut codes),
+            };
             for (i, &x) in xs.iter().enumerate() {
-                let q = code_of(x, fs, fb, top);
+                let q = if keeps {
+                    kept(i)
+                } else {
+                    code_of(x, fs, fb, top)
+                };
                 write_code(&mut dst_words, g * spec.group_size + i, spec.bits, q as u32);
                 let d = f64::from(x) - (f64::from(fs) * f64::from(q) + f64::from(fb));
                 fidelity.err += d * d;
@@ -578,6 +634,105 @@ mod tests {
         let (_, _, _, f) = requantized(proj(&src, 4, 128, 32), lsq(4, 32));
         // Not exact: a group that misses a level of its range is fitted on a slightly other grid.
         assert!(f.snr_db() > 30.0, "{} dB", f.snr_db());
+    }
+
+    fn words(bytes: &[u8]) -> Vec<u32> {
+        words_of(bytes).collect()
+    }
+
+    #[test]
+    fn the_left_out_bits_are_all_the_top_recipes_need_to_get_the_source_codes_back() {
+        let (rows, cols, gs) = (4, 128, 64);
+        let src = source(rows, cols, gs, 21);
+        let source_codes = words(&src.0);
+        for recipe in [Recipe::Top, Recipe::TopFit] {
+            let spec = LowbitSpec::new(2, gs, recipe).unwrap();
+            let (w, _, _, _) = requantized(proj(&src, rows, cols, gs), spec);
+            let kept = words(&w);
+            for i in 0..rows * cols {
+                let code = read_code(&source_codes, i, 4);
+                let left_out = code & 0b11;
+                assert_eq!(read_code(&kept, i, 2) << 2 | left_out, code, "{recipe:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn top_reads_each_code_as_the_middle_of_what_it_stands_for() {
+        let (rows, cols, gs) = (4, 128, 64);
+        let src = source(rows, cols, gs, 22);
+        let source_codes = words(&src.0);
+        let spec = LowbitSpec::new(2, gs, Recipe::Top).unwrap();
+        let (w, s, b, _) = requantized(proj(&src, rows, cols, gs), spec);
+        let (scale, bias) = (ScaleType::Bf16.read(&s[..2]), ScaleType::Bf16.read(&b[..2]));
+        // `source` writes a step of 0.002 from -0.015, so the step of four codes is exact.
+        assert_eq!(scale, bf16_to_f32(f32_to_bf16(0.002)) * 4.0);
+        let kept = words(&w);
+        let (s0, b0) = (
+            bf16_to_f32(f32_to_bf16(0.002)),
+            bf16_to_f32(f32_to_bf16(-0.015)),
+        );
+        for i in 0..gs {
+            let code = read_code(&source_codes, i, 4) as f32;
+            let copy = scale * read_code(&kept, i, 2) as f32 + bias;
+            let original = s0 * code + b0;
+            // At most a code and a half from the middle of four, and a bias rounded to bf16.
+            assert!((copy - original).abs() <= 1.5 * s0 + 2e-4, "{i}");
+        }
+    }
+
+    /// A projection at 4 bits, codes bunched around the middle of the range like real weights.
+    fn bunched(rows: usize, cols: usize, gs: usize, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (_, scales, biases) = source(rows, cols, gs, seed);
+        let mut rng = Rng(seed);
+        let mut words = vec![0u32; rows * cols / 8];
+        for i in 0..rows * cols {
+            let code = (7.5 + 2.0 * rng.gauss()).round().clamp(0.0, 15.0) as u32;
+            write_code(&mut words, i, 4, code);
+        }
+        let weight = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        (weight, scales, biases)
+    }
+
+    #[test]
+    fn solving_for_the_kept_codes_beats_their_middle_and_refitting_the_codes_beats_both() {
+        let (rows, cols, gs) = (8, 128, 64);
+        let src = bunched(rows, cols, gs, 23);
+        let err = |r| {
+            let spec = LowbitSpec::new(2, gs, r).unwrap();
+            requantized(proj(&src, rows, cols, gs), spec).3.err
+        };
+        let (top, fit, lsq) = (
+            err(Recipe::Top),
+            err(Recipe::TopFit),
+            err(Recipe::LeastSquares),
+        );
+        assert!(fit < top, "{fit} against {top}");
+        // The price of keeping the codes.
+        assert!(lsq < fit, "{lsq} against {fit}");
+    }
+
+    #[test]
+    fn the_top_recipes_need_the_sources_groups_and_fewer_bits() {
+        let src = source(2, 128, 32, 24);
+        let run = |bits, gs| {
+            let spec = LowbitSpec::new(bits, gs, Recipe::Top).unwrap();
+            let groups = 128 / gs;
+            let (mut w, mut s, mut b) = (
+                vec![0u8; 2 * row_bytes(128, bits).unwrap()],
+                vec![0u8; 2 * groups * 2],
+                vec![0u8; 2 * groups * 2],
+            );
+            let dst = PackedProjMut {
+                weight: &mut w,
+                scales: &mut s,
+                biases: &mut b,
+            };
+            requantize(proj(&src, 2, 128, 32), spec, dst).is_ok()
+        };
+        assert!(run(2, 32));
+        assert!(!run(2, 64), "other groups");
+        assert!(!run(4, 32), "as many bits");
     }
 
     /// What MLX itself reads out of packed words, scales and biases.
