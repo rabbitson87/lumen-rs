@@ -792,6 +792,7 @@ impl Qwen4ExpRunner {
                 expert_budget_bytes: Some(budget),
                 ngram: NgramSource::Auto,
                 scores_budget_bytes: 0,
+                low_experts: None,
             },
         )
         .with_context(|| format!("qwen4_exp: load `{}`", dir.display()))?;
@@ -2555,6 +2556,7 @@ mod tests {
                 ngram: NgramSource::Auto,
                 mtp,
                 scores_budget_bytes: 0,
+                low_experts: None,
             },
         )
         .expect("tiny replica");

@@ -37,7 +37,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use super::expert_store::{ExpertStore, LayerRanges, RoleRange};
-use super::lowbit::{self, Fidelity, LowbitSpec, PackedProj, PackedProjMut};
+use super::lowbit::{self, Fidelity, LowbitSpec, PackedProj, PackedProjMut, ScaleType};
 
 /// File name of the pack inside a checkpoint directory.
 pub(crate) const PACK_FILE: &str = "experts.lpack";
@@ -511,6 +511,7 @@ struct ProjPlan {
     rows: usize,
     cols: usize,
     src_group: usize,
+    scale_type: ScaleType,
     /// Index into the role-ordered tensors, and bytes of one expert, of weight, scales, biases.
     src: [(usize, usize); 3],
     /// Index into the role-ordered record slots.
@@ -538,14 +539,15 @@ fn plan_lowbit(
         let [w, s, b] = PARTS.map(|p| format!("{name}.{p}"));
         let (wi, si, bi) = (index(&w)?, index(&s)?, index(&b)?);
         let (wr, sr, br) = (&first.roles[&w], &first.roles[&s], &first.roles[&b]);
-        if wr.dtype != "U32" || sr.dtype != "BF16" || br.dtype != "BF16" {
+        if wr.dtype != "U32" || sr.dtype != br.dtype {
             bail!(
-                "pack: {name} is {}, {}, {}; a low-bit copy needs U32 and BF16",
+                "pack: {name} is {}, {}, {}; a low-bit copy needs U32 weights and one float type",
                 wr.dtype,
                 sr.dtype,
                 br.dtype
             );
         }
+        let scale_type = ScaleType::parse(&sr.dtype)?;
         let [rows, words] = wr.tail_shape[..] else {
             bail!("pack: {name}.weight is not a matrix");
         };
@@ -558,13 +560,15 @@ fn plan_lowbit(
         let dst_words = lowbit::row_bytes(cols, spec.bits)? / 4;
         tails[wi] = Some((rows * dst_words * 4, vec![rows as i64, dst_words as i64]));
         for i in [si, bi] {
-            tails[i] = Some((rows * dst_groups * 2, vec![rows as i64, dst_groups as i64]));
+            let bytes = rows * dst_groups * scale_type.bytes();
+            tails[i] = Some((bytes, vec![rows as i64, dst_groups as i64]));
         }
         plans.push(ProjPlan {
             name: name.to_string(),
             rows,
             cols,
             src_group: cols / groups,
+            scale_type,
             src: [(wi, wr.bytes), (si, sr.bytes), (bi, br.bytes)],
             dst: [wi, si, bi],
         });
@@ -624,6 +628,7 @@ pub(crate) fn build_lowbit(
                         weight: w,
                         scales: s,
                         biases: b,
+                        scale_type: plan.scale_type,
                         rows: plan.rows,
                         cols: plan.cols,
                         bits: src_bits,

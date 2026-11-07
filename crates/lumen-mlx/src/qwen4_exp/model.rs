@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mlx_rs::ops::indexing::{TryIndexOp, put_along_axis, take_along_axis};
@@ -26,6 +27,7 @@ use crate::native_moe::{
 use crate::native_quant::MODE_AFFINE;
 use crate::native_rope::rope;
 use crate::native_ssm::{compute_g, gated_delta_step_kernel};
+use crate::offload::lowbit::LowbitSpec;
 use crate::offload::{IoMode, IoTuning, MoeOffload};
 use crate::qwen3_5_moe::{NativeWeights, ResolvedLinear};
 
@@ -577,6 +579,9 @@ pub struct Qwen4ExpModel {
     mixer: HyperConnection,
     lm_head: Option<Proj>,
     offload: Option<MoeOffload>,
+    /// A low-bit copy of the routed experts, when asked for, and whether passes read it now.
+    low: Option<LowExperts>,
+    low_active: AtomicBool,
     /// The MTP draft head, when its weights are next to the checkpoint and `LoadOptions::mtp`
     /// allows it.
     mtp: Option<MtpHead>,
@@ -849,6 +854,30 @@ pub enum NgramSource {
     File,
 }
 
+/// Which copy of the routed experts a pass reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExpertTier {
+    /// The checkpoint's own. The only exact one.
+    #[default]
+    Full,
+    /// The low-bit copy from [`LoadOptions::low_experts`].
+    Low,
+}
+
+/// A low-bit copy of the routed experts to load beside the checkpoint's own (see
+/// [`crate::offload::lowbit`]), with a pool of its own.
+#[derive(Debug, Clone, Copy)]
+pub struct LowExpertOptions {
+    pub spec: LowbitSpec,
+    pub budget_bytes: u64,
+}
+
+struct LowExperts {
+    offload: MoeOffload,
+    bits: i32,
+    group_size: i32,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LoadOptions {
     /// Serve the routed experts from an SSD-backed slot pool of about this many bytes.
@@ -860,6 +889,9 @@ pub struct LoadOptions {
     /// [`DEFAULT_SCORES_BUDGET`]): a chunk against a long context is attended in blocks of query
     /// rows so the scores (`heads x rows x context x 4 B`) stay under it.
     pub scores_budget_bytes: u64,
+    /// Load a low-bit copy of the experts too. Passes read the checkpoint's own until
+    /// [`Qwen4ExpModel::set_expert_tier`] says otherwise.
+    pub low_experts: Option<LowExpertOptions>,
 }
 
 /// Fewest query rows attended together: a block this small is all kernel launches.
@@ -881,6 +913,7 @@ impl Qwen4ExpModel {
                 ngram: NgramSource::Auto,
                 mtp: MtpMode::Off,
                 scores_budget_bytes: 0,
+                low_experts: None,
             },
         )
     }
@@ -1024,6 +1057,21 @@ impl Qwen4ExpModel {
             }
             None => None,
         };
+        let low = match options.low_experts {
+            Some(o) => Some(LowExperts {
+                offload: MoeOffload::open_lowbit(
+                    model_dir,
+                    o.spec,
+                    o.budget_bytes,
+                    cfg.num_experts_per_tok,
+                    IoTuning::from_env()?,
+                )
+                .context("qwen4_exp: low-bit experts")?,
+                bits: o.spec.bits as i32,
+                group_size: o.spec.group_size as i32,
+            }),
+            None => None,
+        };
         let ones_hidden = mlx_rs::ops::ones::<f32>(&[cfg.hidden_size as i32])?;
         ones_hidden.eval()?;
         let mtp = if want_head {
@@ -1049,6 +1097,8 @@ impl Qwen4ExpModel {
             mixer,
             lm_head,
             offload,
+            low,
+            low_active: AtomicBool::new(false),
             mtp,
             scores_budget: if options.scores_budget_bytes == 0 {
                 DEFAULT_SCORES_BUDGET
@@ -2240,14 +2290,43 @@ impl Qwen4ExpModel {
         Ok(mlx_rs::ops::add(h, &spread)?)
     }
 
+    fn low_in_use(&self) -> Option<&LowExperts> {
+        self.low
+            .as_ref()
+            .filter(|_| self.low_active.load(Ordering::Relaxed))
+    }
+
     /// Where this pass reads the routed experts from, when they are offloaded.
     fn expert_source(&self) -> Option<&MoeOffload> {
-        self.offload.as_ref()
+        match self.low_in_use() {
+            Some(low) => Some(&low.offload),
+            None => self.offload.as_ref(),
+        }
     }
 
     /// A MoE block's weights as this pass reads them.
     fn expert_view<'a>(&'a self, moe: &'a MoeLayer) -> MoeBlockWeights<'a> {
-        moe.view(self.expert_source())
+        let mut view = moe.view(self.expert_source());
+        if let Some(low) = self.low_in_use() {
+            view.switch_glu.bits = low.bits;
+            view.switch_glu.group_size = low.group_size;
+        }
+        view
+    }
+
+    /// Choose the copy of the experts the passes after this one read.
+    pub fn set_expert_tier(&self, tier: ExpertTier) -> Result<()> {
+        if tier == ExpertTier::Low && self.low.is_none() {
+            bail!("qwen4_exp: this model was loaded without low-bit experts");
+        }
+        self.low_active
+            .store(tier == ExpertTier::Low, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The low-bit pool's report, like [`Self::offload_report`].
+    pub fn low_offload_report(&self) -> Option<String> {
+        self.low.as_ref().map(|low| low.offload.report())
     }
 
     fn layer_forward(

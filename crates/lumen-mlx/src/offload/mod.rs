@@ -655,6 +655,19 @@ impl MoeOffload {
             .with_context(|| format!("expert offload: bank over {}", dir.display()))
     }
 
+    /// A bank over the low-bit copy `spec` of `dir`'s experts.
+    pub(crate) fn open_lowbit(
+        dir: &Path,
+        spec: lowbit::LowbitSpec,
+        budget_bytes: u64,
+        top_k: usize,
+        io: IoTuning,
+    ) -> Result<Self> {
+        let store = expert_store::ExpertStore::open_lowbit(dir, spec)?;
+        Self::over(store, budget_bytes, top_k, io)
+            .with_context(|| format!("expert offload: low-bit bank over {}", dir.display()))
+    }
+
     /// A bank over an opened store.
     fn over(
         store: expert_store::ExpertStore,

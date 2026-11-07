@@ -98,6 +98,18 @@ impl ExpertStore {
         Ok(store)
     }
 
+    /// The low-bit copy `spec` of the checkpoint in `dir`. It has to exist: asking for a copy that
+    /// is not there is not a reason to serve another model.
+    pub(crate) fn open_lowbit(dir: &Path, spec: super::lowbit::LowbitSpec) -> Result<Self> {
+        let source = Self::open(dir)?;
+        super::pack::open_lowbit(dir, &source, spec)?.ok_or_else(|| {
+            anyhow!(
+                "no low-bit pack at {}",
+                super::pack::lowbit_path(dir, spec).display()
+            )
+        })
+    }
+
     fn open_pack_or_shards(dir: &Path, mode: super::pack::PackMode) -> Result<Self> {
         use super::pack::{self, PackMode};
         let source = Self::open(dir)?;

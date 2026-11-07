@@ -34,7 +34,9 @@ pub(crate) fn is_qwen4_exp(dir: &std::path::Path) -> bool {
         })
         .is_some_and(|t| t == "qwen4_exp")
 }
-pub use model::{LoadOptions, NgramSource, Qwen4ExpCache, Qwen4ExpModel};
+pub use model::{
+    ExpertTier, LoadOptions, LowExpertOptions, NgramSource, Qwen4ExpCache, Qwen4ExpModel,
+};
 
 #[cfg(test)]
 mod tests;

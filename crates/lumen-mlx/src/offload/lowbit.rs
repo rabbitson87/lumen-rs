@@ -65,12 +65,60 @@ impl LowbitSpec {
     }
 }
 
-/// A projection of one expert, as packed `u32` words and `bf16` scales and biases, little endian.
+/// The float type of a checkpoint's scales and biases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScaleType {
+    Bf16,
+    F32,
+}
+
+impl ScaleType {
+    pub(crate) fn parse(safetensors: &str) -> Result<Self> {
+        match safetensors {
+            "BF16" => Ok(Self::Bf16),
+            "F32" => Ok(Self::F32),
+            other => bail!("scales of type {other} are not supported"),
+        }
+    }
+
+    pub(crate) fn bytes(self) -> usize {
+        match self {
+            Self::Bf16 => 2,
+            Self::F32 => 4,
+        }
+    }
+
+    /// `x` as this type stores it.
+    fn held(self, x: f32) -> f32 {
+        match self {
+            Self::Bf16 => bf16_to_f32(f32_to_bf16(x)),
+            Self::F32 => x,
+        }
+    }
+
+    fn read(self, b: &[u8]) -> f32 {
+        match self {
+            Self::Bf16 => bf16_to_f32(u16::from_le_bytes(b.try_into().expect("2 bytes"))),
+            Self::F32 => f32::from_le_bytes(b.try_into().expect("4 bytes")),
+        }
+    }
+
+    fn write(self, x: f32, to: &mut [u8]) {
+        match self {
+            Self::Bf16 => to.copy_from_slice(&f32_to_bf16(x).to_le_bytes()),
+            Self::F32 => to.copy_from_slice(&x.to_le_bytes()),
+        }
+    }
+}
+
+/// A projection of one expert, as packed `u32` words and floats for its scales and biases, little
+/// endian.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PackedProj<'a> {
     pub weight: &'a [u8],
     pub scales: &'a [u8],
     pub biases: &'a [u8],
+    pub scale_type: ScaleType,
     /// Rows of the weight matrix.
     pub rows: usize,
     /// Weights in a row.
@@ -234,25 +282,27 @@ fn refine(xs: &[f32], top: f32, start: (f32, f32), codes: &mut [f32]) -> (f32, f
     (scale, bias)
 }
 
-/// A group's `(scale, bias)`, as the `bf16` values the kernels will read.
-fn fit_group(xs: &[f32], top: f32, recipe: Recipe, codes: &mut [f32]) -> (u16, u16) {
-    let bf = |(s, b): (f32, f32)| (f32_to_bf16(s), f32_to_bf16(b));
-    let unbf = |(s, b): (u16, u16)| (bf16_to_f32(s), bf16_to_f32(b));
+/// A group's `(scale, bias)`, as the values the kernels will read.
+fn fit_group(
+    xs: &[f32],
+    top: f32,
+    recipe: Recipe,
+    scale_type: ScaleType,
+    codes: &mut [f32],
+) -> (f32, f32) {
+    let held = |(s, b): (f32, f32)| (scale_type.held(s), scale_type.held(b));
     let min_max = fit_min_max(xs, top);
     match recipe {
-        Recipe::MinMax => bf(min_max),
+        Recipe::MinMax => held(min_max),
         Recipe::LeastSquares => {
             let spread = fit_spread(xs, top);
-            // A candidate is judged after rounding to bf16: that is what gets served.
+            // A candidate is judged as stored: that is what gets served.
             [min_max, spread]
                 .into_iter()
-                .flat_map(|start| [bf(start), bf(refine(xs, top, start, codes))])
-                .map(|c| {
-                    let (s, b) = unbf(c);
-                    (c, squared_error(xs, s, b, top))
-                })
+                .flat_map(|start| [held(start), held(refine(xs, top, start, codes))])
+                .map(|c| (c, squared_error(xs, c.0, c.1, top)))
                 .min_by(|a, b| a.1.total_cmp(&b.1))
-                .map_or((0, 0), |(c, _)| c)
+                .map_or((0.0, 0.0), |(c, _)| c)
         }
     }
 }
@@ -263,10 +313,8 @@ fn words_of(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
         .map(|w| u32::from_le_bytes(w.try_into().expect("4 bytes")))
 }
 
-fn bf16s_of(bytes: &[u8]) -> impl Iterator<Item = f32> + '_ {
-    bytes
-        .chunks_exact(2)
-        .map(|v| bf16_to_f32(u16::from_le_bytes(v.try_into().expect("2 bytes"))))
+fn floats_of(bytes: &[u8], t: ScaleType) -> impl Iterator<Item = f32> + '_ {
+    bytes.chunks_exact(t.bytes()).map(move |v| t.read(v))
 }
 
 /// Fit one projection of one expert again at `spec`, into `dst`.
@@ -285,17 +333,18 @@ pub(crate) fn requantize(
             spec.group_size
         );
     }
+    let t = src.scale_type;
     let src_groups = src.cols / src.group_size;
     let dst_groups = src.cols / spec.group_size;
     if src.weight.len() != src.rows * src_row
-        || src.scales.len() != src.rows * src_groups * 2
-        || src.biases.len() != src.rows * src_groups * 2
+        || src.scales.len() != src.rows * src_groups * t.bytes()
+        || src.biases.len() != src.rows * src_groups * t.bytes()
     {
         bail!("the source does not match {} x {}", src.rows, src.cols);
     }
     if dst.weight.len() != src.rows * dst_row
-        || dst.scales.len() != src.rows * dst_groups * 2
-        || dst.biases.len() != src.rows * dst_groups * 2
+        || dst.scales.len() != src.rows * dst_groups * t.bytes()
+        || dst.biases.len() != src.rows * dst_groups * t.bytes()
     {
         bail!("the destination does not match {} x {}", src.rows, src.cols);
     }
@@ -312,9 +361,9 @@ pub(crate) fn requantize(
         for (w, v) in src_words.iter_mut().zip(words_of(weight)) {
             *w = v;
         }
-        let at = r * src_groups * 2;
-        let scales = bf16s_of(&src.scales[at..at + src_groups * 2]);
-        let biases = bf16s_of(&src.biases[at..at + src_groups * 2]);
+        let (at, len) = (r * src_groups * t.bytes(), src_groups * t.bytes());
+        let scales = floats_of(&src.scales[at..at + len], t);
+        let biases = floats_of(&src.biases[at..at + len], t);
         for (g, (s, b)) in scales.zip(biases).enumerate() {
             let start = g * src.group_size;
             for (i, x) in row[start..start + src.group_size].iter_mut().enumerate() {
@@ -324,8 +373,7 @@ pub(crate) fn requantize(
 
         dst_words.fill(0);
         for (g, xs) in row.chunks_exact(spec.group_size).enumerate() {
-            let (scale, bias) = fit_group(xs, top, spec.recipe, &mut codes);
-            let (fs, fb) = (bf16_to_f32(scale), bf16_to_f32(bias));
+            let (fs, fb) = fit_group(xs, top, spec.recipe, t, &mut codes);
             for (i, &x) in xs.iter().enumerate() {
                 let q = code_of(x, fs, fb, top);
                 write_code(&mut dst_words, g * spec.group_size + i, spec.bits, q as u32);
@@ -333,9 +381,9 @@ pub(crate) fn requantize(
                 fidelity.err += d * d;
                 fidelity.energy += f64::from(x) * f64::from(x);
             }
-            let at = (r * dst_groups + g) * 2;
-            dst.scales[at..at + 2].copy_from_slice(&scale.to_le_bytes());
-            dst.biases[at..at + 2].copy_from_slice(&bias.to_le_bytes());
+            let at = (r * dst_groups + g) * t.bytes();
+            t.write(fs, &mut dst.scales[at..at + t.bytes()]);
+            t.write(fb, &mut dst.biases[at..at + t.bytes()]);
         }
         for (i, w) in dst_words.iter().enumerate() {
             let at = r * dst_row + i * 4;
@@ -425,8 +473,8 @@ mod tests {
                 })
                 .collect();
             let mut err = |r| {
-                let (s, b) = fit_group(&xs, 3.0, r, &mut codes);
-                squared_error(&xs, bf16_to_f32(s), bf16_to_f32(b), 3.0)
+                let (s, b) = fit_group(&xs, 3.0, r, ScaleType::Bf16, &mut codes);
+                squared_error(&xs, s, b, 3.0)
             };
             let (mm, ls) = (err(Recipe::MinMax), err(Recipe::LeastSquares));
             assert!(ls <= mm, "trial {trial}: least squares {ls} > min-max {mm}");
@@ -463,6 +511,7 @@ mod tests {
             weight: w,
             scales: s,
             biases: b,
+            scale_type: ScaleType::Bf16,
             rows,
             cols,
             bits: 4,
@@ -510,7 +559,7 @@ mod tests {
         let groups = (cols / gs) as i32;
         let w = Array::from_slice(&words, &[rows as i32, (words.len() / rows) as i32]);
         let bf = |b: &[u8]| {
-            let v: Vec<f32> = bf16s_of(b).collect();
+            let v: Vec<f32> = floats_of(b, ScaleType::Bf16).collect();
             Array::from_slice(&v, &[rows as i32, groups])
                 .as_dtype(Dtype::Bfloat16)
                 .unwrap()
@@ -533,8 +582,8 @@ mod tests {
     ) -> Vec<f32> {
         let words: Vec<u32> = words_of(w).collect();
         let row_words = cols * bits as usize / 32;
-        let scales: Vec<f32> = bf16s_of(s).collect();
-        let biases: Vec<f32> = bf16s_of(b).collect();
+        let scales: Vec<f32> = floats_of(s, ScaleType::Bf16).collect();
+        let biases: Vec<f32> = floats_of(b, ScaleType::Bf16).collect();
         let groups = cols / gs;
         let mut out = Vec::new();
         for (r, row) in words.chunks_exact(row_words).enumerate() {
@@ -620,6 +669,45 @@ mod tests {
         let (_, _, _, f) = requantized(proj(&src, rows, cols, 32), lsq(2, 64));
         assert_eq!(f.err, 0.0);
         assert!(f.energy > 0.0);
+    }
+
+    #[test]
+    fn f32_scales_stay_f32_and_fit_at_least_as_well() {
+        let (w, s, b) = source(4, 128, 32, 15);
+        let widen = |bytes: &[u8]| -> Vec<u8> {
+            floats_of(bytes, ScaleType::Bf16)
+                .flat_map(f32::to_le_bytes)
+                .collect()
+        };
+        let (s32, b32) = (widen(&s), widen(&b));
+        let src = PackedProj {
+            weight: &w,
+            scales: &s32,
+            biases: &b32,
+            scale_type: ScaleType::F32,
+            rows: 4,
+            cols: 128,
+            bits: 4,
+            group_size: 32,
+        };
+        let mut out = (
+            vec![0u8; 4 * 32],
+            vec![0u8; 4 * 4 * 4],
+            vec![0u8; 4 * 4 * 4],
+        );
+        let f = requantize(
+            src,
+            lsq(2, 32),
+            PackedProjMut {
+                weight: &mut out.0,
+                scales: &mut out.1,
+                biases: &mut out.2,
+            },
+        )
+        .unwrap();
+        let bf = requantized(proj(&(w.clone(), s, b), 4, 128, 32), lsq(2, 32)).3;
+        // Scales that are not rounded to bf16 cannot fit worse, beyond float noise.
+        assert!(f.err <= bf.err * 1.001, "{} vs {}", f.err, bf.err);
     }
 
     #[test]
