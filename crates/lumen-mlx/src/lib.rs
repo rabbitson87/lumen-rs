@@ -2541,10 +2541,12 @@ impl MlxBackend {
     ) -> Result<Vec<u32>> {
         match self {
             Self::Qwen35Family(m) => {
-                if structured {
-                    // `chat_response_format` builds through
-                    // `build_response_format_input`, which is `build_chat_input`
-                    // for a text prompt — tools never reach the template.
+                // Both decode through `build_chat_input`: `chat_response_format`
+                // for a text prompt, where tools never reach the template, and
+                // a request with no tools. The tool renderer is not that with an
+                // empty tool list: it keeps an empty think block on every
+                // replayed assistant turn, which 3.5 and 3.6 drop.
+                if structured || tools.is_empty() {
                     return m.build_chat_input(messages, thinking, effort);
                 }
                 m.build_chat_input_with_tools(messages, thinking, tools, tool_choice, effort)
@@ -10988,6 +10990,62 @@ mod tests {
                 );
                 assert_eq!(qwen(&mut b).script_runner().live_seqs(), 0, "{context}");
                 assert!(parsed.tool_calls.is_empty(), "{context}");
+            }
+        }
+    }
+
+    /// RED before: a request with no tools was counted through the tool renderer, which writes
+    /// an empty think block on every replayed assistant turn. Decode renders with
+    /// `format_qwen3_chat`, which drops it where the template does (3.5, 3.6): four tokens a
+    /// turn, in `usage.prompt_tokens` and in the context guard.
+    #[test]
+    fn a_plain_request_counts_what_it_feeds() {
+        use crate::chat_io::ResolvedToolChoice;
+        let messages: Vec<_> = [
+            ("system", "S"),
+            ("user", "U1"),
+            ("assistant", "Blue"),
+            ("user", "U2"),
+            ("assistant", "Blue"),
+            ("user", "U1"),
+        ]
+        .iter()
+        .map(|(role, text)| (role.to_string(), text.to_string()))
+        .collect();
+        let ov = SamplingOverrides::default();
+        for preserves_thinking in [false, true] {
+            for thinking in [false, true] {
+                for choice in [ResolvedToolChoice::Auto, ResolvedToolChoice::Required] {
+                    let mut b = MlxBackend::Qwen35Family(chat_backend(preserves_thinking));
+                    let counted = b
+                        .build_chat_input_prefilled(&messages, thinking, &[], &choice, false, None)
+                        .expect("count");
+                    b.chat(
+                        &messages,
+                        4,
+                        0.0,
+                        1.0,
+                        &ov,
+                        thinking,
+                        None,
+                        &[],
+                        &choice,
+                        None,
+                    )
+                    .expect("chat");
+                    let fed: usize = std::mem::take(&mut qwen(&mut b).script_runner().feeds)
+                        .into_iter()
+                        .map(|feed| match feed {
+                            ScriptFeed::Prefill(n) | ScriptFeed::Extend(n) => n,
+                            ScriptFeed::Mark(_) | ScriptFeed::Rollback(_) => 0,
+                        })
+                        .sum();
+                    assert_eq!(
+                        counted.len(),
+                        fed,
+                        "preserves {preserves_thinking}, thinking {thinking}, {choice:?}",
+                    );
+                }
             }
         }
     }
