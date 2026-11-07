@@ -649,6 +649,23 @@ pub struct Qwen4ExpCache {
     mrope: Option<MropeState>,
 }
 
+/// How far one array of a layer's state is from the same array in another cache.
+#[derive(Debug, Clone, Copy)]
+pub struct StateGap {
+    pub layer: usize,
+    /// `gdn` or `qsa`.
+    pub kind: &'static str,
+    /// Which of the layer's arrays, in [`LayerState::arrays`] order.
+    pub array: usize,
+    /// `|a - b|`, Frobenius.
+    pub distance: f32,
+    pub norm_a: f32,
+    pub norm_b: f32,
+    /// The largest magnitude in each.
+    pub peak_a: f32,
+    pub peak_b: f32,
+}
+
 /// Every token's `[t, h, w]` rotary position so far, and what a text token after the prompt adds
 /// to its index (`next_position - prompt length`).
 #[derive(Clone)]
@@ -815,6 +832,42 @@ impl Qwen4ExpCache {
     /// it keeps the graph that computes it, and that graph's inputs (a chunk-sized
     /// convolution input per layer, ~2 MB per prompt token over the model), alive until
     /// the next chunk happens to consume it.
+    /// Layer by layer, how far this state is from `other`, a state of the same text. For finding
+    /// where two builds of a model part: a diagnostic, nothing serves from it.
+    pub fn gaps_to(&self, other: &Self) -> Result<Vec<StateGap>> {
+        let norm = |x: &Array| -> Result<(f32, f32)> {
+            let n = mlx_rs::ops::sum(&mlx_rs::ops::multiply(x, x)?, None)?;
+            let n = mlx_rs::ops::sqrt(&n)?;
+            let peak = mlx_rs::ops::max(&mlx_rs::ops::abs(x)?, None)?;
+            mlx_rs::transforms::eval([&n, &peak])?;
+            Ok((n.item::<f32>(), peak.item::<f32>()))
+        };
+        let mut out = Vec::new();
+        for (layer, (a, b)) in self.layers.iter().zip(&other.layers).enumerate() {
+            let kind = match a {
+                LayerState::Gdn(_) => "gdn",
+                LayerState::Qsa(_) => "qsa",
+            };
+            for (array, (x, y)) in a.arrays().into_iter().zip(b.arrays()).enumerate() {
+                let (x, y) = (x.as_dtype(Dtype::Float32)?, y.as_dtype(Dtype::Float32)?);
+                let (norm_a, peak_a) = norm(&x)?;
+                let (norm_b, peak_b) = norm(&y)?;
+                let (distance, _) = norm(&mlx_rs::ops::subtract(&x, &y)?)?;
+                out.push(StateGap {
+                    layer,
+                    kind,
+                    array,
+                    distance,
+                    norm_a,
+                    norm_b,
+                    peak_a,
+                    peak_b,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     fn arrays(&self) -> Vec<&Array> {
         let mut out: Vec<&Array> = Vec::new();
         for layer in &self.layers {
