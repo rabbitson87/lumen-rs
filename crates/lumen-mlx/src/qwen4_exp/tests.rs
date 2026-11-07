@@ -10,13 +10,16 @@
 //! top-4 routing over 16 experts with biases, and the shared expert.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mlx_rs::Array;
 
 use super::config::Qwen4ExpConfig;
-use super::model::{LoadOptions, MtpMode, NgramSource, Qwen4ExpModel};
+use super::model::{
+    ExpertTier, LoadOptions, LowExpertOptions, MtpMode, NgramSource, Qwen4ExpModel,
+};
 use super::ngram::NgramHasher;
+use crate::offload::lowbit::{LowbitSpec, Recipe};
 
 /// `f` with the KV cache in f32 (`LUMEN_QWEN4_KV_BF16=0`): the reference logits were computed
 /// with one, and these tests check the port's arithmetic against them at f32 tolerances.
@@ -441,6 +444,7 @@ fn serving_the_ngram_table_from_disk_matches_holding_it_in_memory() {
         ngram,
         mtp: MtpMode::Off,
         scores_budget_bytes: 0,
+        low_experts: None,
     };
     let run = |model: &Qwen4ExpModel| -> Vec<f32> {
         let mut cache = model.make_cache();
@@ -759,6 +763,7 @@ fn load_with_head(dir: &std::path::Path, budget: Option<u64>) -> Qwen4ExpModel {
             ngram: NgramSource::Auto,
             mtp: MtpMode::On,
             scores_budget_bytes: 0,
+            low_experts: None,
         },
     )
     .expect("load the replica with its draft head")
@@ -1214,4 +1219,124 @@ fn image_normalization_comes_from_the_preprocessor_config() {
             std: [0.5; 3]
         }
     );
+}
+
+// ---- low-bit experts ---------------------------------------------------------------------
+
+/// The replica in a directory of its own, where a pack can be written.
+fn replica_copy() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["config.json", "model.safetensors"] {
+        std::fs::copy(fixture_dir().join(name), tmp.path().join(name)).unwrap();
+    }
+    tmp
+}
+
+fn with_low_experts(dir: &Path, spec: LowbitSpec) -> Qwen4ExpModel {
+    crate::offload::build_lowbit_pack(dir, 4, spec).expect("low-bit pack");
+    let budget = 400 << 20;
+    Qwen4ExpModel::load_with(
+        dir,
+        LoadOptions {
+            expert_budget_bytes: Some(budget),
+            ngram: NgramSource::Auto,
+            mtp: MtpMode::Off,
+            scores_budget_bytes: 0,
+            low_experts: Some(LowExpertOptions {
+                spec,
+                budget_bytes: budget,
+            }),
+        },
+    )
+    .expect("load the replica with low-bit experts")
+}
+
+/// The last position's logits after feeding `tokens` one at a time.
+fn last_logits(model: &Qwen4ExpModel, tokens: &[u32]) -> Vec<f32> {
+    let mut cache = model.make_cache();
+    let mut last = Vec::new();
+    for &t in tokens {
+        let logits = model.forward(&[t], &mut cache, true).unwrap();
+        logits.eval().unwrap();
+        last = logits.as_slice::<f32>().to_vec();
+    }
+    last
+}
+
+fn distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
+        .sqrt()
+}
+
+#[test]
+fn a_loaded_low_bit_copy_changes_nothing_until_it_is_chosen() {
+    let tmp = replica_copy();
+    let tokens = [3u32, 14, 15, 92, 65];
+    let plain = last_logits(
+        &Qwen4ExpModel::load(tmp.path(), Some(400 << 20)).unwrap(),
+        &tokens,
+    );
+    let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
+    let model = with_low_experts(tmp.path(), spec);
+    assert_eq!(last_logits(&model, &tokens), plain);
+
+    model.set_expert_tier(ExpertTier::Low).unwrap();
+    let low = last_logits(&model, &tokens);
+    assert!(low.iter().all(|x| x.is_finite()));
+    assert_ne!(low, plain, "the low tier read the checkpoint's experts");
+    assert_eq!(
+        last_logits(&model, &tokens),
+        low,
+        "the low tier is deterministic"
+    );
+
+    model.set_expert_tier(ExpertTier::Full).unwrap();
+    assert_eq!(last_logits(&model, &tokens), plain);
+}
+
+#[test]
+fn more_bits_in_the_copy_stay_closer_to_the_checkpoint() {
+    // The copy is fitted to the model: serving the right expert's bytes at the right bit width
+    // shows as a distance that falls with the bits. Mixed-up experts or a wrong width do not.
+    let tmp = replica_copy();
+    let tokens = [3u32, 14, 15, 92, 65];
+    let distance_at = |bits| {
+        let spec = LowbitSpec::new(bits, 32, Recipe::LeastSquares).unwrap();
+        let model = with_low_experts(tmp.path(), spec);
+        let full = last_logits(&model, &tokens);
+        model.set_expert_tier(ExpertTier::Low).unwrap();
+        distance(&last_logits(&model, &tokens), &full)
+    };
+    let (two, four) = (distance_at(2), distance_at(4));
+    assert!(four < two / 2.0, "4 bits {four}, 2 bits {two}");
+}
+
+#[test]
+fn a_model_without_a_copy_refuses_the_low_tier() {
+    let model = Qwen4ExpModel::load(&fixture_dir(), None).unwrap();
+    assert!(model.set_expert_tier(ExpertTier::Low).is_err());
+    assert!(model.set_expert_tier(ExpertTier::Full).is_ok());
+}
+
+#[test]
+fn asking_for_a_copy_that_was_not_built_is_an_error() {
+    let tmp = replica_copy();
+    let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
+    let r = Qwen4ExpModel::load_with(
+        tmp.path(),
+        LoadOptions {
+            expert_budget_bytes: Some(400 << 20),
+            ngram: NgramSource::Auto,
+            mtp: MtpMode::Off,
+            scores_budget_bytes: 0,
+            low_experts: Some(LowExpertOptions {
+                spec,
+                budget_bytes: 400 << 20,
+            }),
+        },
+    );
+    assert!(r.is_err());
 }

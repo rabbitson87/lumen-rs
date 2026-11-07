@@ -8,14 +8,12 @@
 //! pools with those slots as its indices.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use mlx_rs::Dtype;
 
 use super::expert_store::{ExpertStore, MTP_LAYER};
 use super::io::{IoMode, IoPool, IoProfile, IoTicket, ReadJob};
-use super::pack::PackMode;
 use super::slot_map::{CallKind, EvictionKind, ExpertKey, Plan, PolicyConfig, SlotMap, Stats};
 use super::slot_pool::PoolTensor;
 
@@ -147,20 +145,35 @@ fn mlx_dtype(safetensors: &str) -> Result<Dtype> {
 impl ExpertBank {
     /// Open the shards of `dir` and allocate `n_slots` slots per role. The pool must hold the
     /// `STAGING_REGIONS` staging regions (widest layer each) and should have room beside them.
+    #[cfg(test)]
     pub(crate) fn open(
-        dir: &Path,
+        dir: &std::path::Path,
         n_slots: usize,
         lanes: usize,
         mode: IoMode,
-        pack: PackMode,
+        pack: super::pack::PackMode,
         with_mtp: bool,
     ) -> Result<Self> {
-        let store = ExpertStore::open_with(dir, pack, with_mtp)?;
+        Self::over(
+            ExpertStore::open_with(dir, pack, with_mtp)?,
+            n_slots,
+            lanes,
+            mode,
+        )
+    }
+
+    /// A bank of `n_slots` slots per role over an opened store.
+    pub(crate) fn over(
+        store: ExpertStore,
+        n_slots: usize,
+        lanes: usize,
+        mode: IoMode,
+    ) -> Result<Self> {
         let first = store
             .layers
             .values()
             .next()
-            .ok_or_else(|| anyhow!("expert bank: {} has no routed experts", dir.display()))?;
+            .ok_or_else(|| anyhow!("expert bank: the checkpoint has no routed experts"))?;
         let width = store
             .layers
             .values()
@@ -494,9 +507,11 @@ impl ExpertBank {
 
 #[cfg(test)]
 mod tests {
+    use super::super::pack::PackMode;
     use super::*;
     use crate::native_quant::{MODE_MXFP4, gather_qmm_with_mode};
     use mlx_rs::{Array, random};
+    use std::path::Path;
 
     /// The 35B checkpoint's layout and bytes, taken through the bank, must
     /// drive `gather_qmm` to exactly what MLX's own stacked tensors give.

@@ -22,6 +22,11 @@
 //!
 //! The fingerprint hashes the shards' names and sizes and every expert range found in them, so
 //! a pack made for other weights is rejected instead of serving plausible wrong ones.
+//!
+//! A low-bit copy (`experts.2b64.lsq.lpack`, see [`super::lowbit`]) is a file of the same shape
+//! whose records were fitted again at fewer bits. Its header names its quantization and the
+//! weights it was made from as `source_fingerprint`. It is a different model, not a cache of
+//! this one, so nothing opens it unless asked to.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
@@ -32,6 +37,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use super::expert_store::{ExpertStore, LayerRanges, RoleRange};
+use super::lowbit::{self, Fidelity, LowbitSpec, PackedProj, PackedProjMut, ScaleType};
 
 /// File name of the pack inside a checkpoint directory.
 pub(crate) const PACK_FILE: &str = "experts.lpack";
@@ -166,7 +172,8 @@ pub(crate) fn open_pack(dir: &Path, source: &ExpertStore) -> Result<Option<Exper
     }
 }
 
-fn read_header(file: &File, path: &Path, source: &ExpertStore) -> Result<ExpertStore> {
+/// A pack file's header, and the store its records describe, checked only against itself.
+fn read_pack(file: &File, path: &Path) -> Result<(Value, ExpertStore)> {
     let mut prefix = [0u8; 16];
     file.read_exact_at(&mut prefix, 0)
         .context("too short to hold a header")?;
@@ -181,11 +188,6 @@ fn read_header(file: &File, path: &Path, source: &ExpertStore) -> Result<ExpertS
     file.read_exact_at(&mut json, 16)
         .context("truncated header")?;
     let v: Value = serde_json::from_slice(&json).context("header is not JSON")?;
-    let want = fingerprint(source)?;
-    let got = v["fingerprint"].as_str().unwrap_or_default();
-    if got != want {
-        bail!("it was made for other weights (fingerprint {got}, these are {want})");
-    }
     let stride = v["stride"].as_u64().ok_or_else(|| anyhow!("no stride"))? as usize;
     let data_start = v["data_start"]
         .as_u64()
@@ -238,9 +240,23 @@ fn read_header(file: &File, path: &Path, source: &ExpertStore) -> Result<ExpertS
             "it is {actual_len} bytes, its header promises {expected_len} (an interrupted build?)"
         );
     }
+    let store = ExpertStore {
+        files: vec![path.to_path_buf()],
+        layers: out_layers,
+    };
+    Ok((v, store))
+}
+
+fn read_header(file: &File, path: &Path, source: &ExpertStore) -> Result<ExpertStore> {
+    let (v, store) = read_pack(file, path)?;
+    let want = fingerprint(source)?;
+    let got = v["fingerprint"].as_str().unwrap_or_default();
+    if got != want {
+        bail!("it was made for other weights (fingerprint {got}, these are {want})");
+    }
     // The pack must describe exactly what the shards do, role by role.
     for (layer, l) in &source.layers {
-        let Some(p) = out_layers.get(layer) else {
+        let Some(p) = store.layers.get(layer) else {
             bail!("layer {layer} is missing");
         };
         if p.n_experts != l.n_experts
@@ -254,26 +270,65 @@ fn read_header(file: &File, path: &Path, source: &ExpertStore) -> Result<ExpertS
             bail!("layer {layer} differs from the shards");
         }
     }
-    Ok(ExpertStore {
-        files: vec![path.to_path_buf()],
-        layers: out_layers,
-    })
+    Ok(store)
 }
 
-/// Build `dir`'s pack from `source` (the shards' own ranges). `progress(done, total)` is called
-/// after every layer. Writes `experts.lpack.tmp` and renames it, so a stopped build leaves no
-/// pack that looks complete.
-pub(crate) fn build(
-    dir: &Path,
+/// Where one role's bytes sit inside a record.
+struct RoleSlot {
+    name: String,
+    at: usize,
+    bytes: usize,
+    dtype: String,
+    tail_shape: Vec<i64>,
+}
+
+impl RoleSlot {
+    /// Roles back to back, in the order given.
+    fn lay_out(roles: impl IntoIterator<Item = (String, usize, String, Vec<i64>)>) -> Vec<Self> {
+        let mut at = 0usize;
+        roles
+            .into_iter()
+            .map(|(name, bytes, dtype, tail_shape)| {
+                let slot = Self {
+                    name,
+                    at,
+                    bytes,
+                    dtype,
+                    tail_shape,
+                };
+                at += bytes;
+                slot
+            })
+            .collect()
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "at": self.at,
+            "bytes": self.bytes,
+            "dtype": self.dtype,
+            "tail_shape": self.tail_shape,
+        })
+    }
+}
+
+/// Write a pack of `source`'s experts to `dest`. `slots` lay a record out, `head` is the header's
+/// own fields, and `fill(tensors, expert, record)` writes an expert's record from its layer's
+/// whole tensors (in `LayerRanges::roles` order). Goes through `<dest>.tmp` and a rename, so a
+/// stopped build leaves no pack that looks complete.
+fn write_pack(
+    dest: &Path,
     source: &ExpertStore,
+    slots: &[RoleSlot],
+    mut head: serde_json::Map<String, Value>,
+    fill: impl Fn(&[Vec<u8>], usize, &mut [u8]) -> Result<()> + Sync,
     mut progress: impl FnMut(usize, usize),
-) -> Result<PathBuf> {
-    let first = source
-        .layers
-        .values()
-        .next()
-        .ok_or_else(|| anyhow!("pack: the checkpoint has no routed experts"))?;
-    let record = record_bytes(source);
+) -> Result<()> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| anyhow!("pack: {} has no directory", dest.display()))?;
+    let record = slots.iter().map(|r| r.bytes).sum::<usize>();
     let stride = stride_for(record);
     let n_records: u64 = source.layers.values().map(|l| l.n_experts as u64).sum();
     let total = HEADER_RESERVE as u64 + n_records * stride as u64;
@@ -286,40 +341,21 @@ pub(crate) fn build(
             free as f64 / 1e9
         );
     }
-    // Where each role sits inside a record.
-    let mut at = 0usize;
-    let mut role_layout = Vec::new();
-    for (name, r) in &first.roles {
-        role_layout.push((
-            name.clone(),
-            at,
-            r.bytes,
-            r.dtype.clone(),
-            r.tail_shape.clone(),
-        ));
-        at += r.bytes;
-    }
-    let layout_json: Vec<Value> = role_layout
-        .iter()
-        .map(|(name, at, bytes, dtype, tail)| {
-            json!({"name": name, "at": at, "bytes": bytes, "dtype": dtype, "tail_shape": tail})
-        })
-        .collect();
     let mut layer_json = Vec::new();
     let mut next_record = 0u64;
     for (layer, l) in &source.layers {
         layer_json.push(json!({"layer": layer, "n_experts": l.n_experts, "first": next_record}));
         next_record += l.n_experts as u64;
     }
-    let header = json!({
-        "version": 1,
-        "fingerprint": fingerprint(source)?,
-        "stride": stride,
-        "data_start": HEADER_RESERVE,
-        "roles": layout_json,
-        "layers": layer_json,
-    })
-    .to_string();
+    head.insert("version".into(), json!(1));
+    head.insert("stride".into(), json!(stride));
+    head.insert("data_start".into(), json!(HEADER_RESERVE));
+    head.insert(
+        "roles".into(),
+        slots.iter().map(RoleSlot::to_json).collect(),
+    );
+    head.insert("layers".into(), Value::Array(layer_json));
+    let header = Value::Object(head).to_string();
     if header.len() > HEADER_RESERVE - 16 {
         bail!(
             "pack: the header ({} bytes) does not fit its reserve",
@@ -327,7 +363,11 @@ pub(crate) fn build(
         );
     }
 
-    let tmp = dir.join(format!("{PACK_FILE}.tmp"));
+    let name = dest
+        .file_name()
+        .ok_or_else(|| anyhow!("pack: {} has no file name", dest.display()))?
+        .to_string_lossy();
+    let tmp = dir.join(format!("{name}.tmp"));
     let out = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -351,10 +391,10 @@ pub(crate) fn build(
     for (done, (layer, l)) in source.layers.iter().enumerate() {
         // One tensor per role, read whole and in parallel (they are contiguous in the shard).
         let bufs: Vec<Vec<u8>> = std::thread::scope(|s| {
-            let handles: Vec<_> = role_layout
-                .iter()
-                .map(|(name, ..)| {
-                    let r = &l.roles[name];
+            let handles: Vec<_> = l
+                .roles
+                .values()
+                .map(|r| {
                     let file = &sources[r.file];
                     s.spawn(move || -> Result<Vec<u8>> {
                         let mut buf = vec![0u8; r.bytes * l.n_experts];
@@ -369,24 +409,29 @@ pub(crate) fn build(
                 .map(|h| h.join().map_err(|_| anyhow!("pack: a reader panicked"))?)
                 .collect::<Result<Vec<_>>>()
         })?;
-        // Interleave them into records.
+        // Build the records.
         let mut records = vec![0u8; l.n_experts * stride];
         let workers = 8usize.min(l.n_experts).max(1);
         let per = l.n_experts.div_ceil(workers);
         std::thread::scope(|s| {
-            for (w, chunk) in records.chunks_mut(per * stride).enumerate() {
-                let (bufs, layout) = (&bufs, &role_layout);
-                s.spawn(move || {
-                    for (i, rec) in chunk.chunks_mut(stride).enumerate() {
-                        let e = w * per + i;
-                        for (ri, (_, at, bytes, ..)) in layout.iter().enumerate() {
-                            rec[*at..*at + *bytes]
-                                .copy_from_slice(&bufs[ri][e * bytes..(e + 1) * bytes]);
+            let handles: Vec<_> = records
+                .chunks_mut(per * stride)
+                .enumerate()
+                .map(|(w, chunk)| {
+                    let (bufs, fill) = (&bufs, &fill);
+                    s.spawn(move || -> Result<()> {
+                        for (i, rec) in chunk.chunks_mut(stride).enumerate() {
+                            fill(bufs, w * per + i, rec)?;
                         }
-                    }
-                });
-            }
-        });
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .try_for_each(|h| h.join().map_err(|_| anyhow!("pack: a worker panicked"))?)
+        })
+        .with_context(|| format!("pack: layer {layer}"))?;
         drop(bufs);
         out.write_all_at(
             &records,
@@ -397,15 +442,253 @@ pub(crate) fn build(
         progress(done + 1, total_layers);
     }
 
-    let mut head = Vec::with_capacity(16 + header.len());
-    head.extend_from_slice(MAGIC);
-    head.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    head.extend_from_slice(header.as_bytes());
-    out.write_all_at(&head, 0)?;
+    let mut bytes = Vec::with_capacity(16 + header.len());
+    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    out.write_all_at(&bytes, 0)?;
     out.sync_all()?;
     drop(out);
+    std::fs::rename(&tmp, dest).with_context(|| format!("pack: move {} into place", tmp.display()))
+}
+
+/// Build `dir`'s pack from `source` (the shards' own ranges). `progress(done, total)` is called
+/// after every layer.
+pub(crate) fn build(
+    dir: &Path,
+    source: &ExpertStore,
+    progress: impl FnMut(usize, usize),
+) -> Result<PathBuf> {
+    let first = source
+        .layers
+        .values()
+        .next()
+        .ok_or_else(|| anyhow!("pack: the checkpoint has no routed experts"))?;
+    debug_assert_eq!(
+        first.roles.values().map(|r| r.bytes).sum::<usize>(),
+        record_bytes(source)
+    );
+    let slots = RoleSlot::lay_out(
+        first
+            .roles
+            .iter()
+            .map(|(k, r)| (k.clone(), r.bytes, r.dtype.clone(), r.tail_shape.clone())),
+    );
+    let mut head = serde_json::Map::new();
+    head.insert("fingerprint".into(), json!(fingerprint(source)?));
     let dest = pack_path(dir);
-    std::fs::rename(&tmp, &dest)
-        .with_context(|| format!("pack: move {} into place", tmp.display()))?;
+    write_pack(
+        &dest,
+        source,
+        &slots,
+        head,
+        |tensors, e, rec| {
+            // The roles' bytes unchanged: `tensors` and `slots` are both in role order.
+            for (buf, slot) in tensors.iter().zip(&slots) {
+                rec[slot.at..slot.at + slot.bytes]
+                    .copy_from_slice(&buf[e * slot.bytes..(e + 1) * slot.bytes]);
+            }
+            Ok(())
+        },
+        progress,
+    )?;
     Ok(dest)
+}
+
+/// File name of `spec`'s low-bit copy inside a checkpoint directory.
+pub(crate) fn lowbit_path(dir: &Path, spec: LowbitSpec) -> PathBuf {
+    dir.join(format!(
+        "experts.{}b{}.{}.lpack",
+        spec.bits,
+        spec.group_size,
+        spec.recipe.name()
+    ))
+}
+
+/// One projection of a layer: its three roles, in the source and in the copy.
+struct ProjPlan {
+    name: String,
+    rows: usize,
+    cols: usize,
+    src_group: usize,
+    scale_type: ScaleType,
+    /// Index into the role-ordered tensors, and bytes of one expert, of weight, scales, biases.
+    src: [(usize, usize); 3],
+    /// Index into the role-ordered record slots.
+    dst: [usize; 3],
+}
+
+const PARTS: [&str; 3] = ["weight", "scales", "biases"];
+
+/// What a low-bit copy of `first`'s roles looks like: the plan per projection, and the record.
+fn plan_lowbit(
+    first: &LayerRanges,
+    src_bits: u32,
+    spec: LowbitSpec,
+) -> Result<(Vec<ProjPlan>, Vec<RoleSlot>)> {
+    let names: Vec<&String> = first.roles.keys().collect();
+    let index = |role: &str| {
+        names
+            .iter()
+            .position(|n| n.as_str() == role)
+            .ok_or_else(|| anyhow!("pack: the checkpoint has no role {role}"))
+    };
+    let mut plans = Vec::new();
+    let mut tails: Vec<Option<(usize, Vec<i64>)>> = vec![None; names.len()];
+    for name in first.roles.keys().filter_map(|k| k.strip_suffix(".weight")) {
+        let [w, s, b] = PARTS.map(|p| format!("{name}.{p}"));
+        let (wi, si, bi) = (index(&w)?, index(&s)?, index(&b)?);
+        let (wr, sr, br) = (&first.roles[&w], &first.roles[&s], &first.roles[&b]);
+        if wr.dtype != "U32" || sr.dtype != br.dtype {
+            bail!(
+                "pack: {name} is {}, {}, {}; a low-bit copy needs U32 weights and one float type",
+                wr.dtype,
+                sr.dtype,
+                br.dtype
+            );
+        }
+        let scale_type = ScaleType::parse(&sr.dtype)?;
+        let [rows, words] = wr.tail_shape[..] else {
+            bail!("pack: {name}.weight is not a matrix");
+        };
+        let [_, groups] = sr.tail_shape[..] else {
+            bail!("pack: {name}.scales is not a matrix");
+        };
+        let (rows, words, groups) = (rows as usize, words as usize, groups as usize);
+        let cols = words * 32 / src_bits as usize;
+        let dst_groups = cols / spec.group_size;
+        let dst_words = lowbit::row_bytes(cols, spec.bits)? / 4;
+        tails[wi] = Some((rows * dst_words * 4, vec![rows as i64, dst_words as i64]));
+        for i in [si, bi] {
+            let bytes = rows * dst_groups * scale_type.bytes();
+            tails[i] = Some((bytes, vec![rows as i64, dst_groups as i64]));
+        }
+        plans.push(ProjPlan {
+            name: name.to_string(),
+            rows,
+            cols,
+            src_group: cols / groups,
+            scale_type,
+            src: [(wi, wr.bytes), (si, sr.bytes), (bi, br.bytes)],
+            dst: [wi, si, bi],
+        });
+    }
+    let roles = first
+        .roles
+        .iter()
+        .zip(tails)
+        .map(|((name, r), tail)| {
+            let (bytes, shape) =
+                tail.ok_or_else(|| anyhow!("pack: role {name} belongs to no projection"))?;
+            Ok((name.clone(), bytes, r.dtype.clone(), shape))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((plans, RoleSlot::lay_out(roles)))
+}
+
+/// Build `spec`'s low-bit copy of `source`, whose experts are `src_bits` bits. Returns where it
+/// went and how close each projection stayed.
+pub(crate) fn build_lowbit(
+    dir: &Path,
+    source: &ExpertStore,
+    src_bits: u32,
+    spec: LowbitSpec,
+    progress: impl FnMut(usize, usize),
+) -> Result<(PathBuf, Vec<(String, Fidelity)>)> {
+    let first = source
+        .layers
+        .values()
+        .next()
+        .ok_or_else(|| anyhow!("pack: the checkpoint has no routed experts"))?;
+    let (plans, slots) = plan_lowbit(first, src_bits, spec)?;
+    let mut head = serde_json::Map::new();
+    head.insert("source_fingerprint".into(), json!(fingerprint(source)?));
+    head.insert(
+        "lowbit".into(),
+        json!({"bits": spec.bits, "group_size": spec.group_size, "recipe": spec.recipe.name()}),
+    );
+    let fidelity: std::sync::Mutex<Vec<Fidelity>> =
+        std::sync::Mutex::new(vec![Fidelity::default(); plans.len()]);
+    let dest = lowbit_path(dir, spec);
+    write_pack(
+        &dest,
+        source,
+        &slots,
+        head,
+        |tensors, e, rec| {
+            for (p, plan) in plans.iter().enumerate() {
+                let [w, s, b] = plan
+                    .src
+                    .map(|(i, bytes)| &tensors[i][e * bytes..(e + 1) * bytes]);
+                let [dw, ds, db] = plan.dst.map(|i| &slots[i]);
+                let mut out = [dw, ds, db].map(|d| vec![0u8; d.bytes]);
+                let [ow, os, ob] = &mut out;
+                let f = lowbit::requantize(
+                    PackedProj {
+                        weight: w,
+                        scales: s,
+                        biases: b,
+                        scale_type: plan.scale_type,
+                        rows: plan.rows,
+                        cols: plan.cols,
+                        bits: src_bits,
+                        group_size: plan.src_group,
+                    },
+                    spec,
+                    PackedProjMut {
+                        weight: ow,
+                        scales: os,
+                        biases: ob,
+                    },
+                )?;
+                for (slot, bytes) in [dw, ds, db].into_iter().zip(&out) {
+                    rec[slot.at..slot.at + slot.bytes].copy_from_slice(bytes);
+                }
+                fidelity.lock().unwrap_or_else(|e| e.into_inner())[p].add(f);
+            }
+            Ok(())
+        },
+        progress,
+    )?;
+    let totals = fidelity.into_inner().unwrap_or_else(|e| e.into_inner());
+    let named = plans.iter().map(|p| p.name.clone()).zip(totals).collect();
+    Ok((dest, named))
+}
+
+/// `spec`'s low-bit copy of `source`, as a store, if the file exists; an error if it does but
+/// was not made from these weights at this quantization.
+pub(crate) fn open_lowbit(
+    dir: &Path,
+    source: &ExpertStore,
+    spec: LowbitSpec,
+) -> Result<Option<ExpertStore>> {
+    let path = lowbit_path(dir, spec);
+    let Ok(file) = File::open(&path) else {
+        return Ok(None);
+    };
+    let (v, store) = read_pack(&file, &path).with_context(|| format!("pack {}", path.display()))?;
+    let want = fingerprint(source)?;
+    let got = v["source_fingerprint"].as_str().unwrap_or_default();
+    if got != want {
+        bail!(
+            "{} was made for other weights (fingerprint {got}, these are {want})",
+            path.display()
+        );
+    }
+    let tier = &v["lowbit"];
+    if tier["bits"].as_u64() != Some(u64::from(spec.bits))
+        || tier["group_size"].as_u64() != Some(spec.group_size as u64)
+        || tier["recipe"].as_str() != Some(spec.recipe.name())
+    {
+        bail!("{} holds {tier}, not {spec:?}", path.display());
+    }
+    for (layer, l) in &source.layers {
+        let Some(p) = store.layers.get(layer) else {
+            bail!("{}: layer {layer} is missing", path.display());
+        };
+        if p.n_experts != l.n_experts || !p.roles.keys().eq(l.roles.keys()) {
+            bail!("{}: layer {layer} differs from the shards", path.display());
+        }
+    }
+    Ok(Some(store))
 }

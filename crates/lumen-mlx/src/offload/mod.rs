@@ -22,6 +22,7 @@
 pub(crate) mod expert_bank;
 pub(crate) mod expert_store;
 pub(crate) mod io;
+pub mod lowbit;
 pub(crate) mod pack;
 pub(crate) mod slot_map;
 pub(crate) mod slot_policy;
@@ -264,6 +265,38 @@ pub fn build_expert_pack(dir: &Path) -> Result<std::path::PathBuf> {
         "[offload] expert pack ready in {:.0} s: {}",
         started.elapsed().as_secs_f64(),
         path.display()
+    );
+    Ok(path)
+}
+
+/// Build the low-bit copy `spec` of the checkpoint in `dir`, whose experts are `src_bits` bits.
+pub fn build_lowbit_pack(
+    dir: &Path,
+    src_bits: u32,
+    spec: lowbit::LowbitSpec,
+) -> Result<std::path::PathBuf> {
+    let source = expert_store::ExpertStore::open(dir)?;
+    let started = std::time::Instant::now();
+    let (path, fidelity) = pack::build_lowbit(dir, &source, src_bits, spec, |done, total| {
+        if done % 6 == 0 || done == total {
+            eprintln!("[offload] low-bit pack: layer {done} of {total}");
+        }
+    })?;
+    eprintln!(
+        "[offload] low-bit pack ready in {:.0} s: {}",
+        started.elapsed().as_secs_f64(),
+        path.display()
+    );
+    for (name, f) in &fidelity {
+        eprintln!("[offload] {name}: {:.2} dB", f.snr_db());
+    }
+    // A copy that does not read back is not a copy.
+    let copy = pack::open_lowbit(dir, &source, spec)?
+        .ok_or_else(|| anyhow::anyhow!("{} did not read back", path.display()))?;
+    eprintln!(
+        "[offload] {:.2} MB per expert, {:.2} of the source",
+        copy.expert_bytes() as f64 / 1e6,
+        copy.expert_bytes() as f64 / source.expert_bytes() as f64,
     );
     Ok(path)
 }
@@ -618,6 +651,30 @@ impl MoeOffload {
     /// `top_k` is how many experts a token routes to per layer.
     pub(crate) fn open(dir: &Path, budget_bytes: u64, top_k: usize, io: IoTuning) -> Result<Self> {
         let store = expert_store::ExpertStore::open_with(dir, io.pack, io.mtp_experts)?;
+        Self::over(store, budget_bytes, top_k, io)
+            .with_context(|| format!("expert offload: bank over {}", dir.display()))
+    }
+
+    /// A bank over the low-bit copy `spec` of `dir`'s experts.
+    pub(crate) fn open_lowbit(
+        dir: &Path,
+        spec: lowbit::LowbitSpec,
+        budget_bytes: u64,
+        top_k: usize,
+        io: IoTuning,
+    ) -> Result<Self> {
+        let store = expert_store::ExpertStore::open_lowbit(dir, spec)?;
+        Self::over(store, budget_bytes, top_k, io)
+            .with_context(|| format!("expert offload: low-bit bank over {}", dir.display()))
+    }
+
+    /// A bank over an opened store.
+    fn over(
+        store: expert_store::ExpertStore,
+        budget_bytes: u64,
+        top_k: usize,
+        io: IoTuning,
+    ) -> Result<Self> {
         let per = store.expert_bytes().max(1) as u64;
         let total = store
             .layers
@@ -654,20 +711,9 @@ impl MoeOffload {
                 (per_token as f64 * per as f64 * 1.25) / 1e9,
             );
         }
-        let bank = ExpertBank::open(
-            dir,
-            n_slots,
-            io.lanes,
-            io.mode,
-            // Any pack this needs was built just above.
-            if io.pack == PackMode::Off {
-                PackMode::Off
-            } else {
-                PackMode::Auto
-            },
-            io.mtp_experts,
-        )
-        .with_context(|| format!("expert offload: bank over {}", dir.display()))?;
+        let layers: Vec<u16> = store.layers.keys().copied().collect();
+        let n_experts = store.layers.values().next().map_or(0, |l| l.n_experts);
+        let bank = ExpertBank::over(store, n_slots, io.lanes, io.mode)?;
         let trace = trace::RouteTrace::from_env(|| trace::Header {
             budget_bytes,
             n_slots,
@@ -676,16 +722,15 @@ impl MoeOffload {
             top_k,
             expert_bytes: per,
             bulk_min_percent: BULK_MIN_PERCENT,
-            layers: store.layers.keys().copied().collect(),
+            layers: layers.clone(),
         })?;
         eprintln!(
             "[offload] expert bank: {n_slots} slots x {:.2} MB = {:.2} GB resident of {:.2} GB of routed experts \
-             ({} MoE layers, {} experts each), {} read lanes, {:?} reads",
+             ({} MoE layers, {n_experts} experts each), {} read lanes, {:?} reads",
             per as f64 / 1e6,
             n_slots as f64 * per as f64 / 1e9,
             total as f64 * per as f64 / 1e9,
-            store.layers.len(),
-            store.layers.values().next().map_or(0, |l| l.n_experts),
+            layers.len(),
             io.lanes,
             io.mode,
         );
