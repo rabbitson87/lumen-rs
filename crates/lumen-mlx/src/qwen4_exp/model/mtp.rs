@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::offload::lowbit::LowbitSpec;
 use anyhow::{Context, Result, anyhow, bail};
 use mlx_rs::Array;
 use mlx_rs::ops::indexing::TryIndexOp;
@@ -213,17 +214,22 @@ fn describe_quantization(
 }
 
 impl MtpHead {
-    /// Build the head from the tensors of `mtp.safetensors` (names `mtp.*`).
+    /// Build the head from the tensors of `mtp.safetensors` (names `mtp.*`). `copy` is the
+    /// low-bit copy its streamed experts are served from, when the trunk's are.
     pub(super) fn load(
         tensors: HashMap<String, Array>,
         dir: &Path,
         cfg: &Qwen4ExpConfig,
         streamed: bool,
+        copy: Option<LowbitSpec>,
     ) -> Result<Self> {
         let meta = MtpMeta::read(dir)?;
         let mut cfg = cfg.clone();
         cfg.norms_centered = !meta.norms_folded;
         describe_quantization(&tensors, &mut cfg, &meta)?;
+        if let Some(spec) = copy {
+            cfg.use_expert_copy_at("mtp.layers.0.mlp.switch_mlp", spec);
+        }
         // Everything resident is read now, on the loading thread (see `materialize_trunk`). A
         // streamed head's experts stay unevaluated: the pool reads them from the file.
         let resident: Vec<&Array> = tensors

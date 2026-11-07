@@ -269,6 +269,11 @@ pub fn build_expert_pack(dir: &Path) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Does the low-bit copy `spec` of the checkpoint in `dir` hold the draft head's experts?
+pub(crate) fn lowbit_holds_head(dir: &Path, spec: lowbit::LowbitSpec) -> Result<bool> {
+    pack::lowbit_holds_head(dir, spec)
+}
+
 /// Build the low-bit copy `spec` of the checkpoint in `dir`, whose experts are `src_bits` bits.
 pub fn build_lowbit_pack(
     dir: &Path,
@@ -291,7 +296,8 @@ pub fn build_lowbit_pack(
         eprintln!("[offload] {name}: {:.2} dB", f.snr_db());
     }
     // A copy that does not read back is not a copy.
-    let copy = pack::open_lowbit(dir, &source, spec)?
+    let head = dir.join("mtp.safetensors").is_file();
+    let copy = pack::open_lowbit(dir, &source, spec, head)?
         .ok_or_else(|| anyhow::anyhow!("{} did not read back", path.display()))?;
     eprintln!(
         "[offload] {:.2} MB per expert, {:.2} of the source",
@@ -663,7 +669,7 @@ impl MoeOffload {
         top_k: usize,
         io: IoTuning,
     ) -> Result<Self> {
-        let store = expert_store::ExpertStore::open_lowbit(dir, spec)?;
+        let store = expert_store::ExpertStore::open_lowbit(dir, spec, io.mtp_experts)?;
         Self::over(store, budget_bytes, top_k, io)
             .with_context(|| format!("expert offload: low-bit bank over {}", dir.display()))
     }

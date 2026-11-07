@@ -61,7 +61,7 @@ pub(crate) struct LayerRanges {
 pub(crate) const MTP_LAYER: u16 = 1000;
 
 /// The shards of one checkpoint and the expert ranges found in them.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ExpertStore {
     pub files: Vec<PathBuf>,
     pub layers: BTreeMap<u16, LayerRanges>,
@@ -85,7 +85,8 @@ impl ExpertStore {
 
     /// [`Self::open`], then the directory's expert pack if `mode` allows it: when `mode` is
     /// `Build` and there is no usable pack, the pack is built first. With `with_mtp` the draft
-    /// head's experts are added as layer [`MTP_LAYER`] (they are never part of the pack).
+    /// head's experts are added as layer [`MTP_LAYER`] (they are never part of the checkpoint's
+    /// pack; a low-bit copy holds its own).
     pub(crate) fn open_with(
         dir: &Path,
         mode: super::pack::PackMode,
@@ -99,10 +100,15 @@ impl ExpertStore {
     }
 
     /// The low-bit copy `spec` of the checkpoint in `dir`. It has to exist: asking for a copy that
-    /// is not there is not a reason to serve another model.
-    pub(crate) fn open_lowbit(dir: &Path, spec: super::lowbit::LowbitSpec) -> Result<Self> {
+    /// is not there is not a reason to serve another model. With `with_mtp` it has to hold the
+    /// draft head's experts too.
+    pub(crate) fn open_lowbit(
+        dir: &Path,
+        spec: super::lowbit::LowbitSpec,
+        with_mtp: bool,
+    ) -> Result<Self> {
         let source = Self::open(dir)?;
-        super::pack::open_lowbit(dir, &source, spec)?.ok_or_else(|| {
+        super::pack::open_lowbit(dir, &source, spec, with_mtp)?.ok_or_else(|| {
             anyhow!(
                 "no low-bit pack at {}",
                 super::pack::lowbit_path(dir, spec).display()
@@ -893,7 +899,7 @@ mod tests {
         assert_eq!(fidelity.len(), 3);
         assert!(fidelity.iter().all(|(_, f)| f.energy > 0.0 && f.err > 0.0));
 
-        let copy = pack::open_lowbit(dir.path(), &source, spec)
+        let copy = pack::open_lowbit(dir.path(), &source, spec, false)
             .unwrap()
             .expect("a usable copy");
         let l = &copy.layers[&0];
@@ -915,20 +921,20 @@ mod tests {
         let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
         let other = LowbitSpec::new(2, 32, Recipe::MinMax).unwrap();
         assert!(
-            pack::open_lowbit(dir.path(), &source, spec)
+            pack::open_lowbit(dir.path(), &source, spec, false)
                 .unwrap()
                 .is_none()
         );
         let (path, _) = pack::build_lowbit(dir.path(), &source, 4, spec, |_, _| {}).unwrap();
         // The file a different recipe would look for is not this one.
         assert!(
-            pack::open_lowbit(dir.path(), &source, other)
+            pack::open_lowbit(dir.path(), &source, other, false)
                 .unwrap()
                 .is_none()
         );
         // Renamed into another recipe's place, it says what it really is.
         std::fs::rename(&path, pack::lowbit_path(dir.path(), other)).unwrap();
-        assert!(pack::open_lowbit(dir.path(), &source, other).is_err());
+        assert!(pack::open_lowbit(dir.path(), &source, other, false).is_err());
         std::fs::rename(pack::lowbit_path(dir.path(), other), &path).unwrap();
         // Other weights: the shard's size changes, so the fingerprint does.
         let shard = dir.path().join("model.safetensors");
@@ -936,7 +942,7 @@ mod tests {
         bytes.extend_from_slice(&[0; 8]);
         std::fs::write(&shard, bytes).unwrap();
         let changed = ExpertStore::open(dir.path()).unwrap();
-        assert!(pack::open_lowbit(dir.path(), &changed, spec).is_err());
+        assert!(pack::open_lowbit(dir.path(), &changed, spec, false).is_err());
     }
 
     #[test]

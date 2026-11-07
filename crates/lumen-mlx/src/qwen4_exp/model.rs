@@ -931,9 +931,6 @@ impl Qwen4ExpModel {
                     "qwen4_exp: an expert copy is served from the pool, and no pool was asked for"
                 );
             }
-            if options.mtp != MtpMode::Off {
-                bail!("qwen4_exp: the draft head does not run on an expert copy yet");
-            }
             cfg.use_expert_copy(spec);
         }
         let mut weights = NativeWeights::load_dir(model_dir)?;
@@ -1094,7 +1091,8 @@ impl Qwen4ExpModel {
         let ones_hidden = mlx_rs::ops::ones::<f32>(&[cfg.hidden_size as i32])?;
         ones_hidden.eval()?;
         let mtp = if want_head {
-            let head = MtpHead::load(head_tensors, model_dir, &cfg, offload.is_some())
+            let streamed = offload.is_some();
+            let head = MtpHead::load(head_tensors, model_dir, &cfg, streamed, options.expert_copy)
                 .context("qwen4_exp: MTP head")?;
             eprintln!(
                 "[qwen4_exp] MTP draft head loaded ({:.2} GB resident{})",
