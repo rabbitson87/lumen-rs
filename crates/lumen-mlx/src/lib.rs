@@ -1646,6 +1646,19 @@ fn gemma4_grammar_would_constrain(
         && crate::gemma4_backend::imp::gemma4_grammar_lark_enabled()
 }
 
+/// Whether a non-streaming Gemma request has to run on the streaming decode:
+/// `generate()` has no per-token hook, so it applies no grammar and cannot end at
+/// a stop sequence.
+#[cfg(feature = "mlx-native")]
+fn gemma4_needs_streaming_decode(
+    ov: &SamplingOverrides,
+    response_schema: Option<&serde_json::Value>,
+    tools: &[crate::chat_io::ToolDef<'_>],
+    tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+) -> bool {
+    !ov.stop.is_empty() || gemma4_grammar_would_constrain(response_schema, tools, tool_choice)
+}
+
 /// [`auto_prefix_key`] or [`auto_prefix_key_from_turns`], whichever shape
 /// `source` has.
 #[cfg(feature = "mlx-native")]
@@ -1666,9 +1679,10 @@ fn auto_prefix_key_for(
 /// to the uncached route when neither yields a key (e.g. a user-first chat with
 /// no system turn).
 ///
-/// The batched `generate()` path applies no grammar at all, so any request that
-/// would have one runs through the streaming decode with a no-op sink and
-/// returns its ParsedResponse — the cached streaming route when a key resolves.
+/// The batched `generate()` path has no per-token hook, so it applies no grammar
+/// and cannot end at a stop sequence. Any request that needs either runs through
+/// the streaming decode with [`stop_sink`] and returns its ParsedResponse — the
+/// cached streaming route when a key resolves.
 /// It used to take the uncached one every time, and agent clients send tools on
 /// every request, so each turn paid a cold prefill (~19-20 s at 16K tokens).
 ///
@@ -1692,7 +1706,7 @@ fn gemma4_chat(
     response_schema: Option<&serde_json::Value>,
     effort: Option<crate::chat_io::ReasoningEffort>,
 ) -> Result<crate::chat_io::ParsedResponse> {
-    if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
+    if gemma4_needs_streaming_decode(ov, response_schema, tools, tool_choice) {
         // The grammar masks generated tokens only, so the prompt
         // can still come from the prefix cache.
         let key = session_id
@@ -1710,7 +1724,7 @@ fn gemma4_chat(
                 tools,
                 tool_choice,
                 response_schema,
-                |_| Ok(()),
+                stop_sink(&ov.stop),
             );
         }
         return m.chat_streaming_from(
@@ -1724,7 +1738,7 @@ fn gemma4_chat(
             tools,
             tool_choice,
             response_schema,
-            |_| Ok(()),
+            stop_sink(&ov.stop),
         );
     }
     // Resolve prefix-cache key. Priority:
@@ -2953,9 +2967,8 @@ impl MlxBackend {
             Self::Gemma4(m) => {
                 let _ = session_id;
                 // Same trick as the text path: only the streaming decode
-                // applies a grammar, so a non-streaming request that wants one
-                // runs it with a no-op sink.
-                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
+                // applies a grammar or ends at a stop sequence.
+                if gemma4_needs_streaming_decode(ov, response_schema, tools, tool_choice) {
                     return m.chat_streaming_from(
                         PromptSource::Flat(messages),
                         images,
@@ -2967,7 +2980,7 @@ impl MlxBackend {
                         tools,
                         tool_choice,
                         response_schema,
-                        |_| Ok(()),
+                        stop_sink(&ov.stop),
                     );
                 }
                 m.chat_from(
@@ -3216,9 +3229,9 @@ impl MlxBackend {
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let _ = session_id;
-                // Only the streaming decode applies a grammar; run it with a
-                // no-op sink for the non-streaming call.
-                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
+                // Only the streaming decode applies a grammar or ends at a
+                // stop sequence.
+                if gemma4_needs_streaming_decode(ov, response_schema, tools, tool_choice) {
                     return m.chat_streaming_from(
                         PromptSource::History(turns),
                         images,
@@ -3230,7 +3243,7 @@ impl MlxBackend {
                         tools,
                         tool_choice,
                         response_schema,
-                        |_| Ok(()),
+                        stop_sink(&ov.stop),
                     );
                 }
                 m.chat_from(
@@ -7969,8 +7982,8 @@ where
     }
 }
 
-/// A non-streaming tool reply's sink: [`StopWatch`] for the tool loop, whose parser has already
-/// split the reasoning from the answer.
+/// A non-streaming reply's sink: [`StopWatch`] for a decode whose events have already split the
+/// reasoning from the answer.
 fn stop_sink(stops: &[String]) -> impl FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()> {
     use crate::chat_io::BackendStreamEvent;
     let mut stops = lumen_core::stop::StopMatcher::new(stops.to_vec());
@@ -8127,7 +8140,10 @@ pub(crate) struct LoadInfo {
 /// is only worth as much as a way to reproduce it.
 #[cfg(all(test, feature = "mlx-native"))]
 mod grammar_routing_regressions {
-    use super::{gemma4_grammar_would_constrain, hold_back_last_prompt_token};
+    use super::{
+        SamplingOverrides, gemma4_grammar_would_constrain, gemma4_needs_streaming_decode,
+        hold_back_last_prompt_token,
+    };
     use crate::chat_io::{ResolvedToolChoice, ToolDef};
 
     fn one_tool() -> Vec<ToolDef<'static>> {
@@ -8143,6 +8159,20 @@ mod grammar_routing_regressions {
     // RED: a non-streaming `tool_choice=required` returned `迎get_weather`.
     // Only `response_format` was re-routed to the streaming decode, so tool
     // requests kept the batched `generate()` path, which applies no mask.
+
+    /// `generate()` has no per-token hook, so a stop sequence has to take the streaming decode
+    /// the way a grammar does. A plain request stays on `generate()`.
+    #[test]
+    fn a_gemma_request_with_a_stop_sequence_takes_the_streaming_decode() {
+        let auto = ResolvedToolChoice::Auto;
+        let stops = SamplingOverrides {
+            stop: vec!["END".to_string()],
+            ..Default::default()
+        };
+        let plain = SamplingOverrides::default();
+        assert!(gemma4_needs_streaming_decode(&stops, None, &[], &auto));
+        assert!(!gemma4_needs_streaming_decode(&plain, None, &[], &auto));
+    }
 
     #[test]
     fn tools_alone_must_route_through_the_grammar_aware_decode() {
@@ -10927,6 +10957,81 @@ mod tests {
             assert_eq!(parsed.visible.matches(['S', 'T']).count(), visible);
             assert_eq!(backend.script_runner().live_seqs(), 0, "{cut_after:?}");
         }
+    }
+
+    /// RED before: Gemma's streaming decode passed the sink's `Err` up with `?`, so a stream that
+    /// ended early lost its parse, and a non-streaming reply never looked at `stop`: `generate()`
+    /// has no per-token hook. Both now end the decode and finish the turn, greedy and sampled.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_gemma_decode_ends_where_its_sink_says() {
+        use crate::chat_io::{BackendStreamEvent, ResolvedToolChoice};
+        let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
+            eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR to a Gemma 4 checkpoint");
+            return;
+        };
+        let mut b = MlxBackend::load(&dir).expect("load checkpoint");
+        let messages = vec![(
+            "user".to_string(),
+            "Count from one to fifty in words, one number per line.".to_string(),
+        )];
+        let auto = ResolvedToolChoice::Auto;
+        // The sampled path defers each token's emit by one step, so the reply may run a token or
+        // two past the sink. A decode that ignored it would write the whole count.
+        const FAR_PAST_THE_STOP: usize = 40;
+        // Gemma's default repeat penalty is 1.1, which takes the sampled path even at temperature
+        // 0. Only a penalty of 1 reaches the greedy loop.
+        for (temperature, repeat_penalty) in [(0.0, Some(1.0)), (0.7, None)] {
+            let ov = SamplingOverrides {
+                repeat_penalty,
+                ..Default::default()
+            };
+            let mut texts = 0;
+            let parsed = b
+                .chat_streaming(
+                    &messages,
+                    200,
+                    temperature,
+                    1.0,
+                    &ov,
+                    false,
+                    None,
+                    &[],
+                    &auto,
+                    None,
+                    |ev| {
+                        if let BackendStreamEvent::Text(_) = ev {
+                            texts += 1;
+                            if texts == 4 {
+                                return Err(anyhow!("stop sequence"));
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+                .expect("a stop sequence is not an error");
+            assert_eq!(texts, 4, "the sink hears nothing after its `Err`");
+            assert!(
+                parsed.visible.len() < FAR_PAST_THE_STOP,
+                "temperature {temperature}: {:?}",
+                parsed.visible,
+            );
+        }
+        let ov = SamplingOverrides {
+            stop: vec!["three".to_string()],
+            repeat_penalty: Some(1.0),
+            ..Default::default()
+        };
+        let parsed = b
+            .chat(&messages, 200, 0.0, 1.0, &ov, false, None, &[], &auto, None)
+            .expect("chat");
+        assert!(parsed.visible.contains("three"), "{:?}", parsed.visible);
+        assert!(
+            parsed.visible.len() < FAR_PAST_THE_STOP,
+            "{:?}",
+            parsed.visible,
+        );
     }
 
     /// A call after a stop sequence must not reach the client: past its `Err` a sink hears

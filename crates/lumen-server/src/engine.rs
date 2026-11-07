@@ -1352,9 +1352,8 @@ impl InferenceEngine {
                     &parsed.visible,
                     &parsed.tool_calls,
                 );
-                // A stop sequence or a complete JSON value ends here too: Qwen's
-                // loops end on the sink's error and finish the turn. (Gemma's
-                // hands the error back, to the `stopped_by_seq` arm below.) The
+                // A stop sequence or a complete JSON value ends here too: the
+                // decode loops end on the sink's error and finish the turn. The
                 // reason is the stop even if that token also spent the budget.
                 let finish_reason = FinishReason::resolve(
                     parsed.stop,
@@ -1381,14 +1380,13 @@ impl InferenceEngine {
                 eprintln!("[chat-stream] client disconnected — stopped decoding");
             }
             Err(_) if stopped_by_seq.get() => {
-                // Stopped by a client stop sequence. The visible text up to the
-                // stop was already streamed (already trimmed by the matcher),
-                // and any held tail beyond the stop is intentionally dropped —
-                // do NOT flush here. No tool calls are possible mid-text, so we
-                // finish exactly like the Ok arm's no-tool-call terminal chunk:
-                // a `Done` with `FinishReason::Stop`. `completion_tokens` is a
-                // best-effort 0 since the parsed visible text is unavailable on
-                // this early-break path.
+                // The decode failed after a stop sequence ended the reply. The
+                // visible text up to the stop was already streamed (already
+                // trimmed by the matcher), so the client has its whole answer:
+                // finish it with a `Done` rather than an error. Any held tail
+                // beyond the stop is intentionally dropped — do NOT flush here.
+                // `completion_tokens` is a best-effort 0: the parse went with
+                // the failure.
                 // Observability: still count the request (gen tokens unknown →
                 // 0, tok/s left unchanged via the 0.0 guard in `record`).
                 self.load_stats.record(prompt_tokens as u64, 0, 0.0);
@@ -1603,9 +1601,9 @@ impl InferenceEngine {
                 eprintln!("[anthropic-stream] client disconnected — stopped decoding");
             }
             Err(_) if stops.matched().is_some() => {
-                // The sink broke the decode loop at a stop sequence; the text
-                // before it is already out and the rest is dropped. Tokens past
-                // the break are unknown here, so the count is 0, as on the
+                // The decode failed after a stop sequence ended the reply; the
+                // text before it is already out and the rest is dropped. The
+                // parse went with the failure, so the count is 0, as on the
                 // OpenAI stream.
                 let _ = token_tx.deliver(StreamEvent::Done {
                     prompt_tokens,

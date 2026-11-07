@@ -2795,6 +2795,16 @@ pub(crate) mod imp {
             vision: Option<(Vec<(usize, usize)>, Vec<mlx_rs::Array>)>,
             mut on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
+            // The sink's `Err` means it has what it needs, as on the Qwen loops (`flow_of`): the
+            // decode ends and the turn finishes, with its parse. Past that it hears nothing, and
+            // each loop below reads `sink_done` to end.
+            let sink_done = std::cell::Cell::new(false);
+            let mut on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
+                if !sink_done.get() && on_event(ev).is_err() {
+                    sink_done.set(true);
+                }
+                Ok(())
+            };
             // ── Manual prefill + decode loop so we can inject the
             //    on_token callback between steps.
             //
@@ -3200,7 +3210,7 @@ pub(crate) mod imp {
                     let mut n_cycles: usize = 0;
                     let mut accepted_total: usize = 0;
                     let mut attempted_total: usize = 0;
-                    while all_tokens.len() < max_new_tokens && !hit_eos {
+                    while all_tokens.len() < max_new_tokens && !hit_eos && !sink_done.get() {
                         let out = self
                             .model
                             .mtp_step(&mut cache, current_u32, n_draft)
@@ -3226,6 +3236,9 @@ pub(crate) mod imp {
                             )?;
                             if eos.contains(tok) {
                                 hit_eos = true;
+                                break;
+                            }
+                            if sink_done.get() {
                                 break;
                             }
                         }
@@ -3437,7 +3450,7 @@ pub(crate) mod imp {
                                 .context("chat_streaming(sampled): seed async_eval")?;
                         }
 
-                        while all_tokens.len() < max_new_tokens {
+                        while all_tokens.len() < max_new_tokens && !sink_done.get() {
                             // Phase B: build per-step correction context
                             // from the just-captured `h_for_lm_head`. h
                             // ownership transfers via take_*, so a forward
@@ -3802,7 +3815,7 @@ pub(crate) mod imp {
                         capture_stopped = true;
                     }
 
-                    if eos.contains(&token) {
+                    if eos.contains(&token) || sink_done.get() {
                         break;
                     }
                     current = next_lazy;
