@@ -50,6 +50,23 @@ pub struct LowbitSpec {
 }
 
 impl LowbitSpec {
+    /// `bits,group,recipe`, like `3,64,lsq`.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let parts: Vec<&str> = raw.trim().split(',').map(str::trim).collect();
+        let [bits, group, recipe] = parts.as_slice() else {
+            bail!("{raw:?} is not bits,group,recipe, like 3,64,lsq");
+        };
+        let number = |what: &str, v: &str| -> Result<usize> {
+            v.parse()
+                .map_err(|_| anyhow::anyhow!("{raw:?}: {what} {v:?} is not a number"))
+        };
+        Self::new(
+            number("bits", bits)? as u32,
+            number("group", group)?,
+            Recipe::parse(recipe)?,
+        )
+    }
+
     pub fn new(bits: u32, group_size: usize, recipe: Recipe) -> Result<Self> {
         if !(2..=8).contains(&bits) {
             bail!("{bits} bits is outside what the affine kernels take (2 to 8)");
@@ -417,6 +434,24 @@ mod tests {
 
     fn lsq(bits: u32, gs: usize) -> LowbitSpec {
         LowbitSpec::new(bits, gs, Recipe::LeastSquares).unwrap()
+    }
+
+    #[test]
+    fn a_spec_reads_as_bits_group_recipe() {
+        let spec = LowbitSpec::parse(" 3, 64 ,lsq ").unwrap();
+        assert_eq!(spec, lsq(3, 64));
+        for bad in [
+            "",
+            "3",
+            "3,64",
+            "3,64,lsq,1",
+            "x,64,lsq",
+            "3,y,lsq",
+            "3,64,best",
+            "1,64,lsq",
+        ] {
+            assert!(LowbitSpec::parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -892,6 +892,9 @@ pub struct LoadOptions {
     /// Load a low-bit copy of the experts too. Passes read the checkpoint's own until
     /// [`Qwen4ExpModel::set_expert_tier`] says otherwise.
     pub low_experts: Option<LowExpertOptions>,
+    /// Serve every pass from this low-bit copy instead of the checkpoint's experts: the
+    /// checkpoint's are never read. Needs `expert_budget_bytes`, and is not an exact model.
+    pub expert_copy: Option<LowbitSpec>,
 }
 
 /// Fewest query rows attended together: a block this small is all kernel launches.
@@ -914,6 +917,7 @@ impl Qwen4ExpModel {
                 mtp: MtpMode::Off,
                 scores_budget_bytes: 0,
                 low_experts: None,
+                expert_copy: None,
             },
         )
     }
@@ -921,6 +925,17 @@ impl Qwen4ExpModel {
     pub fn load_with(model_dir: &Path, options: LoadOptions) -> Result<Self> {
         let expert_budget_bytes = options.expert_budget_bytes;
         let mut cfg = Qwen4ExpConfig::load(model_dir)?;
+        if let Some(spec) = options.expert_copy {
+            if expert_budget_bytes.is_none() {
+                bail!(
+                    "qwen4_exp: an expert copy is served from the pool, and no pool was asked for"
+                );
+            }
+            if options.mtp != MtpMode::Off {
+                bail!("qwen4_exp: the draft head does not run on an expert copy yet");
+            }
+            cfg.use_expert_copy(spec);
+        }
         let mut weights = NativeWeights::load_dir(model_dir)?;
         // The image tower is read from the raw weights: `sanitize` drops `vision_tower.*`.
         let vision = match &cfg.vision {
@@ -1050,9 +1065,13 @@ impl Qwen4ExpModel {
                     mtp_experts: want_head,
                     ..IoTuning::from_env()?
                 };
+                let top_k = cfg.num_experts_per_tok;
                 Some(
-                    MoeOffload::open(model_dir, bytes, cfg.num_experts_per_tok, io)
-                        .context("qwen4_exp: expert offload")?,
+                    match options.expert_copy {
+                        Some(spec) => MoeOffload::open_lowbit(model_dir, spec, bytes, top_k, io),
+                        None => MoeOffload::open(model_dir, bytes, top_k, io),
+                    }
+                    .context("qwen4_exp: expert offload")?,
                 )
             }
             None => None,

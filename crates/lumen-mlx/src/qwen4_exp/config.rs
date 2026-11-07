@@ -480,6 +480,22 @@ impl Qwen4ExpConfig {
         layers * (recurrent + window) as u64
     }
 
+    /// Serve the routed experts at this quantization: a low-bit copy (see
+    /// [`crate::offload::lowbit`]) stands in for the checkpoint's own, so everything that reads the
+    /// experts' quantization, the kernels and the memory plan alike, sees the copy.
+    pub fn use_expert_copy(&mut self, spec: crate::offload::lowbit::LowbitSpec) {
+        let copy = QuantSpec {
+            group_size: spec.group_size as i32,
+            bits: spec.bits as i32,
+        };
+        for layer in 0..self.num_hidden_layers {
+            self.quant.set(
+                &format!("language_model.model.layers.{layer}.mlp.switch_mlp"),
+                copy,
+            );
+        }
+    }
+
     /// Bytes of one routed expert as the offload engine reads it: its gate, up and down
     /// projections at the experts' quantization, with a bf16 scale and bias per group (2.76 MB on
     /// Flash-Next: 2,560 x 640, 4-bit, groups of 64).
