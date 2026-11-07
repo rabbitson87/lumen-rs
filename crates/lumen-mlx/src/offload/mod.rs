@@ -651,6 +651,17 @@ impl MoeOffload {
     /// `top_k` is how many experts a token routes to per layer.
     pub(crate) fn open(dir: &Path, budget_bytes: u64, top_k: usize, io: IoTuning) -> Result<Self> {
         let store = expert_store::ExpertStore::open_with(dir, io.pack, io.mtp_experts)?;
+        Self::over(store, budget_bytes, top_k, io)
+            .with_context(|| format!("expert offload: bank over {}", dir.display()))
+    }
+
+    /// A bank over an opened store.
+    fn over(
+        store: expert_store::ExpertStore,
+        budget_bytes: u64,
+        top_k: usize,
+        io: IoTuning,
+    ) -> Result<Self> {
         let per = store.expert_bytes().max(1) as u64;
         let total = store
             .layers
@@ -687,20 +698,9 @@ impl MoeOffload {
                 (per_token as f64 * per as f64 * 1.25) / 1e9,
             );
         }
-        let bank = ExpertBank::open(
-            dir,
-            n_slots,
-            io.lanes,
-            io.mode,
-            // Any pack this needs was built just above.
-            if io.pack == PackMode::Off {
-                PackMode::Off
-            } else {
-                PackMode::Auto
-            },
-            io.mtp_experts,
-        )
-        .with_context(|| format!("expert offload: bank over {}", dir.display()))?;
+        let layers: Vec<u16> = store.layers.keys().copied().collect();
+        let n_experts = store.layers.values().next().map_or(0, |l| l.n_experts);
+        let bank = ExpertBank::over(store, n_slots, io.lanes, io.mode)?;
         let trace = trace::RouteTrace::from_env(|| trace::Header {
             budget_bytes,
             n_slots,
@@ -709,16 +709,15 @@ impl MoeOffload {
             top_k,
             expert_bytes: per,
             bulk_min_percent: BULK_MIN_PERCENT,
-            layers: store.layers.keys().copied().collect(),
+            layers: layers.clone(),
         })?;
         eprintln!(
             "[offload] expert bank: {n_slots} slots x {:.2} MB = {:.2} GB resident of {:.2} GB of routed experts \
-             ({} MoE layers, {} experts each), {} read lanes, {:?} reads",
+             ({} MoE layers, {n_experts} experts each), {} read lanes, {:?} reads",
             per as f64 / 1e6,
             n_slots as f64 * per as f64 / 1e9,
             total as f64 * per as f64 / 1e9,
-            store.layers.len(),
-            store.layers.values().next().map_or(0, |l| l.n_experts),
+            layers.len(),
             io.lanes,
             io.mode,
         );

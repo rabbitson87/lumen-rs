@@ -1489,7 +1489,7 @@ impl Qwen4ExpModel {
             },
             None => RopeAt::Index,
         };
-        let ahead = match &self.offload {
+        let ahead = match self.expert_source() {
             Some(off) if self.builds_ahead(ids.len()) && cache.mrope.is_none() => Some(off),
             _ => None,
         };
@@ -1907,7 +1907,7 @@ impl Qwen4ExpModel {
                 self.cfg.num_experts_per_tok,
                 self.cfg.num_experts,
             ))
-        .then(|| self.offload.as_ref().map(BulkHint::on))
+        .then(|| self.expert_source().map(BulkHint::on))
         .flatten();
 
         for (i, layer) in self.layers.iter().enumerate() {
@@ -2240,6 +2240,16 @@ impl Qwen4ExpModel {
         Ok(mlx_rs::ops::add(h, &spread)?)
     }
 
+    /// Where this pass reads the routed experts from, when they are offloaded.
+    fn expert_source(&self) -> Option<&MoeOffload> {
+        self.offload.as_ref()
+    }
+
+    /// A MoE block's weights as this pass reads them.
+    fn expert_view<'a>(&'a self, moe: &'a MoeLayer) -> MoeBlockWeights<'a> {
+        moe.view(self.expert_source())
+    }
+
     fn layer_forward(
         &self,
         layer: &Layer,
@@ -2249,7 +2259,7 @@ impl Qwen4ExpModel {
         at: RopeAt<'_>,
     ) -> Result<Array> {
         let front = self.layer_front(layer, h, state, first_row, at)?;
-        let view = layer.moe.view(self.offload.as_ref());
+        let view = self.expert_view(&layer.moe);
         let x = moe_block_forward(&front.x, &view).context("moe block")?;
         self.layer_back(&front.h_mid, &x, &front.inject)
     }
@@ -2310,7 +2320,7 @@ impl Qwen4ExpModel {
     /// Whether this pass takes the pipelined decode path ([`build_ahead`]): a single-row step
     /// with the experts offloaded, and no stage-by-stage profile asking for its own syncs.
     fn builds_ahead(&self, rows: usize) -> bool {
-        build_ahead::get() && rows == 1 && self.offload.is_some() && !probe::sync_on()
+        build_ahead::get() && rows == 1 && self.expert_source().is_some() && !probe::sync_on()
     }
 
     /// The layers of a decode step, each one's graph built while the GPU runs the one before.
@@ -2332,7 +2342,7 @@ impl Qwen4ExpModel {
         let mut front = self.front_at(0, &h, rows, history, cache)?;
         for i in 0..n {
             let layer = &self.layers[i];
-            let view = layer.moe.view(Some(off));
+            let view = self.expert_view(&layer.moe);
             let (inds, scores) =
                 moe_router(&front.x, &view).with_context(|| format!("layer {i}"))?;
             let k = inds.shape().last().copied().unwrap_or(1).max(1) as usize;
