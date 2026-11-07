@@ -43,6 +43,15 @@
 //! top two tokens and margin, this run's, and the token's text.
 //!
 //! `compare --low 2,64,lsq` runs the natural-text comparison through a copy.
+//!
+//! When a copy's predictions leave the checkpoint's and stay away, the state is what carries it:
+//!
+//! ```text
+//! ... state <model_dir> <ref.bin> <out.tsv> --low 3,64,lsq [--seq 1] [--chunk 64] [--upto 2048]
+//! ```
+//!
+//! feeds one recorded text through the checkpoint and the copy side by side, in one process, and
+//! writes how far apart each layer's state is after every chunk.
 
 #[cfg(feature = "mlx-native")]
 mod imp {
@@ -392,6 +401,70 @@ mod imp {
         Ok(())
     }
 
+    /// One recorded text through both builds side by side, one chunk at a time: where they part.
+    fn state(model: &Qwen4ExpModel, rec: &Path, plan: StatePlan, out: &Path) -> Result<()> {
+        let rec = Record::load(rec)?;
+        let (tokens, _) = rec
+            .seqs
+            .get(plan.seq)
+            .ok_or_else(|| anyhow!("no sequence {}", plan.seq))?;
+        let tokens = &tokens[..plan.upto.min(tokens.len())];
+        let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
+        writeln!(
+            w,
+            "pos\tlayer\tkind\tarray\tdistance\tnorm_a\tnorm_b\tpeak_a\tpeak_b"
+        )?;
+        let vocab = model.config().vocab_size as i32;
+        let (mut full, mut low) = (model.make_cache(), model.make_cache());
+        let mut pos = 0;
+        for piece in tokens.chunks(plan.chunk) {
+            let logits = |tier, cache| -> Result<Array> {
+                model.set_expert_tier(tier)?;
+                let rows = model
+                    .forward(piece, cache, false)?
+                    .reshape(&[piece.len() as i32, vocab])?
+                    .as_dtype(Dtype::Float32)?;
+                let lse = rows.logsumexp_axis(-1, true)?;
+                let lp = mlx_rs::ops::subtract(&rows, &lse)?;
+                lp.eval()?;
+                Ok(lp)
+            };
+            let (p, q) = (
+                logits(ExpertTier::Full, &mut full)?,
+                logits(ExpertTier::Low, &mut low)?,
+            );
+            let kl = mlx_rs::ops::multiply(&p.exp()?, &mlx_rs::ops::subtract(&p, &q)?)?;
+            let kl = kl.sum(None)?;
+            kl.eval()?;
+            pos += piece.len();
+            let gaps = full.gaps_to(&low)?;
+            let worst = gaps
+                .iter()
+                .filter(|g| g.norm_a > 0.0)
+                .max_by(|a, b| (a.distance / a.norm_a).total_cmp(&(b.distance / b.norm_a)));
+            eprintln!(
+                "{pos}: KL {:.4}, worst {:?}",
+                kl.item::<f32>() / piece.len() as f32,
+                worst.map(|g| (g.layer, g.kind, g.array, g.distance / g.norm_a)),
+            );
+            for g in gaps {
+                writeln!(
+                    w,
+                    "{pos}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    g.layer, g.kind, g.array, g.distance, g.norm_a, g.norm_b, g.peak_a, g.peak_b
+                )?;
+            }
+            w.flush()?;
+        }
+        Ok(())
+    }
+
+    struct StatePlan {
+        seq: usize,
+        chunk: usize,
+        upto: usize,
+    }
+
     const GREEDY_MAGIC: &[u8; 4] = b"Q4QG";
 
     /// A position's two best tokens by logit.
@@ -661,6 +734,15 @@ mod imp {
         let new: usize = take("--new").and_then(|v| v.parse().ok()).unwrap_or(300);
         let rows: usize = take("--rows").and_then(|v| v.parse().ok()).unwrap_or(1);
         let dump = take("--dump").map(PathBuf::from);
+        let plan = StatePlan {
+            seq: take("--seq").and_then(|v| v.parse().ok()).unwrap_or(0),
+            chunk: take("--chunk")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(CHUNK),
+            upto: take("--upto")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(usize::MAX),
+        };
         let low_prefill = take("--prefill").as_deref() == Some("low");
         let low_budget_gb: f64 = take("--low-budget-gb")
             .and_then(|v| v.parse().ok())
@@ -668,7 +750,7 @@ mod imp {
         let low = take("--low").map(|v| LowbitSpec::parse(&v)).transpose()?;
         let usage = "usage: record <model_dir> <out.bin> <text files...> | \
              compare <model_dir> <ref.bin> | greedy <model_dir> <out.bin> <prompt files...> | \
-             audit <model_dir> <ref.bin> <out.tsv>";
+             audit <model_dir> <ref.bin> <out.tsv> | state <model_dir> <ref.bin> <out.tsv>";
         let (mode, dir, file) = match args.as_slice() {
             [m, d, f, ..] => (m.clone(), PathBuf::from(d), PathBuf::from(f)),
             _ => bail!(usage),
@@ -705,6 +787,13 @@ mod imp {
                     model.set_expert_tier(ExpertTier::Low)?;
                 }
                 compare(&model, &dir, &file, seqs, dump.as_deref())
+            }
+            "state" => {
+                let out = PathBuf::from(args.get(3).ok_or_else(|| anyhow!(usage))?);
+                if low.is_none() {
+                    bail!("state compares a copy with the checkpoint: it needs --low");
+                }
+                state(&model, &file, plan, &out)
             }
             "greedy" => {
                 let files: Vec<PathBuf> = args[3..].iter().map(PathBuf::from).collect();
