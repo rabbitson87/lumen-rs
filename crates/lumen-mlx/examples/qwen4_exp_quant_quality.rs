@@ -19,7 +19,8 @@
 //!
 //! Each text file is one sequence, cut to `--max-tokens`, fed in 1,024-token chunks (every chunk
 //! reads the whole expert set, so a bigger one is faster). `compare --seqs N` compares only the
-//! first N sequences.
+//! first N sequences. `compare --dump <out.tsv>` writes one row per position, for finding where a
+//! figure comes from: the text token, its KL, both negative log-probs, whether top-1 matched.
 //!
 //! Natural text is full of positions where the model is unsure, so the numbers above read much
 //! lower than what a build changes along the model's own reply. Two more modes measure that, for
@@ -304,8 +305,23 @@ mod imp {
         kl
     }
 
-    fn compare(model: &Qwen4ExpModel, rec: &Path, seqs: usize) -> Result<()> {
+    fn compare(
+        model: &Qwen4ExpModel,
+        dir: &Path,
+        rec: &Path,
+        seqs: usize,
+        dump: Option<&Path>,
+    ) -> Result<()> {
         let rec = Record::load(rec)?;
+        let mut dump = dump
+            .map(|path| -> Result<_> {
+                let tok = Tokenizer::from_file(dir.join("tokenizer.json"))
+                    .map_err(|e| anyhow!("tokenizer: {e}"))?;
+                let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+                writeln!(w, "seq\tpos\tkl\tnll_ref\tnll\tsame\ttext")?;
+                Ok((tok, w))
+            })
+            .transpose()?;
         let mut total = Tally::default();
         let mut by_depth = [Tally::default(); DEPTHS.len()];
         for (s, (tokens, rows)) in rec.seqs.iter().enumerate().take(seqs) {
@@ -337,6 +353,16 @@ mod imp {
                     let kl = kl_top(r, &at[p * TOP..(p + 1) * TOP]);
                     let pos = start + p;
                     let d = DEPTHS.iter().position(|(lim, _)| pos < *lim).unwrap_or(0);
+                    if let Some((tok, w)) = &mut dump {
+                        writeln!(
+                            w,
+                            "{s}\t{pos}\t{kl:.4}\t{:.4}\t{:.4}\t{}\t{}",
+                            -r.next_lp,
+                            -nl[p],
+                            u8::from(top[p] == best),
+                            field(tok, tokens[pos + 1]),
+                        )?;
+                    }
                     for t in [&mut seq, &mut by_depth[d]] {
                         t.n += 1;
                         t.agree += usize::from(top[p] == best);
@@ -634,6 +660,7 @@ mod imp {
             .unwrap_or(usize::MAX);
         let new: usize = take("--new").and_then(|v| v.parse().ok()).unwrap_or(300);
         let rows: usize = take("--rows").and_then(|v| v.parse().ok()).unwrap_or(1);
+        let dump = take("--dump").map(PathBuf::from);
         let low_prefill = take("--prefill").as_deref() == Some("low");
         let low_budget_gb: f64 = take("--low-budget-gb")
             .and_then(|v| v.parse().ok())
@@ -677,7 +704,7 @@ mod imp {
                 if low.is_some() {
                     model.set_expert_tier(ExpertTier::Low)?;
                 }
-                compare(&model, &file, seqs)
+                compare(&model, &dir, &file, seqs, dump.as_deref())
             }
             "greedy" => {
                 let files: Vec<PathBuf> = args[3..].iter().map(PathBuf::from).collect();
