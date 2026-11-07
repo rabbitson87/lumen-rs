@@ -279,6 +279,10 @@ mod offload;
 /// Build the contiguous expert pack of a Flash-Next checkpoint (`lumen-server --pack-experts`).
 #[cfg(feature = "mlx-native")]
 pub use offload::build_expert_pack;
+#[cfg(feature = "mlx-native")]
+pub use offload::build_lowbit_pack;
+#[cfg(feature = "mlx-native")]
+pub use offload::lowbit::{LowbitSpec, Recipe};
 mod prefix_cache;
 mod qwen3_5_moe;
 #[cfg(feature = "mlx-native")]

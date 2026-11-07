@@ -853,6 +853,80 @@ mod tests {
         assert_eq!(reads, 1, "six ranges of one record should be one read");
     }
 
+    /// A checkpoint whose expert tensors have the shapes of real affine weights: 2 experts, 3
+    /// layers' worth of nothing else, 64 x 64 at 4 bits in groups of 32.
+    fn affine_checkpoint(dir: &Path) {
+        let mut parts: Vec<(String, &'static str, Vec<i64>, Vec<u8>)> = Vec::new();
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let base = format!("language_model.model.layers.0.mlp.switch_mlp.{proj}");
+            let codes: Vec<u8> = (0..2 * 64 * 32).map(|i| (i * 37 % 251) as u8).collect();
+            let scale: Vec<u8> = (0..2 * 64 * 2).flat_map(|_| [0x03u8, 0x3b]).collect();
+            let bias: Vec<u8> = (0..2 * 64 * 2).flat_map(|_| [0x80u8, 0xbc]).collect();
+            parts.push((format!("{base}.weight"), "U32", vec![2, 64, 8], codes));
+            parts.push((format!("{base}.scales"), "BF16", vec![2, 64, 2], scale));
+            parts.push((format!("{base}.biases"), "BF16", vec![2, 64, 2], bias));
+        }
+        write_all(&dir.join("model.safetensors"), &parts);
+    }
+
+    #[test]
+    fn a_low_bit_pack_holds_every_expert_at_its_own_quantization() {
+        use crate::offload::lowbit::{LowbitSpec, Recipe};
+        let dir = tempfile::tempdir().unwrap();
+        affine_checkpoint(dir.path());
+        let source = ExpertStore::open(dir.path()).unwrap();
+        let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
+        let (path, fidelity) = pack::build_lowbit(dir.path(), &source, 4, spec, |_, _| {}).unwrap();
+        assert_eq!(path, dir.path().join("experts.2b32.lsq.lpack"));
+        assert_eq!(fidelity.len(), 3);
+        assert!(fidelity.iter().all(|(_, f)| f.energy > 0.0 && f.err > 0.0));
+
+        let copy = pack::open_lowbit(dir.path(), &source, spec)
+            .unwrap()
+            .expect("a usable copy");
+        let l = &copy.layers[&0];
+        assert_eq!(l.n_experts, 2);
+        // Half the weight bytes; the same groups, so the same scales and biases.
+        let (w, s) = (&l.roles["up_proj.weight"], &l.roles["up_proj.scales"]);
+        assert_eq!((w.bytes, s.bytes), (64 * 16, 64 * 2 * 2));
+        assert_eq!(w.tail_shape, vec![64, 4]);
+        assert_eq!(s.tail_shape, vec![64, 2]);
+        assert_eq!(copy.expert_bytes(), 3 * (64 * 16 + 2 * (64 * 2 * 2)));
+    }
+
+    #[test]
+    fn a_low_bit_pack_is_opened_only_for_its_own_weights_and_quantization() {
+        use crate::offload::lowbit::{LowbitSpec, Recipe};
+        let dir = tempfile::tempdir().unwrap();
+        affine_checkpoint(dir.path());
+        let source = ExpertStore::open(dir.path()).unwrap();
+        let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
+        let other = LowbitSpec::new(2, 32, Recipe::MinMax).unwrap();
+        assert!(
+            pack::open_lowbit(dir.path(), &source, spec)
+                .unwrap()
+                .is_none()
+        );
+        let (path, _) = pack::build_lowbit(dir.path(), &source, 4, spec, |_, _| {}).unwrap();
+        // The file a different recipe would look for is not this one.
+        assert!(
+            pack::open_lowbit(dir.path(), &source, other)
+                .unwrap()
+                .is_none()
+        );
+        // Renamed into another recipe's place, it says what it really is.
+        std::fs::rename(&path, pack::lowbit_path(dir.path(), other)).unwrap();
+        assert!(pack::open_lowbit(dir.path(), &source, other).is_err());
+        std::fs::rename(pack::lowbit_path(dir.path(), other), &path).unwrap();
+        // Other weights: the shard's size changes, so the fingerprint does.
+        let shard = dir.path().join("model.safetensors");
+        let mut bytes = std::fs::read(&shard).unwrap();
+        bytes.extend_from_slice(&[0; 8]);
+        std::fs::write(&shard, bytes).unwrap();
+        let changed = ExpertStore::open(dir.path()).unwrap();
+        assert!(pack::open_lowbit(dir.path(), &changed, spec).is_err());
+    }
+
     #[test]
     fn a_pack_for_other_weights_or_cut_short_is_ignored_and_off_never_reads_it() {
         let dir = tempfile::tempdir().unwrap();

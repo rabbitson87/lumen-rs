@@ -22,6 +22,7 @@
 pub(crate) mod expert_bank;
 pub(crate) mod expert_store;
 pub(crate) mod io;
+pub mod lowbit;
 pub(crate) mod pack;
 pub(crate) mod slot_map;
 pub(crate) mod slot_policy;
@@ -264,6 +265,38 @@ pub fn build_expert_pack(dir: &Path) -> Result<std::path::PathBuf> {
         "[offload] expert pack ready in {:.0} s: {}",
         started.elapsed().as_secs_f64(),
         path.display()
+    );
+    Ok(path)
+}
+
+/// Build the low-bit copy `spec` of the checkpoint in `dir`, whose experts are `src_bits` bits.
+pub fn build_lowbit_pack(
+    dir: &Path,
+    src_bits: u32,
+    spec: lowbit::LowbitSpec,
+) -> Result<std::path::PathBuf> {
+    let source = expert_store::ExpertStore::open(dir)?;
+    let started = std::time::Instant::now();
+    let (path, fidelity) = pack::build_lowbit(dir, &source, src_bits, spec, |done, total| {
+        if done % 6 == 0 || done == total {
+            eprintln!("[offload] low-bit pack: layer {done} of {total}");
+        }
+    })?;
+    eprintln!(
+        "[offload] low-bit pack ready in {:.0} s: {}",
+        started.elapsed().as_secs_f64(),
+        path.display()
+    );
+    for (name, f) in &fidelity {
+        eprintln!("[offload] {name}: {:.2} dB", f.snr_db());
+    }
+    // A copy that does not read back is not a copy.
+    let copy = pack::open_lowbit(dir, &source, spec)?
+        .ok_or_else(|| anyhow::anyhow!("{} did not read back", path.display()))?;
+    eprintln!(
+        "[offload] {:.2} MB per expert, {:.2} of the source",
+        copy.expert_bytes() as f64 / 1e6,
+        copy.expert_bytes() as f64 / source.expert_bytes() as f64,
     );
     Ok(path)
 }

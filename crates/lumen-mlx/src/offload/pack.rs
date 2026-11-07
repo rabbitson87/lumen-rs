@@ -22,6 +22,11 @@
 //!
 //! The fingerprint hashes the shards' names and sizes and every expert range found in them, so
 //! a pack made for other weights is rejected instead of serving plausible wrong ones.
+//!
+//! A low-bit copy (`experts.2b64.lsq.lpack`, see [`super::lowbit`]) is a file of the same shape
+//! whose records were fitted again at fewer bits. Its header names its quantization and the
+//! weights it was made from as `source_fingerprint`. It is a different model, not a cache of
+//! this one, so nothing opens it unless asked to.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
@@ -32,6 +37,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use super::expert_store::{ExpertStore, LayerRanges, RoleRange};
+use super::lowbit::{self, Fidelity, LowbitSpec, PackedProj, PackedProjMut};
 
 /// File name of the pack inside a checkpoint directory.
 pub(crate) const PACK_FILE: &str = "experts.lpack";
@@ -487,4 +493,197 @@ pub(crate) fn build(
         progress,
     )?;
     Ok(dest)
+}
+
+/// File name of `spec`'s low-bit copy inside a checkpoint directory.
+pub(crate) fn lowbit_path(dir: &Path, spec: LowbitSpec) -> PathBuf {
+    dir.join(format!(
+        "experts.{}b{}.{}.lpack",
+        spec.bits,
+        spec.group_size,
+        spec.recipe.name()
+    ))
+}
+
+/// One projection of a layer: its three roles, in the source and in the copy.
+struct ProjPlan {
+    name: String,
+    rows: usize,
+    cols: usize,
+    src_group: usize,
+    /// Index into the role-ordered tensors, and bytes of one expert, of weight, scales, biases.
+    src: [(usize, usize); 3],
+    /// Index into the role-ordered record slots.
+    dst: [usize; 3],
+}
+
+const PARTS: [&str; 3] = ["weight", "scales", "biases"];
+
+/// What a low-bit copy of `first`'s roles looks like: the plan per projection, and the record.
+fn plan_lowbit(
+    first: &LayerRanges,
+    src_bits: u32,
+    spec: LowbitSpec,
+) -> Result<(Vec<ProjPlan>, Vec<RoleSlot>)> {
+    let names: Vec<&String> = first.roles.keys().collect();
+    let index = |role: &str| {
+        names
+            .iter()
+            .position(|n| n.as_str() == role)
+            .ok_or_else(|| anyhow!("pack: the checkpoint has no role {role}"))
+    };
+    let mut plans = Vec::new();
+    let mut tails: Vec<Option<(usize, Vec<i64>)>> = vec![None; names.len()];
+    for name in first.roles.keys().filter_map(|k| k.strip_suffix(".weight")) {
+        let [w, s, b] = PARTS.map(|p| format!("{name}.{p}"));
+        let (wi, si, bi) = (index(&w)?, index(&s)?, index(&b)?);
+        let (wr, sr, br) = (&first.roles[&w], &first.roles[&s], &first.roles[&b]);
+        if wr.dtype != "U32" || sr.dtype != "BF16" || br.dtype != "BF16" {
+            bail!(
+                "pack: {name} is {}, {}, {}; a low-bit copy needs U32 and BF16",
+                wr.dtype,
+                sr.dtype,
+                br.dtype
+            );
+        }
+        let [rows, words] = wr.tail_shape[..] else {
+            bail!("pack: {name}.weight is not a matrix");
+        };
+        let [_, groups] = sr.tail_shape[..] else {
+            bail!("pack: {name}.scales is not a matrix");
+        };
+        let (rows, words, groups) = (rows as usize, words as usize, groups as usize);
+        let cols = words * 32 / src_bits as usize;
+        let dst_groups = cols / spec.group_size;
+        let dst_words = lowbit::row_bytes(cols, spec.bits)? / 4;
+        tails[wi] = Some((rows * dst_words * 4, vec![rows as i64, dst_words as i64]));
+        for i in [si, bi] {
+            tails[i] = Some((rows * dst_groups * 2, vec![rows as i64, dst_groups as i64]));
+        }
+        plans.push(ProjPlan {
+            name: name.to_string(),
+            rows,
+            cols,
+            src_group: cols / groups,
+            src: [(wi, wr.bytes), (si, sr.bytes), (bi, br.bytes)],
+            dst: [wi, si, bi],
+        });
+    }
+    let roles = first
+        .roles
+        .iter()
+        .zip(tails)
+        .map(|((name, r), tail)| {
+            let (bytes, shape) =
+                tail.ok_or_else(|| anyhow!("pack: role {name} belongs to no projection"))?;
+            Ok((name.clone(), bytes, r.dtype.clone(), shape))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((plans, RoleSlot::lay_out(roles)))
+}
+
+/// Build `spec`'s low-bit copy of `source`, whose experts are `src_bits` bits. Returns where it
+/// went and how close each projection stayed.
+pub(crate) fn build_lowbit(
+    dir: &Path,
+    source: &ExpertStore,
+    src_bits: u32,
+    spec: LowbitSpec,
+    progress: impl FnMut(usize, usize),
+) -> Result<(PathBuf, Vec<(String, Fidelity)>)> {
+    let first = source
+        .layers
+        .values()
+        .next()
+        .ok_or_else(|| anyhow!("pack: the checkpoint has no routed experts"))?;
+    let (plans, slots) = plan_lowbit(first, src_bits, spec)?;
+    let mut head = serde_json::Map::new();
+    head.insert("source_fingerprint".into(), json!(fingerprint(source)?));
+    head.insert(
+        "lowbit".into(),
+        json!({"bits": spec.bits, "group_size": spec.group_size, "recipe": spec.recipe.name()}),
+    );
+    let fidelity: std::sync::Mutex<Vec<Fidelity>> =
+        std::sync::Mutex::new(vec![Fidelity::default(); plans.len()]);
+    let dest = lowbit_path(dir, spec);
+    write_pack(
+        &dest,
+        source,
+        &slots,
+        head,
+        |tensors, e, rec| {
+            for (p, plan) in plans.iter().enumerate() {
+                let [w, s, b] = plan
+                    .src
+                    .map(|(i, bytes)| &tensors[i][e * bytes..(e + 1) * bytes]);
+                let [dw, ds, db] = plan.dst.map(|i| &slots[i]);
+                let mut out = [dw, ds, db].map(|d| vec![0u8; d.bytes]);
+                let [ow, os, ob] = &mut out;
+                let f = lowbit::requantize(
+                    PackedProj {
+                        weight: w,
+                        scales: s,
+                        biases: b,
+                        rows: plan.rows,
+                        cols: plan.cols,
+                        bits: src_bits,
+                        group_size: plan.src_group,
+                    },
+                    spec,
+                    PackedProjMut {
+                        weight: ow,
+                        scales: os,
+                        biases: ob,
+                    },
+                )?;
+                for (slot, bytes) in [dw, ds, db].into_iter().zip(&out) {
+                    rec[slot.at..slot.at + slot.bytes].copy_from_slice(bytes);
+                }
+                fidelity.lock().unwrap_or_else(|e| e.into_inner())[p].add(f);
+            }
+            Ok(())
+        },
+        progress,
+    )?;
+    let totals = fidelity.into_inner().unwrap_or_else(|e| e.into_inner());
+    let named = plans.iter().map(|p| p.name.clone()).zip(totals).collect();
+    Ok((dest, named))
+}
+
+/// `spec`'s low-bit copy of `source`, as a store, if the file exists; an error if it does but
+/// was not made from these weights at this quantization.
+pub(crate) fn open_lowbit(
+    dir: &Path,
+    source: &ExpertStore,
+    spec: LowbitSpec,
+) -> Result<Option<ExpertStore>> {
+    let path = lowbit_path(dir, spec);
+    let Ok(file) = File::open(&path) else {
+        return Ok(None);
+    };
+    let (v, store) = read_pack(&file, &path).with_context(|| format!("pack {}", path.display()))?;
+    let want = fingerprint(source)?;
+    let got = v["source_fingerprint"].as_str().unwrap_or_default();
+    if got != want {
+        bail!(
+            "{} was made for other weights (fingerprint {got}, these are {want})",
+            path.display()
+        );
+    }
+    let tier = &v["lowbit"];
+    if tier["bits"].as_u64() != Some(u64::from(spec.bits))
+        || tier["group_size"].as_u64() != Some(spec.group_size as u64)
+        || tier["recipe"].as_str() != Some(spec.recipe.name())
+    {
+        bail!("{} holds {tier}, not {spec:?}", path.display());
+    }
+    for (layer, l) in &source.layers {
+        let Some(p) = store.layers.get(layer) else {
+            bail!("{}: layer {layer} is missing", path.display());
+        };
+        if p.n_experts != l.n_experts || !p.roles.keys().eq(l.roles.keys()) {
+            bail!("{}: layer {layer} differs from the shards", path.display());
+        }
+    }
+    Ok(Some(store))
 }
