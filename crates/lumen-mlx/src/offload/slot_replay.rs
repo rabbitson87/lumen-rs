@@ -4,11 +4,13 @@
 //! the other half of that argument: it feeds the same traces to the engine's own `SlotMap`, with
 //! the plan -> commit -> release sequence, the staging blocks being lent and handed back, and the
 //! decode/prefill classification of every call that the engine uses, and reports what the engine
-//! did. Two ignored tests use it:
+//! did. Three ignored tests use it:
 //!
 //! * `engine_replay_matches_the_simulator` compares the engine, call by call, with the hit flags
 //!   the simulator produced for the same trace, policy and pool size.
 //! * `per_call_cost` times the planning of decode-sized, mid-size and large calls per policy.
+//! * `read_ahead_uplift` scores the predictions of `LUMEN_MOE_TRACE_PREDICT` and what reading them
+//!   ahead would do to the decode hit rate.
 //!
 //! The trace format is documented in [`super::trace`]; this reads the parts a replay needs.
 
@@ -29,6 +31,7 @@ const MIN_SCORED_TOKENS: u32 = 4;
 const F_STAGED: u8 = 1;
 const F_PREFILL: u8 = 1 << 2;
 const F_COUNTS: u8 = 1 << 5;
+const TAG_PREDICTED: u8 = 2;
 
 pub(super) struct Call {
     flags: u8,
@@ -36,6 +39,8 @@ pub(super) struct Call {
     request: u32,
     pass: u32,
     ids: Vec<u16>,
+    /// What the previous layer's input predicted for this call, best first; empty if nothing did.
+    predicted: Vec<u16>,
 }
 
 pub(super) struct Trace {
@@ -52,7 +57,7 @@ fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
-/// Read a `LMOETR01` v2 trace: header, then call records (a record cut by a kill is ignored).
+/// Read a `LMOETR01` v2 or v3 trace: header, then records (a record cut by a kill is ignored).
 pub(super) fn read_trace(path: &Path) -> Trace {
     let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert_eq!(
@@ -61,13 +66,26 @@ pub(super) fn read_trace(path: &Path) -> Trace {
         "{} is not a routing trace",
         path.display()
     );
-    assert_eq!(le32(&b, 8), 2, "trace version");
+    assert!(matches!(le32(&b, 8), 2 | 3), "trace version");
     let width = le32(&b, 36) as usize;
     let n_layers = le32(&b, 60) as usize;
     let layers: Vec<u16> = (0..n_layers).map(|i| le16(&b, 64 + 2 * i)).collect();
     let mut at = 64 + 2 * n_layers;
     let mut calls = Vec::new();
-    while at + 18 <= b.len() {
+    let mut predicted = Vec::new();
+    while at + 6 <= b.len() {
+        if b[at] == TAG_PREDICTED {
+            let n = usize::from(le16(&b, at + 4));
+            if at + 6 + 2 * n > b.len() {
+                break;
+            }
+            predicted = (0..n).map(|i| le16(&b, at + 6 + 2 * i)).collect();
+            at += 6 + 2 * n;
+            continue;
+        }
+        if at + 18 > b.len() {
+            break;
+        }
         assert_eq!(b[at], 1, "record tag at {at}");
         let flags = b[at + 1];
         let n = usize::from(le16(&b, at + 16));
@@ -81,6 +99,7 @@ pub(super) fn read_trace(path: &Path) -> Trace {
             request: le32(&b, at + 4),
             pass: le32(&b, at + 8),
             ids: (0..n).map(|i| le16(&b, at + 18 + 2 * i)).collect(),
+            predicted: std::mem::take(&mut predicted),
         });
         at += size;
     }
@@ -91,12 +110,26 @@ pub(super) fn read_trace(path: &Path) -> Trace {
     }
 }
 
+/// The decode calls of a trace as `(layer, predicted)`, and the width of the expert ids.
+pub(crate) fn predictions(path: &Path) -> (usize, Vec<(u16, Vec<u16>)>) {
+    let trace = read_trace(path);
+    let decode = trace.calls.into_iter().filter(|c| c.flags & F_PREFILL == 0);
+    (
+        trace.width,
+        decode.map(|c| (c.layer, c.predicted)).collect(),
+    )
+}
+
 /// What the engine did with a trace.
 pub(super) struct Run {
     /// One flag per expert of every acquire-path call, in order: was it a hit.
     pub flags: Vec<bool>,
     pub decode_hits: u64,
     pub decode_misses: u64,
+    pub decode_tokens: u64,
+    /// Experts read ahead of their call, and how many of those the call then asked for.
+    pub ahead_reads: u64,
+    pub ahead_used: u64,
 }
 
 impl Run {
@@ -115,6 +148,15 @@ pub(super) struct Setup {
     pub n_slots: usize,
     pub kind: EvictionKind,
     pub bias: BiasParams,
+    pub read_ahead: Option<ReadAhead>,
+}
+
+/// Before a decode call: of the first `top` experts predicted for it, read up to `cap` of those
+/// not resident.
+#[derive(Clone, Copy)]
+pub(super) struct ReadAhead {
+    pub top: usize,
+    pub cap: usize,
 }
 
 impl Setup {
@@ -123,6 +165,7 @@ impl Setup {
             n_slots,
             kind,
             bias: BiasParams::default(),
+            read_ahead: None,
         }
     }
 }
@@ -190,6 +233,9 @@ pub(super) fn replay(trace: &Trace, setup: &Setup) -> Run {
         flags: Vec::new(),
         decode_hits: 0,
         decode_misses: 0,
+        decode_tokens: 0,
+        ahead_reads: 0,
+        ahead_used: 0,
     };
     // Per request: decode tokens (highest pass + 1) and the hits and misses of its decode calls.
     let mut per_request: HashMap<u32, (u32, u64, u64)> = HashMap::new();
@@ -205,6 +251,9 @@ pub(super) fn replay(trace: &Trace, setup: &Setup) -> Run {
         } else {
             CallKind::Decode
         };
+        if let Some(ahead) = setup.read_ahead.filter(|_| !prefill) {
+            read_ahead(&mut d, c, ahead, &mut keys, &mut run);
+        }
         keys_of(c.layer, &c.ids, &mut keys);
         let plan = d.call(&keys, kind);
         // The misses come back in request order, so one pass over both lists tells them apart.
@@ -225,9 +274,97 @@ pub(super) fn replay(trace: &Trace, setup: &Setup) -> Run {
         if tokens > MIN_SCORED_TOKENS {
             run.decode_hits += hits;
             run.decode_misses += misses;
+            run.decode_tokens += u64::from(tokens);
         }
     }
     run
+}
+
+/// Read the prediction for call `c` as a call of its own. Prefill-kind, so `bias` does not learn
+/// a transition from experts nobody routed to; its decay clock still ticks once more, which a
+/// real read ahead could avoid.
+fn read_ahead(
+    d: &mut Driver,
+    c: &Call,
+    ahead: ReadAhead,
+    keys: &mut Vec<ExpertKey>,
+    run: &mut Run,
+) {
+    keys.clear();
+    keys.extend(
+        c.predicted
+            .iter()
+            .take(ahead.top)
+            .map(|&e| ExpertKey::new(c.layer, e))
+            .filter(|&k| d.map.peek(k).is_none())
+            .take(ahead.cap),
+    );
+    if keys.is_empty() {
+        return;
+    }
+    d.call(keys, CallKind::Prefill);
+    run.ahead_reads += keys.len() as u64;
+    run.ahead_used += keys.iter().filter(|k| c.ids.contains(&k.expert)).count() as u64;
+}
+
+/// How much of what decode calls asked for the first `top` predicted experts named, by layer third.
+fn recall_report(trace: &Trace) -> Vec<String> {
+    let predicted: Vec<&Call> = trace
+        .calls
+        .iter()
+        .filter(|c| c.flags & F_PREFILL == 0 && !c.predicted.is_empty())
+        .collect();
+    let deepest = predicted.iter().map(|c| c.layer).max().unwrap_or(0);
+    let third = |c: &Call| usize::from(c.layer) * 3 / (usize::from(deepest) + 1);
+    let recall = |top: usize, keep: &dyn Fn(&Call) -> bool| {
+        let (mut found, mut asked) = (0usize, 0usize);
+        for c in predicted.iter().filter(|c| keep(c)) {
+            let named = &c.predicted[..top.min(c.predicted.len())];
+            found += c.ids.iter().filter(|e| named.contains(e)).count();
+            asked += c.ids.len();
+        }
+        100.0 * found as f64 / asked.max(1) as f64
+    };
+    let mut out = vec![format!("{} predicted decode calls", predicted.len())];
+    for top in [10, 12, 16, 24] {
+        out.push(format!(
+            "recall@{top}: {:.1}% (shallow {:.1}, middle {:.1}, deep {:.1})",
+            recall(top, &|_| true),
+            recall(top, &|c| third(c) == 0),
+            recall(top, &|c| third(c) == 1),
+            recall(top, &|c| third(c) == 2),
+        ));
+    }
+    out
+}
+
+/// One line per read-ahead setting at one pool size, against no read ahead. The reads per token
+/// are the honest measure: an expert read ahead for nothing still cost its read.
+fn read_ahead_report(trace: &Trace, n_slots: usize) -> Vec<String> {
+    let run = |ahead| {
+        let mut setup = Setup::new(n_slots, EvictionKind::Bias);
+        setup.read_ahead = ahead;
+        replay(trace, &setup)
+    };
+    let base = run(None);
+    let per_token = |n: u64, r: &Run| n as f64 / r.decode_tokens.max(1) as f64;
+    let mut out = vec![format!(
+        "{n_slots} slots: hit {:.2}%, {:.2} reads per token",
+        100.0 * base.decode_hit_rate(),
+        per_token(base.decode_misses, &base),
+    )];
+    for (top, cap) in [(10, 3), (12, 3), (16, 3), (12, 5), (16, 5), (24, 10)] {
+        let r = run(Some(ReadAhead { top, cap }));
+        out.push(format!(
+            "  top {top} cap {cap}: hit {:.2}%, {:.2} misses + {:.2} ahead = {:.2} reads per token,              {:.0}% of ahead reads used",
+            100.0 * r.decode_hit_rate(),
+            per_token(r.decode_misses, &r),
+            per_token(r.ahead_reads, &r),
+            per_token(r.decode_misses + r.ahead_reads, &r),
+            100.0 * r.ahead_used as f64 / r.ahead_reads.max(1) as f64,
+        ));
+    }
+    out
 }
 
 /// The simulator's policy names: the three selectable ones, plus `bias-full`, `bias` with the
@@ -533,6 +670,113 @@ fn engine_replay_matches_the_simulator() {
     };
     for line in parity_report(Path::new(&traces), Path::new(&sim)) {
         println!("{line}");
+    }
+}
+
+/// A prediction belongs to the call after it, and the records around it still parse.
+#[test]
+fn a_prediction_is_read_as_part_of_the_call_it_precedes() {
+    use super::trace::{Call as Rec, Header, RouteTrace};
+    let path = std::env::temp_dir().join(format!("lumen-predict-{}.bin", std::process::id()));
+    let t = RouteTrace::create(
+        path.clone(),
+        &Header {
+            budget_bytes: 1,
+            n_slots: 64,
+            regions: 1,
+            width: 16,
+            top_k: 2,
+            expert_bytes: 1,
+            bulk_min_percent: 60,
+            layers: vec![0, 1],
+        },
+    )
+    .unwrap();
+    let now = Instant::now();
+    let call = |layer| Rec {
+        layer,
+        rows: 1,
+        staged: false,
+        hinted: false,
+        ids: &[3, 4],
+        hits: &[true, false],
+        counts: None,
+        entered: now,
+        evaluated: now,
+        done: now,
+    };
+    t.record(&call(0));
+    t.predicted(1, &[9, 4, 7]);
+    t.record(&call(1));
+    t.record(&call(0));
+    t.predicted(1, &[1]);
+    t.record(&call(1));
+    drop(t);
+    let got = read_trace(&path);
+    std::fs::remove_file(&path).unwrap();
+    let predicted: Vec<&[u16]> = got.calls.iter().map(|c| &c.predicted[..]).collect();
+    assert_eq!(predicted, [&[][..], &[9, 4, 7][..], &[][..], &[1][..]]);
+    assert_eq!(got.calls[1].ids, [3, 4]);
+}
+
+/// Replays a call with a predicted set the pool lacks: the expert read ahead is a hit in the call,
+/// a named expert already resident is not read again, and the cap holds.
+#[test]
+fn reading_ahead_turns_a_miss_into_a_hit_and_counts_its_reads() {
+    let call = |pass, ids: &[u16], predicted: &[u16]| Call {
+        flags: 0,
+        layer: 0,
+        request: WARMUP_REQUESTS,
+        pass,
+        ids: ids.to_vec(),
+        predicted: predicted.to_vec(),
+    };
+    let trace = Trace {
+        width: 16,
+        layers: vec![0],
+        calls: (0..6)
+            .flat_map(|t| {
+                [
+                    call(2 * t, &[1, 2], &[]),
+                    call(2 * t + 1, &[3, 2], &[3, 2, 5, 6]),
+                ]
+            })
+            .collect(),
+    };
+    let mut setup = Setup::new(64, EvictionKind::Bias);
+    let plain = replay(&trace, &setup);
+    assert_eq!(plain.decode_misses, 3, "1, 2 and 3 once each");
+
+    setup.read_ahead = Some(ReadAhead { top: 3, cap: 1 });
+    let ahead = replay(&trace, &setup);
+    assert_eq!(ahead.decode_misses, 2, "3 was read ahead of its call");
+    // 3 for its call; 2 is resident, so the next token's one read goes to 5, which nobody asks
+    // for; 6 lies past `top`.
+    assert_eq!((ahead.ahead_reads, ahead.ahead_used), (2, 1));
+
+    setup.read_ahead = Some(ReadAhead { top: 4, cap: 2 });
+    let wide = replay(&trace, &setup);
+    assert_eq!(
+        (wide.ahead_reads, wide.ahead_used),
+        (3, 1),
+        "5 and 6 asked for nothing"
+    );
+}
+
+#[test]
+#[ignore = "needs a trace with predictions; set LUMEN_POLICY_TRACE_FILE (and run with --release)"]
+fn read_ahead_uplift() {
+    let Ok(file) = std::env::var(TRACE_FILE_VAR) else {
+        return;
+    };
+    let trace = read_trace(Path::new(&file));
+    for line in recall_report(&trace) {
+        println!("{line}");
+    }
+    for n_slots in [1551, 2423, 3616, 5425, 7161] {
+        for line in read_ahead_report(&trace, n_slots) {
+            println!("{line}");
+        }
     }
 }
 

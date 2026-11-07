@@ -28,7 +28,7 @@ pub(crate) mod slot_map;
 pub(crate) mod slot_policy;
 pub(crate) mod slot_pool;
 #[cfg(test)]
-mod slot_replay;
+pub(crate) mod slot_replay;
 pub(crate) mod trace;
 
 #[cfg(test)]
@@ -1110,6 +1110,29 @@ impl MoeOffload {
         // finished, and with it the previous gather over these slot numbers; the next graph
         // that reads them is submitted after this returns.
         unsafe { slots.write(&slot_ids) }
+    }
+
+    /// Whether the routing trace records what each layer's gate predicts for the next.
+    pub(crate) fn traces_predictions(&self) -> bool {
+        self.trace.is_some() && trace::moe_trace_predict::get()
+    }
+
+    /// Hand the routing trace the prediction for `layer`: `ranked` is the flattened result of
+    /// `moe_ranked`, best last.
+    pub(crate) fn trace_prediction(&self, layer: u16, ranked: &Array) -> Result<()> {
+        let Some(trace) = &self.trace else {
+            return Ok(());
+        };
+        ranked
+            .eval()
+            .context("offload route: evaluate prediction")?;
+        let best_first: Vec<u16> = Self::read_ids(ranked)?
+            .iter()
+            .rev()
+            .map(|&e| e as u16)
+            .collect();
+        trace.predicted(layer, &best_first);
+        Ok(())
     }
 
     /// The pool path of a layer call: leave staging, make the call's distinct experts resident

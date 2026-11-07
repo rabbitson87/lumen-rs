@@ -36,6 +36,7 @@ value → on.
 | `LUMEN_MOE_OVERLAP` | off | Optimization | `lumen_mlx::offload::overlap` |
 | `LUMEN_MOE_PROBE_LAYER_SYNC` | off | Diagnostic | `lumen_mlx::native_moe::imp::moe_layer_sync_probe` |
 | `LUMEN_MOE_TRACE` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace` |
+| `LUMEN_MOE_TRACE_PREDICT` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace_predict` |
 | `LUMEN_MTP_COARSE_HEAD` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_coarse_head` |
 | `LUMEN_MTP_HISTORY` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_history` |
 | `LUMEN_MTP_HOST_TIMING` | off | Diagnostic | `lumen_mlx::qwen3_5_moe::imp::mtp_host_timing` |
@@ -444,6 +445,15 @@ Write a binary trace of the expert pool's layer calls (expert ids in request ord
  per-call timestamps) to the path in this variable, for replaying a workload against other
  eviction policies offline. Any value but `0` is the output path. Never changes the output
  or what is resident; costs one `Option` check per layer call when off.
+
+### `LUMEN_MOE_TRACE_PREDICT`
+
+*Diagnostic, default off.*
+
+With `LUMEN_MOE_TRACE`: also record, before each layer's decode call, the experts that
+ layer's gate ranks highest for the streams before the previous layer's experts: the newest
+ thing a read ahead could know. Only `LUMEN_QWEN4_BUILD_AHEAD` decode steps record it. Adds
+ one mix and one gate per layer per token; never changes the output or what is resident.
 
 ### `LUMEN_MTP_COARSE_HEAD`
 

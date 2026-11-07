@@ -10,7 +10,7 @@
 //! Everything is little endian.
 //!
 //! ```text
-//! header   "LMOETR01"  u32 version(=2)  u64 run_id (unix ns at open)
+//! header   "LMOETR01"  u32 version(=3)  u64 run_id (unix ns at open)
 //!          u64 budget_bytes  u32 n_slots  u32 regions  u32 width  u32 top_k
 //!          u64 expert_bytes  u32 bulk_min_percent  u32 decode_rows
 //!          u32 n_layers  u16 layer[n_layers]            (MoE layers, MTP head included)
@@ -19,6 +19,10 @@
 //!          u8 hit[ceil(n/8)]        bit i set: expert[i] was resident when the call looked
 //!          u64 t_enter  u64 t_eval  u64 t_done      ns since the trace opened (see below)
 //!          [counts]                 only with bit5: u16 total[n]  u16 tail[n]
+//! predicted  u8 tag(=2)  u8 0  u16 layer  u16 n  u16 expert[n]
+//!          what `layer`'s gate ranks highest for the streams before the previous layer's experts
+//!          ran, mixed `layer`'s way, best first,
+//!          just ahead of the call it predicts (`LUMEN_MOE_TRACE_PREDICT`)
 //! flags    bit0 staged   the call took the staging path (pool untouched; hit = resident then)
 //!          bit1 hinted   a layer-major prefill had switched every call to staging
 //!          bit2 prefill  hinted, or more than `decode_rows` rows
@@ -66,12 +70,28 @@ lumen_flags::flag! {
     }
 }
 
+lumen_flags::flag! {
+    /// With `LUMEN_MOE_TRACE`: also record, before each layer's decode call, the experts that
+    /// layer's gate ranks highest for the streams before the previous layer's experts: the newest
+    /// thing a read ahead could know. Only `LUMEN_QWEN4_BUILD_AHEAD` decode steps record it. Adds
+    /// one mix and one gate per layer per token; never changes the output or what is resident.
+    pub(crate) moe_trace_predict {
+        env: "LUMEN_MOE_TRACE_PREDICT",
+        default: false,
+        kind: Diagnostic,
+    }
+}
+
 /// The variable's name, for reading its value after the registry flag said it is set.
 const TRACE_ENV: &str = "LUMEN_MOE_TRACE";
 
 const MAGIC: &[u8; 8] = b"LMOETR01";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const TAG_CALL: u8 = 1;
+const TAG_PREDICTED: u8 = 2;
+/// How many experts a prediction lists: past any read ahead's reach, so one trace answers for
+/// every candidate count.
+pub(crate) const PREDICT_TOP: i32 = 24;
 /// More rows than this is a prefill chunk; fewer is a decode step or a speculative verify.
 pub(crate) const DECODE_ROWS: u32 = 4;
 /// The tail counts cover this many last tokens of a call.
@@ -143,7 +163,7 @@ impl RouteTrace {
         Self::create(PathBuf::from(path), &header()).map(Some)
     }
 
-    fn create(path: PathBuf, header: &Header) -> Result<Self> {
+    pub(super) fn create(path: PathBuf, header: &Header) -> Result<Self> {
         let mut out = File::create(&path)
             .with_context(|| format!("LUMEN_MOE_TRACE: create {}", path.display()))?;
         let mut head = Vec::with_capacity(96 + 2 * header.layers.len());
@@ -186,6 +206,21 @@ impl RouteTrace {
                 broken: false,
             }),
         })
+    }
+
+    /// Append what `layer`'s gate ranks highest, best first, ahead of that layer's call.
+    pub(crate) fn predicted(&self, layer: u16, ids: &[u16]) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if st.broken {
+            return;
+        }
+        let buf = &mut st.buf;
+        buf.extend_from_slice(&[TAG_PREDICTED, 0]);
+        buf.extend_from_slice(&layer.to_le_bytes());
+        buf.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+        for e in ids {
+            buf.extend_from_slice(&e.to_le_bytes());
+        }
     }
 
     /// Append one call. A write error is reported once and silences the recorder: the trace
@@ -334,7 +369,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(&bytes[..8], MAGIC);
-        assert_eq!(u32_at(&bytes, 8), 2, "version");
+        assert_eq!(u32_at(&bytes, 8), VERSION, "version");
         let head_len = 8 + 4 + 8 + 8 + 16 + 8 + 4 + 4 + 4 + 2 * 3;
         assert_eq!(u32_at(&bytes, head_len - 6 - 4), 3, "layer count");
         // A record: 18 bytes of fixed fields, 3 ids, 1 hit byte, 3 timestamps, and for the calls

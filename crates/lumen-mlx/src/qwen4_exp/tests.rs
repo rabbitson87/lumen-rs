@@ -341,6 +341,64 @@ fn building_decode_layers_ahead_gives_the_plain_paths_logits() {
     }
 }
 
+/// `LUMEN_MOE_TRACE_PREDICT` asks every layer's gate about the layer before it. It only looks: the
+/// logits stay the plain path's. Each decode call past the first layer carries a prediction, the
+/// first layer has nothing before it, and the prefill pieces record nothing.
+#[test]
+fn the_trace_predicts_each_later_layer_and_changes_nothing() {
+    use crate::offload::trace::{PREDICT_TOP, moe_trace, moe_trace_predict};
+
+    let dir = fixture_dir();
+    let want = reference(&dir);
+    let ids: Vec<u32> = want["ids"]
+        .as_slice::<i32>()
+        .iter()
+        .map(|&t| t as u32)
+        .collect();
+    let run = |model: &Qwen4ExpModel| -> Vec<f32> {
+        let mut cache = model.make_cache();
+        let mut out = host_f32(&model.forward(&ids[..40], &mut cache, false).unwrap());
+        for t in 40..ids.len() {
+            out.extend(host_f32(
+                &model.forward(&ids[t..t + 1], &mut cache, false).unwrap(),
+            ));
+        }
+        out
+    };
+    let budget = Some(34 * 9_900);
+    let baseline = run(&Qwen4ExpModel::load(&dir, budget).expect("load"));
+
+    let path = std::env::temp_dir().join(format!("lumen-predicted-{}.bin", std::process::id()));
+    // SAFETY: this crate's tests run on one thread, and this variable is only read at open.
+    unsafe { std::env::set_var("LUMEN_MOE_TRACE", &path) };
+    let model = moe_trace::with(true, || Qwen4ExpModel::load(&dir, budget).expect("load"));
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("LUMEN_MOE_TRACE") };
+    let got = moe_trace_predict::with(true, || {
+        super::model::build_ahead::with(true, || run(&model))
+    });
+    drop(model);
+    let (width, calls) = crate::offload::slot_replay::predictions(&path);
+    std::fs::remove_file(&path).unwrap();
+
+    assert!(got == baseline, "the prediction changed the logits");
+    let want_len = (PREDICT_TOP as usize).min(width);
+    let first = calls.iter().map(|c| c.0).min().unwrap();
+    assert!(calls.len() >= 2, "decode calls recorded");
+    for (layer, predicted) in &calls {
+        if *layer == first {
+            assert!(predicted.is_empty(), "nothing comes before layer {layer}");
+            continue;
+        }
+        assert_eq!(predicted.len(), want_len, "layer {layer}");
+        let mut seen = predicted.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), want_len, "distinct experts");
+        assert!(seen.iter().all(|&e| usize::from(e) < width));
+    }
+}
+
 /// Token streams cut into prefill pieces of many sizes: each piece is one layer call of
 /// `rows x 4` index entries, and the sorted gather's kernel depends on that count against the
 /// number of experts in what it gathers over, so a pool of any size must still give the

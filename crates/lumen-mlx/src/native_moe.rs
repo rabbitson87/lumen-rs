@@ -891,6 +891,15 @@ mod imp {
         routing_graph(x, w)
     }
 
+    /// The `n` experts `w`'s gate ranks highest for `x`, best last: `[.., n]`. Any tensor of the
+    /// hidden size will do for `x`, so this can ask a layer's gate about another layer's input.
+    pub fn moe_ranked(x: &Array, w: &MoeBlockWeights<'_>, n: i32) -> Result<Array> {
+        let logits = project_gate(x, &w.gate).context("moe_ranked: gate(x) failed")?;
+        let experts = logits.shape().last().copied().unwrap_or(0);
+        let order = mlx_rs::ops::argsort_axis(&logits, -1).context("moe_ranked: argsort failed")?;
+        Ok(order.index((Ellipsis, (experts - n.min(experts))..)))
+    }
+
     /// The second half of an offloaded layer's MoE block, over the routing handles of
     /// [`crate::offload::MoeOffload::routed_ahead`]: routed experts, shared expert, their sum.
     pub(crate) fn moe_after_routing(
@@ -1051,8 +1060,8 @@ mod imp {
 pub(crate) use imp::{
     AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, OffloadLayer, SharedMlpWeights,
     SwitchExpertWeights, SwitchGluWeights, dense_mlp_forward, gelu_mul_fuse_enabled,
-    gelu_mul_fused, moe_after_routing, moe_block_forward, moe_router, swiglu_fuse_enabled,
-    swiglu_fused, switch_glu,
+    gelu_mul_fused, moe_after_routing, moe_block_forward, moe_ranked, moe_router,
+    swiglu_fuse_enabled, swiglu_fused, switch_glu,
 };
 #[cfg(all(feature = "mlx-native", test))]
 pub(crate) use imp::{expert_entries, rejoin_entries, run_experts, weighted_sum};
