@@ -1150,6 +1150,34 @@ mod tests {
         }
     }
 
+    /// The gate's ranking agrees with the routing it comes from: the same experts on top, in the
+    /// gate's order, however many are asked for.
+    #[test]
+    fn the_gates_ranking_ends_in_the_routed_experts() {
+        use crate::native_moe::{moe_ranked, moe_router};
+
+        let layer = Layer::build(2048, 512, 256).expect("layer");
+        let w = layer.view(true, true);
+        for seed in 0..4u64 {
+            let x = layer.activation(700 + seed).expect("x");
+            let (inds, _) = moe_router(&x, &w).expect("router");
+            let inds = inds.as_dtype(Dtype::Int32).unwrap();
+            inds.eval().unwrap();
+            let mut routed = inds.as_slice::<i32>().to_vec();
+            routed.sort_unstable();
+
+            let wide = moe_ranked(&x, &w, TOP_K + 12)
+                .unwrap()
+                .as_dtype(Dtype::Int32)
+                .unwrap();
+            wide.eval().unwrap();
+            assert_eq!(wide.size(), (TOP_K + 12) as usize);
+            let mut top = wide.as_slice::<i32>()[12..].to_vec();
+            top.sort_unstable();
+            assert_eq!(top, routed, "seed {seed}");
+        }
+    }
+
     /// The kernel's routed activations are the composed SwiGLU's, every one of them: the matvec
     /// follows MLX's lane partition and add order, the activation is rounded to bf16 and summed
     /// four at a time in bf16 as `load_vector` does, and the SwiGLU rounds op by op.

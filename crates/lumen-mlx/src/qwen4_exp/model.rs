@@ -22,12 +22,14 @@ use crate::native_cache::NativeKvCache;
 use crate::native_embedding::quantized_embedding_lookup_with_mode;
 use crate::native_moe::{
     AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, OffloadLayer, SharedMlpWeights,
-    SwitchExpertWeights, SwitchGluWeights, moe_after_routing, moe_block_forward, moe_router,
+    SwitchExpertWeights, SwitchGluWeights, moe_after_routing, moe_block_forward, moe_ranked,
+    moe_router,
 };
 use crate::native_quant::MODE_AFFINE;
 use crate::native_rope::rope;
 use crate::native_ssm::{compute_g, gated_delta_step_kernel};
 use crate::offload::lowbit::LowbitSpec;
+use crate::offload::trace::PREDICT_TOP;
 use crate::offload::{IoMode, IoTuning, MoeOffload};
 use crate::qwen3_5_moe::{NativeWeights, ResolvedLinear};
 
@@ -2443,8 +2445,10 @@ impl Qwen4ExpModel {
                 moe_router(&front.x, &view).with_context(|| format!("layer {i}"))?;
             let k = inds.shape().last().copied().unwrap_or(1).max(1) as usize;
             let flat = mlx_rs::ops::reshape(&inds, &[-1])?;
-            mlx_rs::transforms::async_eval([&flat])
-                .with_context(|| format!("layer {i}: submit"))?;
+            let predicted = self.next_layer_ranked(off, i, &front.h_mid)?;
+            let mut submit = vec![&flat];
+            submit.extend(predicted.iter().map(|(_, ranked)| ranked));
+            mlx_rs::transforms::async_eval(submit).with_context(|| format!("layer {i}: submit"))?;
             let (routed, slots) = off.routed_ahead(layer.moe.layer, inds.shape())?;
             let moe_out = moe_after_routing(&front.x, &view, &routed, &scores)
                 .with_context(|| format!("layer {i}: moe block"))?;
@@ -2456,12 +2460,35 @@ impl Qwen4ExpModel {
             };
             off.route_ahead(layer.moe.layer, &flat, k, &slots)
                 .with_context(|| format!("layer {i}: expert offload routing failed"))?;
+            if let Some((next_layer, ranked)) = &predicted {
+                off.trace_prediction(*next_layer, ranked)?;
+            }
             match next {
                 Some(f) => front = f,
                 None => break,
             }
         }
         Ok(h)
+    }
+
+    /// For the routing trace: layer `i + 1`'s gate on the streams after layer `i`'s mixer, mixed the
+    /// way layer `i + 1` mixes its MoE input, flattened, with the experts it ranks highest last
+    /// (see [`moe_ranked`]). The newest thing that exists before layer `i`'s experts do.
+    fn next_layer_ranked(
+        &self,
+        off: &MoeOffload,
+        i: usize,
+        h_mid: &Array,
+    ) -> Result<Option<(u16, Array)>> {
+        let Some(next) = self.layers.get(i + 1).filter(|_| off.traces_predictions()) else {
+            return Ok(None);
+        };
+        let (x, _) = self.hyper_mix(&next.mlp_hc, h_mid)?;
+        let ranked = moe_ranked(&x, &self.expert_view(&next.moe), PREDICT_TOP)?;
+        Ok(Some((
+            next.moe.layer,
+            mlx_rs::ops::reshape(&ranked, &[-1])?,
+        )))
     }
 
     /// Layer `i`'s front half on the streams `h`, with its n-gram injection first when it has one.
