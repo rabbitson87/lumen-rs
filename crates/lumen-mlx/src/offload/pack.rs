@@ -166,7 +166,8 @@ pub(crate) fn open_pack(dir: &Path, source: &ExpertStore) -> Result<Option<Exper
     }
 }
 
-fn read_header(file: &File, path: &Path, source: &ExpertStore) -> Result<ExpertStore> {
+/// A pack file's header, and the store its records describe, checked only against itself.
+fn read_pack(file: &File, path: &Path) -> Result<(Value, ExpertStore)> {
     let mut prefix = [0u8; 16];
     file.read_exact_at(&mut prefix, 0)
         .context("too short to hold a header")?;
@@ -181,11 +182,6 @@ fn read_header(file: &File, path: &Path, source: &ExpertStore) -> Result<ExpertS
     file.read_exact_at(&mut json, 16)
         .context("truncated header")?;
     let v: Value = serde_json::from_slice(&json).context("header is not JSON")?;
-    let want = fingerprint(source)?;
-    let got = v["fingerprint"].as_str().unwrap_or_default();
-    if got != want {
-        bail!("it was made for other weights (fingerprint {got}, these are {want})");
-    }
     let stride = v["stride"].as_u64().ok_or_else(|| anyhow!("no stride"))? as usize;
     let data_start = v["data_start"]
         .as_u64()
@@ -238,9 +234,23 @@ fn read_header(file: &File, path: &Path, source: &ExpertStore) -> Result<ExpertS
             "it is {actual_len} bytes, its header promises {expected_len} (an interrupted build?)"
         );
     }
+    let store = ExpertStore {
+        files: vec![path.to_path_buf()],
+        layers: out_layers,
+    };
+    Ok((v, store))
+}
+
+fn read_header(file: &File, path: &Path, source: &ExpertStore) -> Result<ExpertStore> {
+    let (v, store) = read_pack(file, path)?;
+    let want = fingerprint(source)?;
+    let got = v["fingerprint"].as_str().unwrap_or_default();
+    if got != want {
+        bail!("it was made for other weights (fingerprint {got}, these are {want})");
+    }
     // The pack must describe exactly what the shards do, role by role.
     for (layer, l) in &source.layers {
-        let Some(p) = out_layers.get(layer) else {
+        let Some(p) = store.layers.get(layer) else {
             bail!("layer {layer} is missing");
         };
         if p.n_experts != l.n_experts
@@ -254,26 +264,65 @@ fn read_header(file: &File, path: &Path, source: &ExpertStore) -> Result<ExpertS
             bail!("layer {layer} differs from the shards");
         }
     }
-    Ok(ExpertStore {
-        files: vec![path.to_path_buf()],
-        layers: out_layers,
-    })
+    Ok(store)
 }
 
-/// Build `dir`'s pack from `source` (the shards' own ranges). `progress(done, total)` is called
-/// after every layer. Writes `experts.lpack.tmp` and renames it, so a stopped build leaves no
-/// pack that looks complete.
-pub(crate) fn build(
-    dir: &Path,
+/// Where one role's bytes sit inside a record.
+struct RoleSlot {
+    name: String,
+    at: usize,
+    bytes: usize,
+    dtype: String,
+    tail_shape: Vec<i64>,
+}
+
+impl RoleSlot {
+    /// Roles back to back, in the order given.
+    fn lay_out(roles: impl IntoIterator<Item = (String, usize, String, Vec<i64>)>) -> Vec<Self> {
+        let mut at = 0usize;
+        roles
+            .into_iter()
+            .map(|(name, bytes, dtype, tail_shape)| {
+                let slot = Self {
+                    name,
+                    at,
+                    bytes,
+                    dtype,
+                    tail_shape,
+                };
+                at += bytes;
+                slot
+            })
+            .collect()
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "at": self.at,
+            "bytes": self.bytes,
+            "dtype": self.dtype,
+            "tail_shape": self.tail_shape,
+        })
+    }
+}
+
+/// Write a pack of `source`'s experts to `dest`. `slots` lay a record out, `head` is the header's
+/// own fields, and `fill(tensors, expert, record)` writes an expert's record from its layer's
+/// whole tensors (in `LayerRanges::roles` order). Goes through `<dest>.tmp` and a rename, so a
+/// stopped build leaves no pack that looks complete.
+fn write_pack(
+    dest: &Path,
     source: &ExpertStore,
+    slots: &[RoleSlot],
+    mut head: serde_json::Map<String, Value>,
+    fill: impl Fn(&[Vec<u8>], usize, &mut [u8]) -> Result<()> + Sync,
     mut progress: impl FnMut(usize, usize),
-) -> Result<PathBuf> {
-    let first = source
-        .layers
-        .values()
-        .next()
-        .ok_or_else(|| anyhow!("pack: the checkpoint has no routed experts"))?;
-    let record = record_bytes(source);
+) -> Result<()> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| anyhow!("pack: {} has no directory", dest.display()))?;
+    let record = slots.iter().map(|r| r.bytes).sum::<usize>();
     let stride = stride_for(record);
     let n_records: u64 = source.layers.values().map(|l| l.n_experts as u64).sum();
     let total = HEADER_RESERVE as u64 + n_records * stride as u64;
@@ -286,40 +335,21 @@ pub(crate) fn build(
             free as f64 / 1e9
         );
     }
-    // Where each role sits inside a record.
-    let mut at = 0usize;
-    let mut role_layout = Vec::new();
-    for (name, r) in &first.roles {
-        role_layout.push((
-            name.clone(),
-            at,
-            r.bytes,
-            r.dtype.clone(),
-            r.tail_shape.clone(),
-        ));
-        at += r.bytes;
-    }
-    let layout_json: Vec<Value> = role_layout
-        .iter()
-        .map(|(name, at, bytes, dtype, tail)| {
-            json!({"name": name, "at": at, "bytes": bytes, "dtype": dtype, "tail_shape": tail})
-        })
-        .collect();
     let mut layer_json = Vec::new();
     let mut next_record = 0u64;
     for (layer, l) in &source.layers {
         layer_json.push(json!({"layer": layer, "n_experts": l.n_experts, "first": next_record}));
         next_record += l.n_experts as u64;
     }
-    let header = json!({
-        "version": 1,
-        "fingerprint": fingerprint(source)?,
-        "stride": stride,
-        "data_start": HEADER_RESERVE,
-        "roles": layout_json,
-        "layers": layer_json,
-    })
-    .to_string();
+    head.insert("version".into(), json!(1));
+    head.insert("stride".into(), json!(stride));
+    head.insert("data_start".into(), json!(HEADER_RESERVE));
+    head.insert(
+        "roles".into(),
+        slots.iter().map(RoleSlot::to_json).collect(),
+    );
+    head.insert("layers".into(), Value::Array(layer_json));
+    let header = Value::Object(head).to_string();
     if header.len() > HEADER_RESERVE - 16 {
         bail!(
             "pack: the header ({} bytes) does not fit its reserve",
@@ -327,7 +357,11 @@ pub(crate) fn build(
         );
     }
 
-    let tmp = dir.join(format!("{PACK_FILE}.tmp"));
+    let name = dest
+        .file_name()
+        .ok_or_else(|| anyhow!("pack: {} has no file name", dest.display()))?
+        .to_string_lossy();
+    let tmp = dir.join(format!("{name}.tmp"));
     let out = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -351,10 +385,10 @@ pub(crate) fn build(
     for (done, (layer, l)) in source.layers.iter().enumerate() {
         // One tensor per role, read whole and in parallel (they are contiguous in the shard).
         let bufs: Vec<Vec<u8>> = std::thread::scope(|s| {
-            let handles: Vec<_> = role_layout
-                .iter()
-                .map(|(name, ..)| {
-                    let r = &l.roles[name];
+            let handles: Vec<_> = l
+                .roles
+                .values()
+                .map(|r| {
                     let file = &sources[r.file];
                     s.spawn(move || -> Result<Vec<u8>> {
                         let mut buf = vec![0u8; r.bytes * l.n_experts];
@@ -369,24 +403,29 @@ pub(crate) fn build(
                 .map(|h| h.join().map_err(|_| anyhow!("pack: a reader panicked"))?)
                 .collect::<Result<Vec<_>>>()
         })?;
-        // Interleave them into records.
+        // Build the records.
         let mut records = vec![0u8; l.n_experts * stride];
         let workers = 8usize.min(l.n_experts).max(1);
         let per = l.n_experts.div_ceil(workers);
         std::thread::scope(|s| {
-            for (w, chunk) in records.chunks_mut(per * stride).enumerate() {
-                let (bufs, layout) = (&bufs, &role_layout);
-                s.spawn(move || {
-                    for (i, rec) in chunk.chunks_mut(stride).enumerate() {
-                        let e = w * per + i;
-                        for (ri, (_, at, bytes, ..)) in layout.iter().enumerate() {
-                            rec[*at..*at + *bytes]
-                                .copy_from_slice(&bufs[ri][e * bytes..(e + 1) * bytes]);
+            let handles: Vec<_> = records
+                .chunks_mut(per * stride)
+                .enumerate()
+                .map(|(w, chunk)| {
+                    let (bufs, fill) = (&bufs, &fill);
+                    s.spawn(move || -> Result<()> {
+                        for (i, rec) in chunk.chunks_mut(stride).enumerate() {
+                            fill(bufs, w * per + i, rec)?;
                         }
-                    }
-                });
-            }
-        });
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .try_for_each(|h| h.join().map_err(|_| anyhow!("pack: a worker panicked"))?)
+        })
+        .with_context(|| format!("pack: layer {layer}"))?;
         drop(bufs);
         out.write_all_at(
             &records,
@@ -397,15 +436,55 @@ pub(crate) fn build(
         progress(done + 1, total_layers);
     }
 
-    let mut head = Vec::with_capacity(16 + header.len());
-    head.extend_from_slice(MAGIC);
-    head.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    head.extend_from_slice(header.as_bytes());
-    out.write_all_at(&head, 0)?;
+    let mut bytes = Vec::with_capacity(16 + header.len());
+    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    out.write_all_at(&bytes, 0)?;
     out.sync_all()?;
     drop(out);
+    std::fs::rename(&tmp, dest).with_context(|| format!("pack: move {} into place", tmp.display()))
+}
+
+/// Build `dir`'s pack from `source` (the shards' own ranges). `progress(done, total)` is called
+/// after every layer.
+pub(crate) fn build(
+    dir: &Path,
+    source: &ExpertStore,
+    progress: impl FnMut(usize, usize),
+) -> Result<PathBuf> {
+    let first = source
+        .layers
+        .values()
+        .next()
+        .ok_or_else(|| anyhow!("pack: the checkpoint has no routed experts"))?;
+    debug_assert_eq!(
+        first.roles.values().map(|r| r.bytes).sum::<usize>(),
+        record_bytes(source)
+    );
+    let slots = RoleSlot::lay_out(
+        first
+            .roles
+            .iter()
+            .map(|(k, r)| (k.clone(), r.bytes, r.dtype.clone(), r.tail_shape.clone())),
+    );
+    let mut head = serde_json::Map::new();
+    head.insert("fingerprint".into(), json!(fingerprint(source)?));
     let dest = pack_path(dir);
-    std::fs::rename(&tmp, &dest)
-        .with_context(|| format!("pack: move {} into place", tmp.display()))?;
+    write_pack(
+        &dest,
+        source,
+        &slots,
+        head,
+        |tensors, e, rec| {
+            // The roles' bytes unchanged: `tensors` and `slots` are both in role order.
+            for (buf, slot) in tensors.iter().zip(&slots) {
+                rec[slot.at..slot.at + slot.bytes]
+                    .copy_from_slice(&buf[e * slot.bytes..(e + 1) * slot.bytes]);
+            }
+            Ok(())
+        },
+        progress,
+    )?;
     Ok(dest)
 }
