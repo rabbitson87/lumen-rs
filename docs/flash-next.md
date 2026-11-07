@@ -381,6 +381,7 @@ named all three, in 14 s for a 334-token prompt, and again with an 11K-character
 | `LUMEN_MOE_IO_MODE` | `auto` | `direct` bypasses the page cache for expert reads, `buffered` uses it, `auto` uses it while the machine has more than 12 GB of memory to spare. |
 | `LUMEN_MOE_IO_LANES` | 32 | Reader threads (1–64). |
 | `LUMEN_MOE_PACK` | `auto` | The contiguous expert pack: `auto` uses `experts.lpack` when it is next to the weights, `off` never does, `build` makes it first. See below. |
+| `LUMEN_QWEN4_EXPERT_COPY` | off | Serve the experts from a low-bit copy, such as `3,64,lsq`. Faster at the same memory; replies differ from the checkpoint's. See the last section. |
 | `LUMEN_QWEN4_MTP` | `off` | The draft head for speculative decoding: `off`, `auto` (use it when installed, with a speed governor) or `on` (the same, but refuses to start without the head). See below. |
 | `LUMEN_QWEN4_MTP_FLOOR` | 0.4 | Share of drafts a conversation must keep getting accepted to keep speculating. |
 
@@ -415,6 +416,9 @@ and writes `mtp.safetensors` and `mtp.json` into the model directory. The server
   The mean is −1.1% and the best case +4%. For code the governor stayed on and each round cost 1.8–2.0
   plain steps for 1.9 tokens, which is break-even; for prose the draft was accepted too rarely, so the
   governor mostly stayed off and its calibration and probe passes cost 1–2.5%.
+- On a low-bit copy of the experts it pays: reads are the part drafting cannot save, and a copy has fewer
+  of them. At a 6.7 GB pool the head adds 4% on the checkpoint, 13% on a 3-bit copy and 16% on a 2-bit
+  one (see the last section).
 - A governor measures milliseconds per token with and without drafts, on this machine with this text,
   and speculates only while that is clearly faster (it switches on below 0.95 of the plain time and
   off above 1.02); it looks at the other mode every few hundred tokens. Machines whose reads are
@@ -443,3 +447,44 @@ Measured on a 36 GB M3 Max (median of three 300-token runs, direct reads, tokens
 identical): 6.7 GB pool 6.69 → 7.15, 10 GB 8.06 → 8.96, 15 GB 10.39 → 11.15, 19.8 GB 11.96 → 12.95. A pack made for other
 weights, or one cut short by an interrupted copy, is ignored and the shards are read as before.
 Delete `experts.lpack` to get the disk back.
+
+## A low-bit copy of the experts
+
+The pool holds more experts when each one is smaller, so fewer are read from the SSD. A copy refits every
+routed expert, and the draft head's, at fewer bits by least squares. **It is a different model, so it is off
+unless you ask for it:** replies differ from the checkpoint's.
+
+```sh
+cargo run --release -p lumen-mlx --features mlx-native --example qwen4_exp_lowbit_pack -- \
+    ~/.slotstream/models/qwen38-flash-next-gs64 --bits 3 --group 64 --recipe lsq
+LUMEN_QWEN4_EXPERT_COPY=3,64,lsq LUMEN_QWEN4_MTP=auto lumen-server
+```
+
+The copy goes next to the weights as `experts.3b64.lsq.lpack` (54 GB, about 4 minutes; 39 GB at 2 bits). The
+memory plan reads the copy's size, and persisted state is kept apart from the checkpoint's. A copy built
+before the head could be copied holds no head, so drafts stay off on it. Delete the file to get the disk back.
+
+Measured on a 36 GB M3 Max with other work running (load 2–8). Tokens/s are warm rounds of three prompts,
+160 tokens each, direct reads; agreement is how often the copy picks the checkpoint's token at the same
+history, over 7,040 positions of the checkpoint's own replies. Two rows of the checkpoint against one agree
+99.75%, which is the ceiling of that measure.
+
+| | Agrees | Long prompts (6–9K) | 6.7 GB pool | + draft head | 15 GB pool | + draft head |
+|---|---:|---:|---:|---:|---:|---:|
+| Checkpoint, 4 bits | 100% | 100% | 7.2 | 7.6 | 8.4–9.2 | 9.7 |
+| 3 bits | 95.81% | 93.00% | 8.9 | 10.0 | 12.7 | 13.7 |
+| 2 bits | 89.49% | 83.67% | 11.7 | 13.5 | 16.2 | 17.2 |
+
+The checkpoint's 15 GB runs were unusually slow here (6.8–10.1, against 11.2 on a quiet machine), so read that
+column's ratios with care. The 6.7 GB runs agreed within 3%.
+
+- **3 bits holds up on tasks.** Over 80 GSM8K problems it got 78 right against the checkpoint's 77, and over 54
+  rounds of tool use it made 1 syntax and 3 schema errors in 61 calls against 0 and 4 in 71. All of the
+  differences in agreement are near-ties: where the checkpoint's top token led by 2 logits or more, the copy
+  never picked another.
+- **2 bits does not.** It picks another token at 10.5% of positions, some of them confident ones, and it was
+  not put through the task checks.
+- **Inside one long text a copy can drift.** Fed a long document as raw text, a 3-bit copy followed the
+  checkpoint on seven documents and left it on one: the error sits in the recurrent state of the linear
+  attention layers and stays there to the end of the text. The next user turn cleared it in the one case tried,
+  and the reply agreed as usual (93%). A very long single reply has not been measured.
