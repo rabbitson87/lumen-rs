@@ -4222,9 +4222,9 @@ pub(crate) mod imp {
                 }
             });
             std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
-            random::seed(23).unwrap();
+            crate::test_support::seed(23);
             let dense = |shape: &[i32], scale: f32| {
-                random::normal::<f32>(shape, None, Some(scale), None)
+                random::normal::<f32>(shape, None, Some(scale), &crate::test_support::key())
                     .unwrap()
                     .as_dtype(Dtype::Bfloat16)
                     .unwrap()

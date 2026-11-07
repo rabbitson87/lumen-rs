@@ -42,17 +42,22 @@ type Roles = BTreeMap<String, Array>;
 
 /// One layer's `EXPERTS` experts, stacked like the checkpoint stores them.
 fn build_layer() -> Roles {
-    random::seed(7).expect("seed");
+    crate::test_support::seed(7);
     let mut roles = Roles::new();
     for (proj, out, inp) in [
         ("gate_proj", INTER, HIDDEN),
         ("up_proj", INTER, HIDDEN),
         ("down_proj", HIDDEN, INTER),
     ] {
-        let w = random::normal::<f32>(&[EXPERTS as i32, out, inp], None, None, None)
-            .expect("normal")
-            .as_dtype(Dtype::Bfloat16)
-            .expect("bf16");
+        let w = random::normal::<f32>(
+            &[EXPERTS as i32, out, inp],
+            None,
+            None,
+            &crate::test_support::key(),
+        )
+        .expect("normal")
+        .as_dtype(Dtype::Bfloat16)
+        .expect("bf16");
         let (wq, sc, bi) = quantize_with_mode(&w, GROUP, 4, MODE_AFFINE).expect("quantize");
         roles.insert(format!("{proj}.weight"), wq);
         roles.insert(format!("{proj}.scales"), sc);
@@ -199,10 +204,15 @@ fn gap(a: &[f32], b: &[f32]) -> (usize, f32) {
 }
 
 fn activations(rows: usize) -> Array {
-    random::normal::<f32>(&[1, rows as i32, HIDDEN], None, None, None)
-        .expect("x")
-        .as_dtype(Dtype::Bfloat16)
-        .expect("bf16")
+    random::normal::<f32>(
+        &[1, rows as i32, HIDDEN],
+        None,
+        None,
+        &crate::test_support::key(),
+    )
+    .expect("x")
+    .as_dtype(Dtype::Bfloat16)
+    .expect("bf16")
 }
 
 /// A random placement of the layer's experts into distinct slots of `0..n_slots`.
@@ -356,10 +366,15 @@ fn a_call_split_into_resident_and_missing_entries_gives_the_whole_calls_bits() {
             let (distinct, index_of) = distinct_in_order(&ids).expect("distinct");
             let slots: Vec<usize> = distinct.iter().map(|&e| placement[e as usize]).collect();
             for (dtype, in_scale_dtype) in [(Dtype::Float32, true), (Dtype::Bfloat16, false)] {
-                let x = random::normal::<f32>(&[1, rows as i32, HIDDEN], None, None, None)
-                    .expect("x")
-                    .as_dtype(dtype)
-                    .expect("dtype");
+                let x = random::normal::<f32>(
+                    &[1, rows as i32, HIDDEN],
+                    None,
+                    None,
+                    &crate::test_support::key(),
+                )
+                .expect("x")
+                .as_dtype(dtype)
+                .expect("dtype");
                 let whole_y = run_experts(&x, &inds, &glu, in_scale_dtype).expect("whole");
                 let whole_sum = weighted_sum(&whole_y, &scores).expect("sum");
                 let (want_y, want_sum) = (bits(&whole_y), bits(&whole_sum));

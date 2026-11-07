@@ -304,10 +304,15 @@ mod tests {
         const IN: i32 = 256;
         for (mode, group_size, has_biases) in [(MODE_MXFP4, 32, false), (MODE_AFFINE, 64, true)] {
             // Random bf16 weights for E experts, quantized as a stack.
-            let w = random::normal::<f32>(&[E as i32, OUT, IN], None, None, None)
-                .expect("normal")
-                .as_dtype(Dtype::Bfloat16)
-                .expect("bf16");
+            let w = random::normal::<f32>(
+                &[E as i32, OUT, IN],
+                None,
+                None,
+                &crate::test_support::key(),
+            )
+            .expect("normal")
+            .as_dtype(Dtype::Bfloat16)
+            .expect("bf16");
             let (wq, sc, bi) = quantize_with_mode(&w, group_size, 4, mode).expect("quantize");
             assert_eq!(bi.is_some(), has_biases, "{mode:?} bias presence");
 
@@ -317,10 +322,11 @@ mod tests {
             let p_s = pool_like(&sc, E, slot_of);
             let p_b = bi.as_ref().map(|b| pool_like(b, E, slot_of));
 
-            let x = random::normal::<f32>(&[1, 1, 1, 1, IN], None, None, None)
-                .expect("normal")
-                .as_dtype(Dtype::Bfloat16)
-                .expect("bf16");
+            let x =
+                random::normal::<f32>(&[1, 1, 1, 1, IN], None, None, &crate::test_support::key())
+                    .expect("normal")
+                    .as_dtype(Dtype::Bfloat16)
+                    .expect("bf16");
             let wanted: [u32; 2] = [5, 2];
             let by_expert = Array::from_slice(&wanted, &[1, 1, 2]);
             let by_slot =

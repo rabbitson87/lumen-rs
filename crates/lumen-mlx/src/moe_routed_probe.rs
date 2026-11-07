@@ -38,7 +38,7 @@ pub(crate) struct Quant {
 }
 
 fn quant(shape: &[i32], bits: i32) -> Result<Quant> {
-    let w = random::normal::<f32>(shape, None, None, None)?;
+    let w = random::normal::<f32>(shape, None, None, &crate::test_support::key())?;
     let w = mlx_rs::ops::multiply(&w, Array::from_f32(0.02))?.as_dtype(Dtype::Bfloat16)?;
     let (w, s, b) = quantize_with_mode(&w, GROUP, bits, MODE_AFFINE)?;
     let b = b.context("affine quantize returned no biases")?;
@@ -90,7 +90,7 @@ pub(crate) struct Layer {
 
 impl Layer {
     pub(crate) fn build(hidden: i32, inter: i32, experts: i32) -> Result<Self> {
-        random::seed(11)?;
+        crate::test_support::seed(11);
         let sw_gate = quant(&[experts, inter, hidden], 4)?;
         let sw_up = quant(&[experts, inter, hidden], 4)?;
         let gate_up = Quant {
@@ -188,8 +188,13 @@ impl Layer {
 
     /// A unit-RMS `[1, 1, hidden]` f32 activation.
     pub(crate) fn activation(&self, seed: u64) -> Result<Array> {
-        random::seed(seed)?;
-        let x = random::normal::<f32>(&[1, 1, self.hidden], None, None, None)?;
+        crate::test_support::seed(seed);
+        let x = random::normal::<f32>(
+            &[1, 1, self.hidden],
+            None,
+            None,
+            &crate::test_support::key(),
+        )?;
         let x = rms_norm(&x, &Array::ones::<f32>(&[self.hidden])?, 1e-6)?;
         x.eval()?;
         Ok(x)
@@ -370,7 +375,13 @@ fn decode_kernels_against_composed_block() {
     // activation (so the two can be told apart without a dependency between them).
     let x32 = mlx_rs::ops::reshape(&x0, &[2048]).expect("reshape");
     let act_fixed = {
-        let a = random::normal::<f32>(&[(TOP_K + 1) * 512], None, None, None).expect("act");
+        let a = random::normal::<f32>(
+            &[(TOP_K + 1) * 512],
+            None,
+            None,
+            &crate::test_support::key(),
+        )
+        .expect("act");
         a.eval().expect("eval");
         a
     };

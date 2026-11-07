@@ -1,7 +1,31 @@
 //! Helpers the GPU test modules share: seeded bf16 inputs and the agreement
 //! metric the attention parity tests report.
 
+use std::cell::RefCell;
+
+use mlx_rs::random::RandomState;
 use mlx_rs::{Array, Dtype, random};
+
+thread_local! {
+    /// This test's key sequence. The sequence `random::seed` and a keyless `random::normal` use
+    /// is process-wide, and keeps its state as a lazy array on the stream of the thread that
+    /// used it last. Every test runs on its own thread, so the next test to draw from it
+    /// evaluates a graph on a stream that thread does not have: "There is no Stream(gpu, N) in
+    /// current thread". Sequential runs got away with it only when the new thread recycled the
+    /// id of the thread MLX took for its main thread, which timing decides.
+    static KEYS: RefCell<RandomState> =
+        RefCell::new(RandomState::with_seed(0).expect("a key from a seed"));
+}
+
+/// Start this test's key sequence over from `seed`.
+pub(crate) fn seed(seed: u64) {
+    KEYS.set(RandomState::with_seed(seed).expect("a key from a seed"));
+}
+
+/// The next key of this test's sequence: what `random::seed(n)` and keyless draws would give.
+pub(crate) fn key() -> Array {
+    KEYS.with_borrow_mut(|keys| keys.next_key().expect("the next key"))
+}
 
 /// Standard-normal samples drawn in f32 from `random::key(seed)`, stored as
 /// bf16 — the activation dtype the models run in.

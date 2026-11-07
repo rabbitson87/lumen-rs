@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use mlx_rs::ops::sum_axis;
-use mlx_rs::random::uniform;
+use mlx_rs::random;
 use mlx_rs::transforms::eval;
 
 /// Bytes the probe reads per pass.
@@ -73,7 +73,10 @@ fn median(samples: &mut [f64]) -> f64 {
 /// Measure the GPU's read bandwidth. Takes about a second and 1 GiB of memory.
 pub fn measure_memory_bandwidth() -> Result<MemoryBandwidth> {
     let elements = (PROBE_BYTES / std::mem::size_of::<f32>()) as i32;
-    let data = uniform::<_, f32>(0.0f32, 1.0f32, &[elements], None).context("fill the probe")?;
+    // Any values will do. A key of its own keeps this off the process-wide key sequence.
+    let key = random::key(0).context("fill the probe")?;
+    let data =
+        random::uniform::<_, f32>(0.0f32, 1.0f32, &[elements], &key).context("fill the probe")?;
     eval([&data]).context("fill the probe")?;
 
     let mut seconds = Vec::with_capacity(TIMED_PASSES);

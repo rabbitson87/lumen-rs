@@ -1793,7 +1793,7 @@ mod qjl_correctness_tests {
     fn probe_matmul_mixed_dtype_bf16_x_f32() {
         let d = 256usize;
         // bf16 input vector
-        let x_bf16 = random::normal::<f32>(&[1, d as i32], None, None, None)
+        let x_bf16 = random::normal::<f32>(&[1, d as i32], None, None, &crate::test_support::key())
             .unwrap()
             .as_dtype(Dtype::Bfloat16)
             .unwrap();
