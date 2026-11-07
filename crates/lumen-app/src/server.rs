@@ -264,7 +264,7 @@ mod parse_tests {
 
 #[cfg(test)]
 mod resolve_tests {
-    use super::prefer_release_over_dev_debug;
+    use super::{prefer_release_over_dev_debug, use_debug_server};
     use std::path::PathBuf;
 
     fn tmpdir(name: &str) -> PathBuf {
@@ -283,7 +283,7 @@ mod resolve_tests {
         std::fs::create_dir_all(&release).unwrap();
         std::fs::write(debug.join("lumen-server"), b"").unwrap();
         std::fs::write(release.join("lumen-server"), b"").unwrap();
-        let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"));
+        let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"), false);
         assert_eq!(
             chosen.as_deref(),
             Some(release.join("lumen-server").as_path())
@@ -296,7 +296,7 @@ mod resolve_tests {
         let debug = root.join("target").join("debug");
         std::fs::create_dir_all(&debug).unwrap();
         std::fs::write(debug.join("lumen-server"), b"").unwrap();
-        let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"));
+        let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"), false);
         assert!(
             chosen.is_none(),
             "no release available -> return None so caller keeps debug"
@@ -310,25 +310,31 @@ mod resolve_tests {
         let resources = root.join("Contents").join("Resources");
         std::fs::create_dir_all(&resources).unwrap();
         std::fs::write(resources.join("lumen-server"), b"").unwrap();
-        let chosen = prefer_release_over_dev_debug(&resources.join("lumen-server"));
+        let chosen = prefer_release_over_dev_debug(&resources.join("lumen-server"), false);
         assert!(chosen.is_none());
     }
 
     #[test]
-    fn respect_lumen_use_debug_server_env() {
-        let root = tmpdir("env-opt-out");
+    fn explicit_opt_out_keeps_debug() {
+        let root = tmpdir("opt-out");
         let debug = root.join("target").join("debug");
         let release = root.join("target").join("release");
         std::fs::create_dir_all(&debug).unwrap();
         std::fs::create_dir_all(&release).unwrap();
         std::fs::write(debug.join("lumen-server"), b"").unwrap();
         std::fs::write(release.join("lumen-server"), b"").unwrap();
-        // Safety: scoped to this test thread; tests in this module run
-        // sequentially under cargo's default config.
-        unsafe { std::env::set_var("LUMEN_USE_DEBUG_SERVER", "1") };
-        let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"));
-        unsafe { std::env::remove_var("LUMEN_USE_DEBUG_SERVER") };
+        let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"), true);
         assert!(chosen.is_none(), "explicit opt-out must short-circuit");
+    }
+
+    #[test]
+    fn lumen_use_debug_server_is_one_or_true() {
+        for on in ["1", "true", "TRUE"] {
+            assert!(use_debug_server(Some(on)), "{on}");
+        }
+        for off in [None, Some(""), Some("0"), Some("yes")] {
+            assert!(!use_debug_server(off), "{off:?}");
+        }
     }
 }
 
@@ -1598,7 +1604,9 @@ fn resolve_binary(explicit: Option<&Path>) -> Result<PathBuf> {
                 // sidecar — fast iteration but 5-10× slower than release
                 // (LTO + opt-level=3). Surface release silently if the
                 // dev'r has built one, unless explicitly opted out.
-                if let Some(release) = prefer_release_over_dev_debug(&sibling) {
+                let use_debug =
+                    use_debug_server(std::env::var("LUMEN_USE_DEBUG_SERVER").ok().as_deref());
+                if let Some(release) = prefer_release_over_dev_debug(&sibling, use_debug) {
                     return Ok(release);
                 }
                 return Ok(sibling);
@@ -1637,18 +1645,19 @@ fn resolve_binary(explicit: Option<&Path>) -> Result<PathBuf> {
     )
 }
 
+/// Whether a `LUMEN_USE_DEBUG_SERVER` value asks to keep the debug server, for
+/// the rare developer who wants symbols + assertions live.
+fn use_debug_server(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// If `sibling` is `<…>/target/debug/lumen-server` AND its sibling
 /// `<…>/target/release/lumen-server` exists, return the release path.
 /// Returns `None` otherwise — i.e. when the sibling lives in a real
-/// bundle (`.app/Contents/Resources/`), a user-customized dir, or
-/// when no release build is available. Honors `LUMEN_USE_DEBUG_SERVER=1`
-/// for the rare developer who wants symbols + assertions live.
-fn prefer_release_over_dev_debug(sibling: &Path) -> Option<PathBuf> {
-    if std::env::var("LUMEN_USE_DEBUG_SERVER")
-        .ok()
-        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .is_some()
-    {
+/// bundle (`.app/Contents/Resources/`), a user-customized dir, when no
+/// release build is available, or when `use_debug` says to keep debug.
+fn prefer_release_over_dev_debug(sibling: &Path, use_debug: bool) -> Option<PathBuf> {
+    if use_debug {
         return None;
     }
     let parent = sibling.parent()?;
