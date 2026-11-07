@@ -1471,7 +1471,12 @@ mod overlap_tests {
             let picked = mlx_rs::ops::indexing::take_axis(w, &part.slot_inds, 0)?
                 .as_dtype(mlx_rs::Dtype::Float32)?
                 .sum(None)?;
-            let m = mlx_rs::random::normal::<f32>(&[2048, 2048], None, None, None)?;
+            let m = mlx_rs::random::normal::<f32>(
+                &[2048, 2048],
+                None,
+                None,
+                &crate::test_support::key(),
+            )?;
             let mut acc = m.clone();
             for _ in 0..48 {
                 acc = mlx_rs::ops::matmul(&acc, &m)?;

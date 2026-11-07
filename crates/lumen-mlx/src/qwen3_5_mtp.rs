@@ -2201,8 +2201,14 @@ mod prequantized_expert_tests {
     /// Evaluated here: MLX's global random key is left as a lazy split of this thread's stream
     /// until a draw is evaluated, and the next test, on another thread, would inherit it.
     fn bf16_experts(out: i32, inputs: i32, seed: u64) -> Array {
-        random::seed(seed).expect("seed");
-        let w = random::normal::<f32>(&[EXPERTS, out, inputs], None, None, None).expect("w");
+        crate::test_support::seed(seed);
+        let w = random::normal::<f32>(
+            &[EXPERTS, out, inputs],
+            None,
+            None,
+            &crate::test_support::key(),
+        )
+        .expect("w");
         let w = w.as_dtype(Dtype::Bfloat16).expect("bf16");
         w.eval().expect("eval");
         w

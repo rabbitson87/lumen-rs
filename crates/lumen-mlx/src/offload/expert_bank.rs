@@ -529,10 +529,15 @@ mod tests {
         assert_eq!(stacked.len(), ranges.roles.len());
 
         let hidden = 2048;
-        let x = random::normal::<f32>(&[1, 1, 1, 1, hidden], None, None, None)
-            .expect("x")
-            .as_dtype(Dtype::Bfloat16)
-            .expect("bf16");
+        let x = random::normal::<f32>(
+            &[1, 1, 1, 1, hidden],
+            None,
+            None,
+            &crate::test_support::key(),
+        )
+        .expect("x")
+        .as_dtype(Dtype::Bfloat16)
+        .expect("bf16");
         let wanted: [u16; 8] = [200, 5, 17, 5, 255, 0, 91, 17]; // repeats on purpose
 
         let first = bank.acquire(layer, &wanted).expect("acquire");

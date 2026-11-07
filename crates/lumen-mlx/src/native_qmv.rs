@@ -1472,8 +1472,9 @@ mod tests {
 
     /// [`projection`] at another group size and weight width.
     fn projection_q(rows: i32, inputs: i32, seed: u64, group: i32, bits: i32) -> Projection {
-        random::seed(seed).expect("seed");
-        let w = random::normal::<f32>(&[rows, inputs], None, None, None).expect("weights");
+        crate::test_support::seed(seed);
+        let w = random::normal::<f32>(&[rows, inputs], None, None, &crate::test_support::key())
+            .expect("weights");
         let w = mlx_rs::ops::multiply(&w, Array::from_f32(0.02))
             .and_then(|w| w.as_dtype(Dtype::Bfloat16))
             .expect("bf16 weights");
@@ -1488,8 +1489,8 @@ mod tests {
     }
 
     fn activation(shape: &[i32], seed: u64) -> Array {
-        random::seed(seed).expect("seed");
-        random::normal::<f32>(shape, None, None, None).expect("activation")
+        crate::test_support::seed(seed);
+        random::normal::<f32>(shape, None, None, &crate::test_support::key()).expect("activation")
     }
 
     fn wide(a: &Array) -> Array {

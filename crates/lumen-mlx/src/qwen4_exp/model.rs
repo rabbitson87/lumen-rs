@@ -2773,11 +2773,25 @@ mod attention_block_tests {
     /// rounding of a differently shaped matmul), for a causal-ish boolean mask.
     #[test]
     fn query_blocks_are_the_same_attention_in_pieces() {
-        mlx_rs::random::seed(3).unwrap();
+        crate::test_support::seed(3);
         let (h, kvh, s, kv, d) = (4, 2, 200, 300, 32);
-        let q = mlx_rs::random::normal::<f32>(&[1, h, s, d], None, None, None).unwrap();
-        let k = mlx_rs::random::normal::<f32>(&[1, kvh, kv, d], None, None, None).unwrap();
-        let v = mlx_rs::random::normal::<f32>(&[1, kvh, kv, d], None, None, None).unwrap();
+        let q =
+            mlx_rs::random::normal::<f32>(&[1, h, s, d], None, None, &crate::test_support::key())
+                .unwrap();
+        let k = mlx_rs::random::normal::<f32>(
+            &[1, kvh, kv, d],
+            None,
+            None,
+            &crate::test_support::key(),
+        )
+        .unwrap();
+        let v = mlx_rs::random::normal::<f32>(
+            &[1, kvh, kv, d],
+            None,
+            None,
+            &crate::test_support::key(),
+        )
+        .unwrap();
         // Query i sees the first 100 + i keys.
         let pos = Array::from_slice(&(0..kv).collect::<Vec<i32>>(), &[1, 1, kv]);
         let lim = Array::from_slice(&(0..s).map(|i| 100 + i).collect::<Vec<i32>>(), &[1, s, 1]);
