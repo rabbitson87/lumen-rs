@@ -65,6 +65,7 @@ value → on.
 | `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
 | `LUMEN_QWEN4_BUILD_AHEAD` | off | Optimization | `lumen_mlx::qwen4_exp::model::build_ahead` |
+| `LUMEN_QWEN4_EXPERT_COPY` | off | Behavior | `lumen_mlx::qwen4_exp::runner::expert_copy` |
 | `LUMEN_QWEN4_KV_BF16` | on | Behavior | `lumen_mlx::qwen4_exp::config::kv_bf16` |
 | `LUMEN_QWEN4_MEM_LOG` | off | Diagnostic | `lumen_mlx::qwen4_exp::runner::mem_log` |
 | `LUMEN_QWEN4_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::decode_probe::stage_sync` |
@@ -901,6 +902,18 @@ Decode with the offloaded layers pipelined one segment ahead: submit the GPU wor
  host's graph building no longer sits between two GPU segments. Measured on the real
  checkpoint (M3 Max): identical text, but no end-to-end gain (15 GB pool 9.79 -> 9.81 tok/s,
  N=10; 6.7 GB +2%, noise); only ~5.5 ms of host build per token is hideable. Kept opt-in.
+
+### `LUMEN_QWEN4_EXPERT_COPY`
+
+*Behavior, default off.*
+
+Serve Flash-Next's routed experts from a low-bit copy built with
+ `qwen4_exp_lowbit_pack` instead of the checkpoint's own: `bits,group,recipe`, such as
+ `3,64,lsq`. The experts take less room, so the pool holds more of them and fewer are read
+ from the SSD. **It is a different model:** replies differ from the checkpoint's. Measured at
+ 3 bits on the checkpoint's own greedy replies, 97.16% of 2,357 positions pick the same
+ token, against 99.75% for the checkpoint's own two-row pass. Prefill and decode both read
+ the copy, and persisted state is kept apart from the checkpoint's. Off unless set.
 
 ### `LUMEN_QWEN4_KV_BF16`
 

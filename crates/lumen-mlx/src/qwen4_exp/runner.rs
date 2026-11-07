@@ -18,6 +18,7 @@ use super::config::Qwen4ExpConfig;
 use super::model::{LoadOptions, MtpMode, NgramSource, Qwen4ExpCache, Qwen4ExpModel};
 use crate::host_memory::HostMemory;
 use crate::kv_disk::{DiskKvStore, KvManifest};
+use crate::offload::lowbit::LowbitSpec;
 use crate::session_feed::PrefillGrid;
 use crate::{ProbeRows, Runner};
 
@@ -25,6 +26,45 @@ use crate::{ProbeRows, Runner};
 pub(crate) struct LoadInfo {
     pub eos_tokens: Vec<u32>,
     pub vocab_size: usize,
+}
+
+lumen_flags::flag! {
+    /// Serve Flash-Next's routed experts from a low-bit copy built with
+    /// `qwen4_exp_lowbit_pack` instead of the checkpoint's own: `bits,group,recipe`, such as
+    /// `3,64,lsq`. The experts take less room, so the pool holds more of them and fewer are read
+    /// from the SSD. **It is a different model:** replies differ from the checkpoint's. Measured at
+    /// 3 bits on the checkpoint's own greedy replies, 97.16% of 2,357 positions pick the same
+    /// token, against 99.75% for the checkpoint's own two-row pass. Prefill and decode both read
+    /// the copy, and persisted state is kept apart from the checkpoint's. Off unless set.
+    pub(crate) expert_copy {
+        env: "LUMEN_QWEN4_EXPERT_COPY",
+        default: false,
+        kind: Behavior,
+    }
+}
+
+/// The variable's name, for reading its value after the registry flag said it is set.
+const EXPERT_COPY_ENV: &str = "LUMEN_QWEN4_EXPERT_COPY";
+
+fn expert_copy_from_env() -> Result<Option<LowbitSpec>> {
+    if !expert_copy::get() {
+        return Ok(None);
+    }
+    let raw = std::env::var(EXPERT_COPY_ENV).unwrap_or_default();
+    LowbitSpec::parse(&raw)
+        .with_context(|| format!("{EXPERT_COPY_ENV}={raw:?}"))
+        .map(Some)
+}
+
+/// What a copy adds to the identity of persisted state: nothing without one, so the states the
+/// checkpoint's experts wrote stay valid.
+fn expert_copy_setting(copy: Option<LowbitSpec>) -> Option<(String, String)> {
+    copy.map(|s| {
+        (
+            "qwen4_exp_experts".to_string(),
+            format!("{}b{}.{}", s.bits, s.group_size, s.recipe.name()),
+        )
+    })
 }
 
 /// Rounds a sequence looks back over when deciding whether drafting pays.
@@ -751,7 +791,15 @@ impl Qwen4ExpRunner {
         {
             device = limit;
         }
-        let cfg = Qwen4ExpConfig::load(dir)?;
+        let mut cfg = Qwen4ExpConfig::load(dir)?;
+        let copy = expert_copy_from_env()?;
+        if let Some(spec) = copy {
+            cfg.use_expert_copy(spec);
+            eprintln!(
+                "[qwen4_exp] serving the expert copy {spec:?}, {:.2} MB per expert: replies differ from the checkpoint's",
+                cfg.routed_expert_bytes() as f64 / 1e6
+            );
+        }
         let plan = plan_memory(device, &cfg, chunk_override(), context_override());
         let (chunk, ctx_tokens) = (plan.chunk, plan.ctx_tokens);
         let host = host_for_plan(device);
@@ -783,7 +831,10 @@ impl Qwen4ExpRunner {
                 dir.display()
             );
         }
-        let use_head = head_there && mode != MtpMode::Off;
+        if mode == MtpMode::On && copy.is_some() {
+            bail!("LUMEN_QWEN4_MTP=on: the draft head does not run on an expert copy yet");
+        }
+        let use_head = head_there && mode != MtpMode::Off && copy.is_none();
         eprintln!("{}", plan_line(device, &choice, &plan, use_head));
         let model = Qwen4ExpModel::load_with(
             dir,
@@ -793,6 +844,7 @@ impl Qwen4ExpRunner {
                 ngram: NgramSource::Auto,
                 scores_budget_bytes: 0,
                 low_experts: None,
+                expert_copy: copy,
             },
         )
         .with_context(|| format!("qwen4_exp: load `{}`", dir.display()))?;
@@ -815,6 +867,7 @@ impl Qwen4ExpRunner {
         settings.push(("mlx".into(), crate::kv_disk::mlx_version()));
         settings.push(("qwen4_exp_prefill_chunk".into(), chunk.to_string()));
         settings.push(("qwen4_exp_mtp".into(), model.has_mtp().to_string()));
+        settings.extend(expert_copy_setting(copy));
         let fingerprint = crate::kv_disk::kv_identity(&dir.display().to_string(), dir, &settings);
         let disk = crate::kv_disk::open_store_from_env(&fingerprint, "qwen4_exp");
         Ok((
@@ -2068,6 +2121,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_copy_changes_the_identity_of_persisted_state_and_no_copy_leaves_it_alone() {
+        use crate::offload::lowbit::Recipe;
+        assert_eq!(expert_copy_setting(None), None);
+        let three = LowbitSpec::new(3, 64, Recipe::LeastSquares).unwrap();
+        let two = LowbitSpec::new(2, 64, Recipe::LeastSquares).unwrap();
+        let min_max = LowbitSpec::new(3, 64, Recipe::MinMax).unwrap();
+        let (a, b, c) = (
+            expert_copy_setting(Some(three)),
+            expert_copy_setting(Some(two)),
+            expert_copy_setting(Some(min_max)),
+        );
+        assert_eq!(a.as_ref().unwrap().1, "3b64.lsq");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
     fn the_draft_head_is_off_unless_asked_for() {
         let mode = |raw: Option<&str>| parse_mtp_mode(raw).unwrap();
         for off in [
@@ -2557,6 +2627,7 @@ mod tests {
                 mtp,
                 scores_budget_bytes: 0,
                 low_experts: None,
+                expert_copy: None,
             },
         )
         .expect("tiny replica");

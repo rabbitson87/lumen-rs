@@ -50,11 +50,11 @@ mod imp {
     use std::time::Instant;
 
     use anyhow::{Context, Result, anyhow, bail};
+    use lumen_mlx::LowbitSpec;
     use lumen_mlx::qwen4_exp::model::MtpMode;
     use lumen_mlx::qwen4_exp::{
         ExpertTier, LoadOptions, LowExpertOptions, NgramSource, Qwen4ExpCache, Qwen4ExpModel,
     };
-    use lumen_mlx::{LowbitSpec, Recipe};
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
     use mlx_rs::{Array, Dtype};
     use tokenizers::Tokenizer;
@@ -615,18 +615,6 @@ mod imp {
         Ok(())
     }
 
-    fn parse_low(raw: &str) -> Result<LowbitSpec> {
-        let parts: Vec<&str> = raw.split(',').collect();
-        let [bits, group, recipe] = parts.as_slice() else {
-            bail!("--low wants bits,group,recipe, like 2,64,lsq");
-        };
-        LowbitSpec::new(
-            bits.parse().context("--low bits")?,
-            group.parse().context("--low group")?,
-            Recipe::parse(recipe)?,
-        )
-    }
-
     pub fn main() -> Result<()> {
         let mut args: Vec<String> = std::env::args().skip(1).collect();
         let mut take = |flag: &str| -> Option<String> {
@@ -650,7 +638,7 @@ mod imp {
         let low_budget_gb: f64 = take("--low-budget-gb")
             .and_then(|v| v.parse().ok())
             .unwrap_or(12.0);
-        let low = take("--low").map(|v| parse_low(&v)).transpose()?;
+        let low = take("--low").map(|v| LowbitSpec::parse(&v)).transpose()?;
         let usage = "usage: record <model_dir> <out.bin> <text files...> | \
              compare <model_dir> <ref.bin> | greedy <model_dir> <out.bin> <prompt files...> | \
              audit <model_dir> <ref.bin> <out.tsv>";
@@ -671,6 +659,7 @@ mod imp {
                     spec,
                     budget_bytes: (low_budget_gb * 1e9) as u64,
                 }),
+                expert_copy: None,
             },
         )
         .context("load")?;

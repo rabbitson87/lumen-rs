@@ -445,6 +445,7 @@ fn serving_the_ngram_table_from_disk_matches_holding_it_in_memory() {
         mtp: MtpMode::Off,
         scores_budget_bytes: 0,
         low_experts: None,
+        expert_copy: None,
     };
     let run = |model: &Qwen4ExpModel| -> Vec<f32> {
         let mut cache = model.make_cache();
@@ -764,6 +765,7 @@ fn load_with_head(dir: &std::path::Path, budget: Option<u64>) -> Qwen4ExpModel {
             mtp: MtpMode::On,
             scores_budget_bytes: 0,
             low_experts: None,
+            expert_copy: None,
         },
     )
     .expect("load the replica with its draft head")
@@ -1246,6 +1248,7 @@ fn with_low_experts(dir: &Path, spec: LowbitSpec) -> Qwen4ExpModel {
                 spec,
                 budget_bytes: budget,
             }),
+            expert_copy: None,
         },
     )
     .expect("load the replica with low-bit experts")
@@ -1336,7 +1339,83 @@ fn asking_for_a_copy_that_was_not_built_is_an_error() {
                 spec,
                 budget_bytes: 400 << 20,
             }),
+            expert_copy: None,
         },
     );
     assert!(r.is_err());
+}
+
+fn copy_options(spec: LowbitSpec, budget: Option<u64>) -> LoadOptions {
+    LoadOptions {
+        expert_budget_bytes: budget,
+        ngram: NgramSource::Auto,
+        mtp: MtpMode::Off,
+        scores_budget_bytes: 0,
+        low_experts: None,
+        expert_copy: Some(spec),
+    }
+}
+
+#[test]
+fn a_model_served_from_a_copy_is_the_low_tier_of_one_that_holds_both() {
+    let tmp = replica_copy();
+    let tokens = [3u32, 14, 15, 92, 65];
+    let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
+    let both = with_low_experts(tmp.path(), spec);
+    both.set_expert_tier(ExpertTier::Low).unwrap();
+    let low = last_logits(&both, &tokens);
+    drop(both);
+
+    let budget = Some(400 << 20);
+    let copy = Qwen4ExpModel::load_with(tmp.path(), copy_options(spec, budget)).unwrap();
+    assert_eq!(last_logits(&copy, &tokens), low);
+    // The plan reads the copy's size, not the checkpoint's.
+    let own = Qwen4ExpConfig::load(tmp.path())
+        .unwrap()
+        .routed_expert_bytes();
+    assert!(copy.config().routed_expert_bytes() < own);
+}
+
+#[test]
+fn a_multi_token_feed_reads_the_copy_too() {
+    // Prefill takes other paths through the pool than a decode step: the staging path has to be
+    // served from the copy as well.
+    let tmp = replica_copy();
+    let tokens: Vec<u32> = (1..200).map(|t| t * 7 % 127 + 1).collect();
+    let spec = LowbitSpec::new(3, 32, Recipe::LeastSquares).unwrap();
+    let plain = Qwen4ExpModel::load(tmp.path(), Some(400 << 20)).unwrap();
+    let mut cache = plain.make_cache();
+    let full = plain.forward(&tokens, &mut cache, true).unwrap();
+    full.eval().unwrap();
+    let full = full.as_slice::<f32>().to_vec();
+    drop(plain);
+
+    let both = with_low_experts(tmp.path(), spec);
+    both.set_expert_tier(ExpertTier::Low).unwrap();
+    let mut cache = both.make_cache();
+    let low = both.forward(&tokens, &mut cache, true).unwrap();
+    low.eval().unwrap();
+    let low = low.as_slice::<f32>().to_vec();
+    drop(both);
+
+    let copy = Qwen4ExpModel::load_with(tmp.path(), copy_options(spec, Some(400 << 20))).unwrap();
+    let mut cache = copy.make_cache();
+    let served = copy.forward(&tokens, &mut cache, true).unwrap();
+    served.eval().unwrap();
+    assert_eq!(served.as_slice::<f32>(), low);
+    assert_ne!(low, full);
+}
+
+#[test]
+fn a_copy_needs_a_pool_and_no_draft_head_and_its_pack() {
+    let tmp = replica_copy();
+    let spec = LowbitSpec::new(2, 32, Recipe::LeastSquares).unwrap();
+    assert!(Qwen4ExpModel::load_with(tmp.path(), copy_options(spec, Some(400 << 20))).is_err());
+    crate::offload::build_lowbit_pack(tmp.path(), 4, spec).unwrap();
+    assert!(Qwen4ExpModel::load_with(tmp.path(), copy_options(spec, None)).is_err());
+    let with_head = LoadOptions {
+        mtp: MtpMode::On,
+        ..copy_options(spec, Some(400 << 20))
+    };
+    assert!(Qwen4ExpModel::load_with(tmp.path(), with_head).is_err());
 }
