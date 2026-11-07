@@ -20,6 +20,28 @@
 //! Each text file is one sequence, cut to `--max-tokens`, fed in 1,024-token chunks (every chunk
 //! reads the whole expert set, so a bigger one is faster). `compare --seqs N` compares only the
 //! first N sequences.
+//!
+//! Natural text is full of positions where the model is unsure, so the numbers above read much
+//! lower than what a build changes along the model's own reply. Two more modes measure that, for
+//! the question "how often would the fast copy pick another token, and could it have known?":
+//!
+//! ```text
+//! # 1. The checkpoint's greedy reply to each prompt file, one token at a time.
+//! ... greedy <model_dir> <out.bin> <prompt files...> [--new 300] [--budget-gb 12]
+//! # 2. The same history through a low-bit copy, position by position, to a TSV.
+//! ... audit <model_dir> <ref.bin> <out.tsv> --low 2,64,lsq [--low-budget-gb 12] [--budget-gb 4]
+//!         [--prefill low] [--rows 2]
+//! ```
+//!
+//! A prompt file is the rendered prompt, template included. `audit` feeds the recorded tokens, so
+//! every position has the same history as the record, and the state the copy builds carries from
+//! one position to the next, as it would in a real decode. The prompt is fed by the checkpoint's
+//! experts unless `--prefill low`. Without `--low` the audit reads the checkpoint itself, which is
+//! the control: 100%. `--rows 2` feeds two tokens per pass, which is what a speculative verify
+//! does, and is the noise floor of any agreement figure. Each TSV row is one position: the record's
+//! top two tokens and margin, this run's, and the token's text.
+//!
+//! `compare --low 2,64,lsq` runs the natural-text comparison through a copy.
 
 #[cfg(feature = "mlx-native")]
 mod imp {
@@ -28,7 +50,11 @@ mod imp {
     use std::time::Instant;
 
     use anyhow::{Context, Result, anyhow, bail};
-    use lumen_mlx::qwen4_exp::Qwen4ExpModel;
+    use lumen_mlx::qwen4_exp::model::MtpMode;
+    use lumen_mlx::qwen4_exp::{
+        ExpertTier, LoadOptions, LowExpertOptions, NgramSource, Qwen4ExpCache, Qwen4ExpModel,
+    };
+    use lumen_mlx::{LowbitSpec, Recipe};
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
     use mlx_rs::{Array, Dtype};
     use tokenizers::Tokenizer;
@@ -340,6 +366,267 @@ mod imp {
         Ok(())
     }
 
+    const GREEDY_MAGIC: &[u8; 4] = b"Q4QG";
+
+    /// A position's two best tokens by logit.
+    #[derive(Clone, Copy)]
+    struct Top2 {
+        ids: [u32; 2],
+        logits: [f32; 2],
+    }
+
+    impl Top2 {
+        /// From `[V]` logits of one position.
+        fn of(row: &Array) -> Result<Self> {
+            let order = mlx_rs::ops::argpartition_axis(&mlx_rs::ops::negative(row)?, 1, -1)?;
+            let idx = order.index(0..2);
+            let val = row.take_along_axis(&idx, -1)?;
+            let idx = idx.as_dtype(Dtype::Int32)?;
+            idx.eval()?;
+            val.eval()?;
+            let (i, v) = (idx.as_slice::<i32>(), val.as_slice::<f32>());
+            let (a, b) = if v[0] >= v[1] { (0, 1) } else { (1, 0) };
+            Ok(Self {
+                ids: [i[a] as u32, i[b] as u32],
+                logits: [v[a], v[b]],
+            })
+        }
+
+        fn margin(&self) -> f32 {
+            self.logits[0] - self.logits[1]
+        }
+    }
+
+    /// One prompt and the checkpoint's reply: position `i` picked `steps[i].ids[0]`.
+    struct GreedySeq {
+        prompt: Vec<u32>,
+        steps: Vec<Top2>,
+    }
+
+    fn save_greedy(seqs: &[GreedySeq], path: &Path) -> Result<()> {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        w.write_all(GREEDY_MAGIC)?;
+        put_u32(&mut w, seqs.len() as u32)?;
+        for s in seqs {
+            put_u32(&mut w, s.prompt.len() as u32)?;
+            for &t in &s.prompt {
+                put_u32(&mut w, t)?;
+            }
+            put_u32(&mut w, s.steps.len() as u32)?;
+            for t in &s.steps {
+                for k in 0..2 {
+                    put_u32(&mut w, t.ids[k])?;
+                    put_f32(&mut w, t.logits[k])?;
+                }
+            }
+        }
+        Ok(w.flush()?)
+    }
+
+    fn load_greedy(path: &Path) -> Result<Vec<GreedySeq>> {
+        let mut r = std::io::BufReader::new(
+            std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?,
+        );
+        let mut magic = [0; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != GREEDY_MAGIC {
+            bail!("{} is not a greedy record", path.display());
+        }
+        let n = get_u32(&mut r)?;
+        let mut seqs = Vec::new();
+        for _ in 0..n {
+            let len = get_u32(&mut r)?;
+            let prompt = (0..len)
+                .map(|_| get_u32(&mut r))
+                .collect::<Result<Vec<_>>>()?;
+            let len = get_u32(&mut r)?;
+            let mut steps = Vec::new();
+            for _ in 0..len {
+                let (id0, lg0) = (get_u32(&mut r)?, get_f32(&mut r)?);
+                let (id1, lg1) = (get_u32(&mut r)?, get_f32(&mut r)?);
+                steps.push(Top2 {
+                    ids: [id0, id1],
+                    logits: [lg0, lg1],
+                });
+            }
+            seqs.push(GreedySeq { prompt, steps });
+        }
+        Ok(seqs)
+    }
+
+    /// The whole prompt but its last token, in chunks: the record and the audit cut it alike, so
+    /// their states start from the same bits.
+    fn feed_prompt(model: &Qwen4ExpModel, prompt: &[u32], cache: &mut Qwen4ExpCache) -> Result<()> {
+        for piece in prompt[..prompt.len() - 1].chunks(CHUNK) {
+            model.forward(piece, cache, true)?;
+        }
+        Ok(())
+    }
+
+    /// One position's logits as a `[V]` array.
+    fn last_row(logits: &Array) -> Result<Array> {
+        Ok(logits.reshape(&[-1])?)
+    }
+
+    fn greedy(
+        model: &Qwen4ExpModel,
+        dir: &Path,
+        out: &Path,
+        files: &[PathBuf],
+        new: usize,
+    ) -> Result<()> {
+        let tok = Tokenizer::from_file(dir.join("tokenizer.json"))
+            .map_err(|e| anyhow!("tokenizer: {e}"))?;
+        let eos: Vec<u32> = ["<|im_end|>", "<|endoftext|>"]
+            .iter()
+            .filter_map(|t| tok.token_to_id(t))
+            .collect();
+        let mut seqs = Vec::new();
+        for f in files {
+            let text =
+                std::fs::read_to_string(f).with_context(|| format!("read {}", f.display()))?;
+            let prompt = tok
+                .encode(text.as_str(), false)
+                .map_err(|e| anyhow!("encode: {e}"))?
+                .get_ids()
+                .to_vec();
+            if prompt.len() < 2 {
+                continue;
+            }
+            let t0 = Instant::now();
+            let mut cache = model.make_cache();
+            feed_prompt(model, &prompt, &mut cache)?;
+            let t1 = Instant::now();
+            let mut steps = Vec::with_capacity(new);
+            let mut last = prompt[prompt.len() - 1];
+            while steps.len() < new {
+                let logits = model.forward(&[last], &mut cache, true)?;
+                let top = Top2::of(&last_row(&logits)?)?;
+                steps.push(top);
+                last = top.ids[0];
+                if eos.contains(&last) {
+                    break;
+                }
+            }
+            eprintln!(
+                "{}: {} prompt tokens in {:.1} s, {} replied at {:.2} tok/s",
+                f.display(),
+                prompt.len(),
+                (t1 - t0).as_secs_f64(),
+                steps.len(),
+                steps.len() as f64 / t1.elapsed().as_secs_f64(),
+            );
+            seqs.push(GreedySeq { prompt, steps });
+        }
+        save_greedy(&seqs, out)?;
+        eprintln!("recorded to {}", out.display());
+        Ok(())
+    }
+
+    /// What the audit reads the experts through.
+    #[derive(Clone, Copy)]
+    struct AuditPlan {
+        decode: ExpertTier,
+        prefill: ExpertTier,
+        rows: usize,
+    }
+
+    /// A TSV field: one token's text on one line.
+    fn field(tok: &Tokenizer, id: u32) -> String {
+        tok.decode(&[id], false)
+            .unwrap_or_default()
+            .replace('\\', "\\\\")
+            .replace('\t', "\\t")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    }
+
+    fn audit(
+        model: &Qwen4ExpModel,
+        dir: &Path,
+        rec: &Path,
+        out: &Path,
+        plan: AuditPlan,
+    ) -> Result<()> {
+        let tok = Tokenizer::from_file(dir.join("tokenizer.json"))
+            .map_err(|e| anyhow!("tokenizer: {e}"))?;
+        let seqs = load_greedy(rec)?;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
+        writeln!(
+            w,
+            "seq\tpos\tprompt\tref_top1\tref_top2\tref_margin\ttop1\ttop2\tmargin\tref_text\ttext"
+        )?;
+        let (mut agree, mut total) = (0usize, 0usize);
+        for (s, seq) in seqs.iter().enumerate() {
+            let t0 = Instant::now();
+            let mut cache = model.make_cache();
+            model.set_expert_tier(plan.prefill)?;
+            feed_prompt(model, &seq.prompt, &mut cache)?;
+            model.set_expert_tier(plan.decode)?;
+            let t1 = Instant::now();
+            // The token before position `i`: the prompt's last, then the record's own picks.
+            let feed: Vec<u32> = std::iter::once(seq.prompt[seq.prompt.len() - 1])
+                .chain(seq.steps.iter().map(|t| t.ids[0]))
+                .take(seq.steps.len())
+                .collect();
+            let mut mine = Vec::with_capacity(seq.steps.len());
+            for piece in feed.chunks(plan.rows) {
+                let logits = model.forward(piece, &mut cache, false)?;
+                let vocab = model.config().vocab_size as i32;
+                let rows = logits.reshape(&[piece.len() as i32, vocab])?;
+                for r in 0..piece.len() as i32 {
+                    mine.push(Top2::of(&rows.index((r, ..)))?);
+                }
+            }
+            let decoded = t1.elapsed().as_secs_f64();
+            model.set_expert_tier(ExpertTier::Full)?;
+            let mut same = 0;
+            for (pos, (r, m)) in seq.steps.iter().zip(&mine).enumerate() {
+                same += usize::from(r.ids[0] == m.ids[0]);
+                writeln!(
+                    w,
+                    "{s}\t{pos}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{:.4}\t{}\t{}",
+                    seq.prompt.len(),
+                    r.ids[0],
+                    r.ids[1],
+                    r.margin(),
+                    m.ids[0],
+                    m.ids[1],
+                    m.margin(),
+                    field(&tok, r.ids[0]),
+                    field(&tok, m.ids[0]),
+                )?;
+            }
+            agree += same;
+            total += seq.steps.len();
+            eprintln!(
+                "seq {s}: {} prompt tokens in {:.1} s; {same} of {} same; {:.2} tok/s",
+                seq.prompt.len(),
+                (t1 - t0).as_secs_f64(),
+                seq.steps.len(),
+                seq.steps.len() as f64 / decoded,
+            );
+        }
+        w.flush()?;
+        println!(
+            "same token at {agree} of {total} positions = {:.2}%",
+            100.0 * agree as f64 / total.max(1) as f64
+        );
+        Ok(())
+    }
+
+    fn parse_low(raw: &str) -> Result<LowbitSpec> {
+        let parts: Vec<&str> = raw.split(',').collect();
+        let [bits, group, recipe] = parts.as_slice() else {
+            bail!("--low wants bits,group,recipe, like 2,64,lsq");
+        };
+        LowbitSpec::new(
+            bits.parse().context("--low bits")?,
+            group.parse().context("--low group")?,
+            Recipe::parse(recipe)?,
+        )
+    }
+
     pub fn main() -> Result<()> {
         let mut args: Vec<String> = std::env::args().skip(1).collect();
         let mut take = |flag: &str| -> Option<String> {
@@ -357,15 +644,36 @@ mod imp {
         let seqs: usize = take("--seqs")
             .and_then(|v| v.parse().ok())
             .unwrap_or(usize::MAX);
-        let usage =
-            "usage: record <model_dir> <out.bin> <text files...> | compare <model_dir> <ref.bin>";
+        let new: usize = take("--new").and_then(|v| v.parse().ok()).unwrap_or(300);
+        let rows: usize = take("--rows").and_then(|v| v.parse().ok()).unwrap_or(1);
+        let low_prefill = take("--prefill").as_deref() == Some("low");
+        let low_budget_gb: f64 = take("--low-budget-gb")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12.0);
+        let low = take("--low").map(|v| parse_low(&v)).transpose()?;
+        let usage = "usage: record <model_dir> <out.bin> <text files...> | \
+             compare <model_dir> <ref.bin> | greedy <model_dir> <out.bin> <prompt files...> | \
+             audit <model_dir> <ref.bin> <out.tsv>";
         let (mode, dir, file) = match args.as_slice() {
             [m, d, f, ..] => (m.clone(), PathBuf::from(d), PathBuf::from(f)),
             _ => bail!(usage),
         };
         let t0 = Instant::now();
         let budget = (budget_gb > 0.0).then_some((budget_gb * 1e9) as u64);
-        let model = Qwen4ExpModel::load(&dir, budget).context("load")?;
+        let model = Qwen4ExpModel::load_with(
+            &dir,
+            LoadOptions {
+                expert_budget_bytes: budget,
+                ngram: NgramSource::Auto,
+                mtp: MtpMode::Off,
+                scores_budget_bytes: 0,
+                low_experts: low.map(|spec| LowExpertOptions {
+                    spec,
+                    budget_bytes: (low_budget_gb * 1e9) as u64,
+                }),
+            },
+        )
+        .context("load")?;
         eprintln!(
             "loaded {} in {:.1} s",
             dir.display(),
@@ -376,7 +684,36 @@ mod imp {
                 let files: Vec<PathBuf> = args[3..].iter().map(PathBuf::from).collect();
                 record(&model, &dir, &file, &files, max)
             }
-            "compare" => compare(&model, &file, seqs),
+            "compare" => {
+                if low.is_some() {
+                    model.set_expert_tier(ExpertTier::Low)?;
+                }
+                compare(&model, &file, seqs)
+            }
+            "greedy" => {
+                let files: Vec<PathBuf> = args[3..].iter().map(PathBuf::from).collect();
+                greedy(&model, &dir, &file, &files, new)
+            }
+            "audit" => {
+                let out = PathBuf::from(args.get(3).ok_or_else(|| anyhow!(usage))?);
+                let tier = |on| {
+                    if on {
+                        ExpertTier::Low
+                    } else {
+                        ExpertTier::Full
+                    }
+                };
+                let plan = AuditPlan {
+                    decode: tier(low.is_some()),
+                    prefill: tier(low.is_some() && low_prefill),
+                    rows: rows.max(1),
+                };
+                audit(&model, &dir, &file, &out, plan)?;
+                if let Some(report) = model.low_offload_report() {
+                    eprintln!("[low] {report}");
+                }
+                Ok(())
+            }
             _ => bail!(usage),
         }
     }
