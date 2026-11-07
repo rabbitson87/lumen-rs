@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run --release -p lumen-mlx --features mlx-native --example qwen4_exp_lowbit_pack -- \
-//!     <model_dir> [--bits 2] [--group 64] [--recipe lsq|minmax]
+//!     <model_dir> [--bits 2] [--group 64] [--recipe lsq|minmax|top|topfit]
 //! ```
 //!
 //! Prints how close each projection stayed, in dB. The copy is another model, not a cache of this
@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
         .context("--group")?;
     let recipe = Recipe::parse(take("--recipe").as_deref().unwrap_or("lsq"))?;
     let [dir] = args.as_slice() else {
-        bail!("usage: <model_dir> [--bits 2] [--group 64] [--recipe lsq|minmax]");
+        bail!("usage: <model_dir> [--bits 2] [--group 64] [--recipe lsq|minmax|top|topfit]");
     };
     let dir = PathBuf::from(dir);
     let cfg = Qwen4ExpConfig::load(&dir)?;
