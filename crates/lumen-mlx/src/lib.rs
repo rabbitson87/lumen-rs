@@ -2837,7 +2837,7 @@ impl MlxBackend {
                         tools,
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
-                        |_| Ok(()),
+                        stop_sink(&ov.stop),
                         effort,
                     );
                 }
@@ -3015,7 +3015,7 @@ impl MlxBackend {
                         tools,
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
-                        |_| Ok(()),
+                        stop_sink(&ov.stop),
                         effort,
                     );
                 }
@@ -3273,7 +3273,7 @@ impl MlxBackend {
                     tools,
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
-                    |_| Ok(()),
+                    stop_sink(&ov.stop),
                     effort,
                 )
             }
@@ -3342,7 +3342,7 @@ impl MlxBackend {
                     tools,
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
-                    |_| Ok(()),
+                    stop_sink(&ov.stop),
                     effort,
                 )
             }
@@ -6228,8 +6228,8 @@ impl MlxQwen35Backend {
     /// template and parses any `<tool_call>...</tool_call>` blocks from the
     /// model's output. Emits `BackendStreamEvent::Text` for visible-text
     /// deltas and `BackendStreamEvent::ToolCallStart { name }` the moment the
-    /// parser sees `<function=NAME>`; a non-streaming caller passes a no-op
-    /// `on_event`. Bypasses MTP / spec-decode for now — tool-calling is a
+    /// parser sees `<function=NAME>`; a non-streaming caller passes
+    /// [`stop_sink`]. Bypasses MTP / spec-decode for now — tool-calling is a
     /// feature gate and the fast paths can be re-added once the happy path is
     /// verified on real hardware.
     ///
@@ -7964,6 +7964,17 @@ where
                 .into_iter()
                 .any(|ev| flow_of(forward_parse_event(ev, &mut self.on_event)).is_break());
         }
+    }
+}
+
+/// A non-streaming tool reply's sink: [`StopWatch`] for the tool loop, whose parser has already
+/// split the reasoning from the answer.
+fn stop_sink(stops: &[String]) -> impl FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()> {
+    use crate::chat_io::BackendStreamEvent;
+    let mut stops = lumen_core::stop::StopMatcher::new(stops.to_vec());
+    move |ev| match ev {
+        BackendStreamEvent::Text(t) if stops.push(t).stopped => Err(anyhow!("stop sequence")),
+        _ => Ok(()),
     }
 }
 
@@ -10930,6 +10941,55 @@ mod tests {
         sink.forward(vec![Text("c".into())]);
         assert!(sink.done);
         assert_eq!(heard, 1);
+    }
+
+    /// RED before: every non-streaming tool entry passed a sink that never ended the decode,
+    /// because the loop would have failed the request if it had. It now ends at the first stop
+    /// sequence in the answer, not in the reasoning, the way the stream does.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn a_non_streaming_tool_reply_stops_decoding_at_a_stop_sequence() {
+        use crate::chat_io::{ChatTurn, ResolvedToolChoice};
+        let params = weather_params();
+        let tools = weather_tool(&params);
+        let auto = ResolvedToolChoice::Auto;
+        let messages = vec![("user".to_string(), "weather?".to_string())];
+        let turns = [ChatTurn::User("weather?")];
+        let stop = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The trace spells the stop too; the answer is what it is watched in.
+        let traced = vec![5, 6, 12, 5, 5, 6, 6, 6];
+        for (script, thinking, stops, decoded) in [
+            ([5, 6].repeat(4), false, stop(&[]), 8),
+            ([5, 6].repeat(4), false, stop(&["TokyoSeoul"]), 3),
+            (traced.clone(), true, stop(&[]), 8),
+            (traced, true, stop(&["SeoulTokyo"]), 6),
+        ] {
+            for history in [false, true] {
+                let mut b = MlxBackend::Qwen35Family(marker_backend(script.clone()));
+                let ov = SamplingOverrides {
+                    stop: stops.clone(),
+                    ..Default::default()
+                };
+                let parsed = if history {
+                    b.chat_from_history(
+                        &turns, 8, 0.0, 1.0, &ov, thinking, None, &tools, &auto, None,
+                    )
+                } else {
+                    b.chat(
+                        &messages, 8, 0.0, 1.0, &ov, thinking, None, &tools, &auto, None,
+                    )
+                }
+                .expect("a stop sequence is not an error");
+                let context = format!("stops {stops:?}, thinking {thinking}, history {history}");
+                assert_eq!(
+                    qwen(&mut b).scripted_tokens_consumed(),
+                    decoded,
+                    "{context}"
+                );
+                assert_eq!(qwen(&mut b).script_runner().live_seqs(), 0, "{context}");
+                assert!(parsed.tool_calls.is_empty(), "{context}");
+            }
+        }
     }
 
     /// The guard is on images only: the same loop given no image still reuses
