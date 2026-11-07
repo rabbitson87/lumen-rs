@@ -381,7 +381,7 @@ named all three, in 14 s for a 334-token prompt, and again with an 11K-character
 | `LUMEN_MOE_IO_MODE` | `auto` | `direct` bypasses the page cache for expert reads, `buffered` uses it, `auto` uses it while the machine has more than 12 GB of memory to spare. |
 | `LUMEN_MOE_IO_LANES` | 32 | Reader threads (1–64). |
 | `LUMEN_MOE_PACK` | `auto` | The contiguous expert pack: `auto` uses `experts.lpack` when it is next to the weights, `off` never does, `build` makes it first. See below. |
-| `LUMEN_QWEN4_EXPERT_COPY` | off | Serve the experts from a low-bit copy, such as `3,64,lsq`. Faster at the same memory; replies differ from the checkpoint's. See the last section. |
+| `LUMEN_QWEN4_EXPERT_COPY` | off | Serve the experts from a low-bit copy, such as `3,64,top`. Faster at the same memory; replies differ from the checkpoint's. See the last section. |
 | `LUMEN_QWEN4_MTP` | `off` | The draft head for speculative decoding: `off`, `auto` (use it when installed, with a speed governor) or `on` (the same, but refuses to start without the head). See below. |
 | `LUMEN_QWEN4_MTP_FLOOR` | 0.4 | Share of drafts a conversation must keep getting accepted to keep speculating. |
 
@@ -450,41 +450,47 @@ Delete `experts.lpack` to get the disk back.
 
 ## A low-bit copy of the experts
 
-The pool holds more experts when each one is smaller, so fewer are read from the SSD. A copy refits every
-routed expert, and the draft head's, at fewer bits by least squares. **It is a different model, so it is off
-unless you ask for it:** replies differ from the checkpoint's.
+The pool holds more experts when each one is smaller, so fewer are read from the SSD. A copy keeps the top
+bits of every routed expert's codes, and the draft head's. **It is a different model, so it is off unless you
+ask for it:** replies differ from the checkpoint's.
 
 ```sh
 cargo run --release -p lumen-mlx --features mlx-native --example qwen4_exp_lowbit_pack -- \
-    ~/.slotstream/models/qwen38-flash-next-gs64 --bits 3 --group 64 --recipe lsq
-LUMEN_QWEN4_EXPERT_COPY=3,64,lsq LUMEN_QWEN4_MTP=auto lumen-server
+    ~/.slotstream/models/qwen38-flash-next-gs64 --bits 3 --group 64 --recipe top
+LUMEN_QWEN4_EXPERT_COPY=3,64,top LUMEN_QWEN4_MTP=auto lumen-server
 ```
 
-The copy goes next to the weights as `experts.3b64.lsq.lpack` (54 GB, about 4 minutes; 39 GB at 2 bits). The
-memory plan reads the copy's size, and persisted state is kept apart from the checkpoint's. A copy built
-before the head could be copied holds no head, so drafts stay off on it. Delete the file to get the disk back.
+The copy goes next to the weights as `experts.3b64.top.lpack` (54 GB, a few minutes; 39 GB at 2 bits). The
+memory plan reads the copy's size, and persisted state is kept apart from the checkpoint's. A copy that holds no
+draft head serves without drafts. Delete the file to get the disk back.
+
+`--recipe lsq` fits each group again by least squares. It gives a better signal-to-noise ratio and a worse copy:
+it clips the tails, and agreement does not follow that ratio. At 3 bits it agrees 95.81% with a natural-text KL
+of 0.148, against 96.21% and 0.096 for `top`.
 
 Measured on a 36 GB M3 Max with other work running (load 2–8). Tokens/s are warm rounds of three prompts,
 160 tokens each, direct reads; agreement is how often the copy picks the checkpoint's token at the same
 history, over 7,040 positions of the checkpoint's own replies. Two rows of the checkpoint against one agree
 99.75%, which is the ceiling of that measure.
 
-| | Agrees | Long prompts (6–9K) | 6.7 GB pool | + draft head | 15 GB pool | + draft head |
+| | Agrees | Long prompts (6–9K) | 6.7 GB pool | + draft head | About 14 GB pool | + draft head |
 |---|---:|---:|---:|---:|---:|---:|
-| Checkpoint, 4 bits | 100% | 100% | 7.2 | 7.6 | 8.4–9.2 | 9.7 |
-| 3 bits | 95.81% | 93.00% | 8.9 | 10.0 | 12.7 | 13.7 |
-| 2 bits | 89.49% | 83.67% | 11.7 | 13.5 | 16.2 | 17.2 |
+| Checkpoint, 4 bits | 100% | 100% | 7.3 | 7.6 | 10.2 | 10.5 |
+| 3 bits, `top` | 96.21% | 93.67% | 9.1 | 9.6 | 13.0 | 14.1 |
+| 2 bits, `lsq` | 89.49% | 83.67% | 11.7 | 13.5 | 16.4 | 17.4 |
 
-The checkpoint's 15 GB runs were unusually slow here (6.8–10.1, against 11.2 on a quiet machine), so read that
-column's ratios with care. The 6.7 GB runs agreed within 3%.
+The 14 GB column comes from the runs that got 13.3–15.0 GB: the server lowers a requested pool to what is free
+at load, so check the `expert bank` line of its log before reading a speed against a pool size. At 2 bits, `top`
+agrees 90.80% (86.33% on long prompts); its speed has not been measured.
 
 - **3 bits holds up on tasks.** Over 80 GSM8K problems it got 78 right against the checkpoint's 77, and over 54
-  rounds of tool use it made 1 syntax and 3 schema errors in 61 calls against 0 and 4 in 71. All of the
-  differences in agreement are near-ties: where the checkpoint's top token led by 2 logits or more, the copy
-  never picked another.
-- **2 bits does not.** It picks another token at 10.5% of positions, some of them confident ones, and it was
-  not put through the task checks.
-- **Inside one long text a copy can drift.** Fed a long document as raw text, a 3-bit copy followed the
-  checkpoint on seven documents and left it on one: the error sits in the recurrent state of the linear
-  attention layers and stays there to the end of the text. The next user turn cleared it in the one case tried,
-  and the reply agreed as usual (93%). A very long single reply has not been measured.
+  rounds of tool use it made 0 syntax and 2 schema errors in 60 calls against 0 and 4 in 71. All 267 differences
+  in agreement are close calls: the checkpoint's top token never led by 2 logits or more where the copy picked
+  another.
+- **2 bits does not.** It picks another token at about 10% of positions, some of them confident ones, and it
+  was not put through the task checks.
+- **Inside one long text a copy can drift.** Fed a long document as raw text, a 3-bit `lsq` copy followed the
+  checkpoint on seven documents and left it on one, KL 1.11 against about 0.1: the error sits in the recurrent
+  state of the linear attention layers and stays there to the end of the text. `top` holds better on the same
+  text, KL 0.27, and is not free of it. The next user turn cleared it in the one case tried, and the reply agreed
+  as usual (93%). A very long single reply has not been measured.
