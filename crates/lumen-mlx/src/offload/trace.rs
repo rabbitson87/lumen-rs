@@ -73,8 +73,8 @@ lumen_flags::flag! {
 lumen_flags::flag! {
     /// With `LUMEN_MOE_TRACE`: also record, before each layer's decode call, the experts that
     /// layer's gate ranks highest for the streams before the previous layer's experts: the newest
-    /// thing a read ahead could know. Only `LUMEN_QWEN4_BUILD_AHEAD` decode steps record it. Adds
-    /// one mix and one gate per layer per token; never changes the output or what is resident.
+    /// thing a read ahead could know. Only single-row decode steps record it. Adds one mix and one
+    /// gate per layer per token; never changes the output or what is resident.
     pub(crate) moe_trace_predict {
         env: "LUMEN_MOE_TRACE_PREDICT",
         default: false,

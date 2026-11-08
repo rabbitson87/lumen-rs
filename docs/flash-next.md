@@ -314,6 +314,38 @@ model does; this can change the text of a long prompt compared with earlier buil
 the same for every pool size and policy. The check is `cargo xtask offload-check` (it runs the tests in
 `offload/exactness_tests.rs`); run it after every MLX upgrade, since the threshold is an MLX internal.
 
+## Reading the next layer's experts ahead (`LUMEN_MOE_READ_AHEAD`, on by default)
+
+While a layer's experts compute, the next layer's router is asked which experts it will want, from the streams
+this layer already has, and up to 3 of its 10 favourites that are not in the pool are read into it. The next layer
+usually finds them there. It guesses right about two times in three; a wrong guess costs a read and nothing else.
+Prompt chunks are not read ahead: they stream whole layers through the staging regions already.
+
+Measured on a 36 GB M3 Max through the server: off, on, on, off, each with the four setups forward and back, warm
+rounds of three prompts × 160 tokens, the pool exactly as asked. 15 GB is 4 runs per side (3 for the checkpoint +
+draft head off, one run left out for swapping), 6.7 GB is 8.
+
+| Pool | Setup | Off | On | Change | Hit rate |
+|---|---|---:|---:|---:|---|
+| 15 GB | checkpoint | 10.4 | 11.9 | +14.6% | 80.6% → 88.2% |
+| 15 GB | checkpoint + draft head | 11.4 | 13.4 | +17.3% | 76.5% → 84.6% |
+| 15 GB | `3,64,top` copy | 13.5 | 14.4 | +7.1% | 85.2% → 90.9% |
+| 15 GB | `3,64,top` + draft head | 13.8 | 16.3 | +18.5% | 83% → 88% |
+| 6.7 GB | checkpoint | 7.3 | 8.0 | +10.7% | 66.5% → 79.8% |
+| 6.7 GB | checkpoint + draft head | 7.6 | 8.6 | +13.8% | 59.4% → 74.2% |
+| 6.7 GB | `3,64,top` copy | 9.1 | 10.4 | +14.2% | 71.8% → 83.2% |
+| 6.7 GB | `3,64,top` + draft head | 9.2 | 10.7 | +15.9% | 65.2% → 76.5% |
+
+Every change clears two standard errors but the checkpoint at 6.7 GB (+0.78 ± 0.83 tok/s; its quieter half alone
+gave +17%). The SSD reads about 20% more in all, and the time to the first token is within ±2% at 6.7 GB and up to
++4.5% (2.16 → 2.25 s) for the copy at 15 GB.
+
+The text is the same with it on and off: only which experts are in the pool changes, and the replica tests check
+the logits bit for bit through prompts, single steps and verify passes. With the draft head the server picks
+drafting or plain steps by measured speed, so a faster step can change which tokens go through a two-row verify,
+and a verify rounds a little differently; one of three replies changed that way at the checkpoint, as it can with
+any change in speed. `LUMEN_MOE_READ_AHEAD=0` turns it off.
+
 ## Estimating the speed on your Mac
 
 A token costs a fixed part plus the SSD reads for the experts that are not in the pool:
@@ -378,6 +410,7 @@ named all three, in 14 s for a 334-token prompt, and again with an 11K-character
 | `LUMEN_MEMORY_LIMIT_GB` | 32 | Cap on MLX's memory in GiB; the pool is planned within it. |
 | `LUMEN_MEMORY_PLAN_RECLAIMABLE` | on | Plan the pool within what is free at load: this process, free, file-backed and purgeable pages, less 2 GB or 5% of RAM (see What other apps hold). MLX's memory limit is lowered to the same figure. `0` plans from the working set alone, and the system makes room by compressing and swapping other apps. |
 | `LUMEN_MOE_EVICTION` | `bias` | Which expert leaves the pool when it is full: `bias` (learned, see below), `gclock` or `clock`. Never changes the output. |
+| `LUMEN_MOE_READ_AHEAD` | on | Read up to 3 of the next layer's likely experts into the pool while a layer computes. +7% to +18% decode, never changes the output. See above. |
 | `LUMEN_MOE_IO_MODE` | `auto` | `direct` bypasses the page cache for expert reads, `buffered` uses it, `auto` uses it while the machine has more than 12 GB of memory to spare. |
 | `LUMEN_MOE_IO_LANES` | 32 | Reader threads (1–64). |
 | `LUMEN_MOE_PACK` | `auto` | The contiguous expert pack: `auto` uses `experts.lpack` when it is next to the weights, `off` never does, `build` makes it first. See below. |
@@ -480,7 +513,9 @@ history, over 7,040 positions of the checkpoint's own replies. Two rows of the c
 | 2 bits, `lsq` | 89.49% | 83.67% | 11.7 | 13.5 | 16.4 | 17.4 |
 
 The 14 GB column comes from the runs that got 13.3–15.0 GB: the server lowers a requested pool to what is free
-at load, so check the `expert bank` line of its log before reading a speed against a pool size. At 2 bits, `top`
+at load, so check the `expert bank` line of its log before reading a speed against a pool size. These speeds are
+without reading ahead; with it, `top` + the draft head gives 10.7 at 6.7 GB and 16.3 at 15 GB (see Reading the
+next layer's experts ahead). At 2 bits, `top`
 agrees 90.80% (86.33% on long prompts); its speed has not been measured.
 
 - **3 bits holds up on tasks.** Over 80 GSM8K problems it got 78 right against the checkpoint's 77, and over 54

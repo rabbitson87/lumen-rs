@@ -103,6 +103,9 @@ pub(crate) enum CallKind {
     /// A prompt chunk that took the pool path. Its experts are chosen by the whole prompt, not by
     /// the previous token, so it is not learned from.
     Prefill,
+    /// Experts read ahead of the call that may want them (`LUMEN_MOE_READ_AHEAD`): a guess, not
+    /// a routing, so it is neither learned from nor counted as hits and misses.
+    Ahead,
 }
 
 /// The knobs of `bias`. The defaults are the configuration the trace simulation selected

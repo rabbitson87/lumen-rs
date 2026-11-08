@@ -35,6 +35,7 @@ value → on.
 | `LUMEN_MOE_IO_THROTTLE_GBPS` | off | Diagnostic | `lumen_mlx::offload::io::io_throttle` |
 | `LUMEN_MOE_OVERLAP` | off | Optimization | `lumen_mlx::offload::overlap` |
 | `LUMEN_MOE_PROBE_LAYER_SYNC` | off | Diagnostic | `lumen_mlx::native_moe::imp::moe_layer_sync_probe` |
+| `LUMEN_MOE_READ_AHEAD` | on | Optimization | `lumen_mlx::offload::read_ahead` |
 | `LUMEN_MOE_TRACE` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace` |
 | `LUMEN_MOE_TRACE_PREDICT` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace_predict` |
 | `LUMEN_MTP_COARSE_HEAD` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_coarse_head` |
@@ -436,6 +437,24 @@ Task 023 Phase 0 probe: read the routed expert ids back to the CPU at
  expert cache needs exactly this readback, so the decode-time delta
  against the default is the sync tax on its own. Output unchanged.
 
+### `LUMEN_MOE_READ_AHEAD`
+
+*Optimization, default on.*
+
+Read the next layer's likely experts into the pool while the GPU works. After each layer
+ call of a decode step or a speculative verify, the next layer's gate is asked about this
+ layer's streams, mixed the way the next layer mixes its MoE input (the ranking is computed
+ with the routing it follows), and up to 3 of its 10 best-ranked experts per row that are
+ not resident are read into slots on an async ticket. The next layer call waits for those
+ reads, usually landed by then, and finds them resident. Only which experts are resident
+ when changes, never the output (with `LUMEN_QWEN4_MTP`, the draft governor picks rounds
+ by measured speed, so a faster step can change which tokens a verify pass computes; that
+ holds for any speed change). Only Flash-Next (`qwen4_exp`) asks; other models are
+ unaffected. Measured on the real checkpoint (M3 Max, server, ABBA, warm tok/s, pools
+ exact): at 15 GB, +14.6% plain, +17.3% with drafts, +7.1% on the `3,64,top` copy, +18.5%
+ on the copy with drafts; at 6.7 GB, +10.7%, +13.8%, +14.2%, +15.9%. The hit rate rises
+ 5-15 points, 57-72% of what is read ahead is used, and the reads in all grow about 20%.
+
 ### `LUMEN_MOE_TRACE`
 
 *Diagnostic, default off.*
@@ -452,8 +471,8 @@ Write a binary trace of the expert pool's layer calls (expert ids in request ord
 
 With `LUMEN_MOE_TRACE`: also record, before each layer's decode call, the experts that
  layer's gate ranks highest for the streams before the previous layer's experts: the newest
- thing a read ahead could know. Only `LUMEN_QWEN4_BUILD_AHEAD` decode steps record it. Adds
- one mix and one gate per layer per token; never changes the output or what is resident.
+ thing a read ahead could know. Only single-row decode steps record it. Adds one mix and one
+ gate per layer per token; never changes the output or what is resident.
 
 ### `LUMEN_MTP_COARSE_HEAD`
 
