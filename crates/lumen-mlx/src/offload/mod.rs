@@ -17,7 +17,9 @@
 //! * [`trace`] — opt-in recording of every layer call's expert ids (`LUMEN_MOE_TRACE`).
 //!
 //! [`MoeOffload`] is what the model holds: every MoE layer calls
-//! [`MoeOffload::route`] between computing its routing and gathering.
+//! [`MoeOffload::route`] between computing its routing and gathering. With
+//! `LUMEN_MOE_READ_AHEAD` it then hands [`MoeOffload::predicted`] the next layer's ranking, and
+//! the next call finds the experts that ranking put first already read.
 
 pub(crate) mod expert_bank;
 pub(crate) mod expert_store;
@@ -65,6 +67,67 @@ lumen_flags::flag! {
         default: false,
         kind: Optimization,
     }
+}
+
+lumen_flags::flag! {
+    /// Read the next layer's likely experts into the pool while the GPU works. After each layer
+    /// call of a decode step or a speculative verify, the next layer's gate is asked about this
+    /// layer's streams, mixed the way the next layer mixes its MoE input (the ranking is computed
+    /// with the routing it follows), and up to 3 of its 10 best-ranked experts per row that are
+    /// not resident are read into slots on an async ticket. The next layer call waits for those
+    /// reads, usually landed by then, and finds them resident. Only which experts are resident
+    /// when changes, never the output. Replayed on a recorded Flash-Next trace at a 19.8 GB pool
+    /// (7,161 slots): decode hit rate 88.1% -> 94.6%, reads a step waits for 57 -> 26 per token,
+    /// but 77 reads in all, 59% of those read ahead used. Off until measured on the real server.
+    pub(crate) read_ahead {
+        env: "LUMEN_MOE_READ_AHEAD",
+        default: false,
+        kind: Optimization,
+    }
+}
+
+/// How deep into each row's ranking a read ahead looks, and how many experts it reads at most
+/// per layer call. Chosen on the replay: of 10/3, 12/3, 16/3, 12/5, 16/5 and 24/10, 10/3 used the
+/// largest share of what it read (59-73% by pool size) for most of the gain in waited reads.
+const READ_AHEAD_TOP: usize = 10;
+const READ_AHEAD_CAP: usize = 3;
+
+/// What a layer's gate ranks highest for the streams before the previous layer's experts: what
+/// a read ahead and the routing trace know about a layer call before it happens. Built by the
+/// model and submitted with the routing it follows.
+pub(crate) struct Prediction {
+    /// The MoE layer the ranking is for.
+    pub layer: u16,
+    /// `moe_ranked`, flattened: every row's `per_row` experts, best last.
+    pub ranked: Array,
+    pub per_row: usize,
+}
+
+/// The experts a ranking of `per_row` per row names, best first: every row's best, then every
+/// row's second, and so on to rank `top`, each expert once. One row is its ranking reversed.
+fn best_first(ids: &[u32], per_row: usize, top: usize) -> Result<Vec<u16>> {
+    let per_row = per_row.max(1);
+    let rows = ids.len() / per_row;
+    let mut out: Vec<u16> = Vec::with_capacity(rows * top.min(per_row));
+    for rank in 0..top.min(per_row) {
+        for row in 0..rows {
+            let id = ids[row * per_row + per_row - 1 - rank];
+            let e = u16::try_from(id)
+                .map_err(|_| anyhow!("offload: predicted expert {id} out of range"))?;
+            if !out.contains(&e) {
+                out.push(e);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A read ahead in flight: experts of `layer` planned into slots (pinned and reserved) and being
+/// read. The next layer call lands it before planning.
+struct Ahead {
+    acquiring: Acquiring,
+    layer: u16,
+    experts: Vec<u16>,
 }
 
 /// An overlapped call runs one more GPU submission and gathers in two parts, which costs a few
@@ -455,6 +518,9 @@ enum Decision {
 /// Held by the model; every MoE layer calls [`Self::route`] between computing
 /// its routing and gathering. See the module docs for how the pieces fit.
 pub(crate) struct MoeOffload {
+    /// `LUMEN_MOE_READ_AHEAD`: the read ahead in flight, landed by the next layer call. First, so
+    /// dropping the offload waits for its reads before the pool they write into goes.
+    ahead: Mutex<Option<Ahead>>,
     bank: Mutex<ExpertBank>,
     /// The slots of the previous layer call, still pinned: that call's gather
     /// is only known to be finished once the next routing readback returns (and
@@ -519,6 +585,12 @@ struct Timing {
     overlap_read_ns: u64,
     overlap_wait_ns: u64,
     overlap_short: u64,
+    /// `LUMEN_MOE_READ_AHEAD`: calls that read ahead, the experts they read, how many of those
+    /// the next call then asked for, and how long calls waited for reads ahead still running.
+    ahead_calls: u64,
+    ahead_reads: u64,
+    ahead_used: u64,
+    ahead_wait_ns: u64,
     /// When the previous call returned.
     last_return: Option<std::time::Instant>,
 }
@@ -553,10 +625,22 @@ impl Timing {
                 self.overlap_short,
             )
         };
+        let ahead = if self.ahead_calls == 0 {
+            String::new()
+        } else {
+            format!(
+                "; read ahead {} experts on {} calls, {:.0}% of them used, waited {:.0} us per \
+                 call for them",
+                self.ahead_reads,
+                self.ahead_calls,
+                100.0 * self.ahead_used as f64 / self.ahead_reads.max(1) as f64,
+                self.ahead_wait_ns as f64 / self.ahead_calls as f64 / 1e3,
+            )
+        };
         format!(
             "[offload] {} layer calls: hit rate {:.3} ({} hits, {} misses); per call: \
              host build {:.0} us, GPU wait {:.0} us, load {:.0} us; {:.0}% of calls read, \
-             {:.0} us and {:.2} MB each{prefetch}{overlap}",
+             {:.0} us and {:.2} MB each{prefetch}{overlap}{ahead}",
             self.calls,
             st.hit_rate(),
             st.hits,
@@ -741,6 +825,7 @@ impl MoeOffload {
             io.mode,
         );
         Ok(Self {
+            ahead: Mutex::new(None),
             bank: Mutex::new(bank),
             pending: Mutex::new(None),
             read_ns_per_expert: AtomicU64::new(0),
@@ -976,7 +1061,9 @@ impl MoeOffload {
         if let Some(prev) = pending.take() {
             prev.release(&mut bank);
         }
+        let landed = self.land_ahead(&mut bank)?;
         let (distinct, index_of) = distinct_in_order(&ids)?;
+        self.note_ahead_used(landed, layer, &distinct);
         let hinted = self.bulk_hint.load(Ordering::Relaxed);
         if takes_staging_path(hinted, distinct.len(), ids.len(), bank.experts_in(layer)) {
             let routed = self.route_bulk(&mut bank, layer, inds, entered, evaluated)?;
@@ -1087,7 +1174,9 @@ impl MoeOffload {
         if let Some(prev) = pending.take() {
             prev.release(&mut bank);
         }
+        let landed = self.land_ahead(&mut bank)?;
         let (distinct, index_of) = distinct_in_order(&ids)?;
+        self.note_ahead_used(landed, layer, &distinct);
         let hinted = self.bulk_hint.load(Ordering::Relaxed);
         if takes_staging_path(hinted, distinct.len(), ids.len(), bank.experts_in(layer)) {
             bail!("offload route: a call built ahead cannot take the staging path");
@@ -1113,26 +1202,110 @@ impl MoeOffload {
     }
 
     /// Whether the routing trace records what each layer's gate predicts for the next.
-    pub(crate) fn traces_predictions(&self) -> bool {
+    fn traces_predictions(&self) -> bool {
         self.trace.is_some() && trace::moe_trace_predict::get()
     }
 
-    /// Hand the routing trace the prediction for `layer`: `ranked` is the flattened result of
-    /// `moe_ranked`, best last.
-    pub(crate) fn trace_prediction(&self, layer: u16, ranked: &Array) -> Result<()> {
-        let Some(trace) = &self.trace else {
-            return Ok(());
-        };
-        ranked
+    /// Whether the model should rank the next layer's experts after a layer call of `rows` rows:
+    /// for the read ahead (decode steps and speculative verifies), or for the routing trace
+    /// (single-row steps).
+    pub(crate) fn wants_prediction(&self, rows: usize) -> bool {
+        rows <= trace::DECODE_ROWS as usize
+            && (read_ahead::get() || (rows == 1 && self.traces_predictions()))
+    }
+
+    /// Take the prediction for the next layer call: record it in the routing trace (single-row
+    /// steps) and, with `LUMEN_MOE_READ_AHEAD`, start reading the experts it ranks highest that
+    /// are not resident. Returns without waiting for the reads.
+    ///
+    /// Call right after the layer call whose routing readback computed `p`: that readback
+    /// finished every earlier GPU use of the slots that call did not pin, which is what lets
+    /// the reads take any of them (see [`ExpertBank::begin_acquire`]).
+    pub(crate) fn predicted(&self, p: &Prediction) -> Result<()> {
+        p.ranked
             .eval()
             .context("offload route: evaluate prediction")?;
-        let best_first: Vec<u16> = Self::read_ids(ranked)?
-            .iter()
-            .rev()
-            .map(|&e| e as u16)
-            .collect();
-        trace.predicted(layer, &best_first);
+        let ids = Self::read_ids(&p.ranked)?;
+        let rows = ids.len() / p.per_row.max(1);
+        if rows == 1
+            && self.traces_predictions()
+            && let Some(trace) = &self.trace
+        {
+            trace.predicted(p.layer, &best_first(&ids, p.per_row, p.per_row)?);
+        }
+        if read_ahead::get() {
+            self.read_ahead(p.layer, &best_first(&ids, p.per_row, READ_AHEAD_TOP)?)?;
+        }
         Ok(())
+    }
+
+    /// Start reading the first `READ_AHEAD_CAP` of `candidates` (experts of `layer`, best first)
+    /// that are not resident into slots of the pool. The next layer call lands them.
+    fn read_ahead(&self, layer: u16, candidates: &[u16]) -> Result<()> {
+        let mut bank = self.bank.lock().unwrap_or_else(|p| p.into_inner());
+        // The staging blocks are lent out until a pool-path call takes them back: the call just
+        // made was staged, so the layers are streaming through regions and nothing is guessed.
+        if bank.in_staging() {
+            return Ok(());
+        }
+        // Only if no layer call came between two predictions, which the model never does.
+        self.land_ahead(&mut bank)?;
+        let experts: Vec<u16> = candidates
+            .iter()
+            .copied()
+            .filter(|&e| !bank.is_resident(layer, e))
+            .take(READ_AHEAD_CAP)
+            .collect();
+        if experts.is_empty() {
+            return Ok(());
+        }
+        let acquiring = bank.begin_acquire(layer, &experts, slot_map::CallKind::Ahead)?;
+        {
+            let mut t = self.timing.lock().unwrap_or_else(|p| p.into_inner());
+            t.ahead_calls += 1;
+            t.ahead_reads += experts.len() as u64;
+        }
+        *self.ahead.lock().unwrap_or_else(|p| p.into_inner()) = Some(Ahead {
+            acquiring,
+            layer,
+            experts,
+        });
+        Ok(())
+    }
+
+    /// Wait for the read ahead in flight, if any, and publish what it read as ordinary resident
+    /// experts, unpinned, before a call plans. Returns its layer and experts. A failed read
+    /// gives its slots back and fails the call: the SSD is the same one the call reads from.
+    fn land_ahead(&self, bank: &mut ExpertBank) -> Result<Option<(u16, Vec<u16>)>> {
+        let Some(mut ahead) = self.ahead.lock().unwrap_or_else(|p| p.into_inner()).take() else {
+            return Ok(None);
+        };
+        let t = std::time::Instant::now();
+        let read = ahead.acquiring.wait_reads();
+        let waited = t.elapsed().as_nanos() as u64;
+        if let Err(e) = read {
+            bank.abort(ahead.acquiring);
+            return Err(e.context("offload: reading ahead"));
+        }
+        let acquired = bank.commit(ahead.acquiring);
+        bank.release(acquired);
+        self.timing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ahead_wait_ns += waited;
+        Ok(Some((ahead.layer, ahead.experts)))
+    }
+
+    /// Count the experts a landed read ahead got right: those the call of `layer` asks for.
+    fn note_ahead_used(&self, landed: Option<(u16, Vec<u16>)>, layer: u16, distinct: &[u16]) {
+        let Some((_, experts)) = landed.filter(|(l, _)| *l == layer) else {
+            return;
+        };
+        let used = experts.iter().filter(|e| distinct.contains(e)).count();
+        self.timing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ahead_used += used as u64;
     }
 
     /// The pool path of a layer call: leave staging, make the call's distinct experts resident
@@ -1495,7 +1668,7 @@ mod overlap_tests {
         );
     }
 
-    fn tiny_offload() -> (MoeOffload, Vec<u16>) {
+    pub(super) fn tiny_offload() -> (MoeOffload, Vec<u16>) {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4exp_tiny");
         let io = IoTuning {
             mode: IoMode::Direct,
@@ -1515,7 +1688,7 @@ mod overlap_tests {
         (off, layers)
     }
 
-    fn routing(ids: &[u32]) -> Array {
+    pub(super) fn routing(ids: &[u32]) -> Array {
         Array::from_slice(ids, &[1, 1, ids.len() as i32])
     }
 
@@ -1622,5 +1795,113 @@ mod overlap_tests {
             .expect("12 of l3");
         bank.release(a);
         bank.release(b);
+    }
+}
+
+#[cfg(test)]
+mod read_ahead_tests {
+    use super::overlap_tests::{routing, tiny_offload};
+    use super::*;
+
+    /// Experts a ranking names for a call, best first: every row's best, then every row's next,
+    /// each once, to the rank asked for.
+    #[test]
+    fn a_ranking_is_read_best_first_across_rows_and_each_expert_once() {
+        // Two rows of four, best last: row 0 ranks 13 > 12 > 11 > 10, row 1 22 > 21 > 13 > 20.
+        let ids = [10, 11, 12, 13, 20, 13, 21, 22];
+        assert_eq!(
+            best_first(&ids, 4, 4).unwrap(),
+            vec![13, 22, 12, 21, 11, 10, 20]
+        );
+        assert_eq!(best_first(&ids, 4, 2).unwrap(), vec![13, 22, 12, 21]);
+        assert_eq!(best_first(&ids[..4], 4, 9).unwrap(), vec![13, 12, 11, 10]);
+        assert!(best_first(&[70_000], 1, 1).is_err(), "not an expert id");
+    }
+
+    /// A read ahead reads at most its cap of the experts that are not resident. The next call
+    /// finds them resident; the guess itself counts as neither hit nor miss, and once that call
+    /// is done every slot but its own can be taken again: the read ahead keeps no pin.
+    #[test]
+    fn experts_read_ahead_are_resident_for_the_next_call_and_hold_no_pin() {
+        let (off, layers) = tiny_offload();
+        let (l0, l1, l2, l3) = (layers[0], layers[1], layers[2], layers[3]);
+        drop(off.route(l0, &routing(&[0, 1, 2, 3])).expect("first call"));
+        assert_eq!(off.stats(), slot_map::Stats { hits: 0, misses: 4 });
+
+        off.read_ahead(l1, &[5, 6, 7, 8]).expect("read ahead");
+        assert_eq!(
+            off.stats(),
+            slot_map::Stats { hits: 0, misses: 4 },
+            "a guess is not a call"
+        );
+        drop(off.route(l1, &routing(&[5, 6, 9, 10])).expect("next call"));
+        assert_eq!(off.stats(), slot_map::Stats { hits: 2, misses: 6 });
+        let report = off.report();
+        assert!(
+            report.contains("read ahead 3 experts on 1 calls, 67% of them used"),
+            "{report}"
+        );
+
+        let mut bank = off.bank.lock().unwrap();
+        assert!(
+            bank.is_resident(l1, 7),
+            "read ahead and not asked for, still resident"
+        );
+        assert!(!bank.is_resident(l1, 8), "past the cap");
+        // 32 slots, 4 pinned by the last call: the other 28 are free to take, and no more.
+        let a = bank
+            .acquire(l2, &(0..16).collect::<Vec<u16>>())
+            .expect("16 of l2");
+        let b = bank
+            .acquire(l3, &(0..12).collect::<Vec<u16>>())
+            .expect("12 of l3");
+        assert!(bank.acquire(l3, &[12]).is_err(), "every slot is pinned now");
+        bank.release(a);
+        bank.release(b);
+    }
+
+    /// What is resident is not read again, so the cap goes to the next experts in the ranking.
+    #[test]
+    fn a_read_ahead_passes_over_resident_experts() {
+        let (off, layers) = tiny_offload();
+        let l0 = layers[0];
+        drop(off.route(l0, &routing(&[0, 1, 2, 3])).expect("first call"));
+        off.read_ahead(l0, &[0, 1, 4, 5, 6, 7]).expect("read ahead");
+        drop(off.route(l0, &routing(&[4, 5, 6, 7])).expect("next call"));
+        assert_eq!(off.stats(), slot_map::Stats { hits: 3, misses: 5 });
+        assert!(
+            off.report()
+                .contains("read ahead 3 experts on 1 calls, 100% of them used")
+        );
+    }
+
+    /// A staged call borrows the pool's last block. Experts read ahead into it must have landed
+    /// and lost their pins first (the slot map checks that no pinned slot is borrowed), and
+    /// while the block is lent out nothing is read ahead.
+    #[test]
+    fn a_staged_call_lands_the_read_ahead_before_borrowing_its_slots() {
+        let (off, layers) = tiny_offload();
+        // 32 slots, the staging block is the last 16: fill the first 16, so the read ahead
+        // lands in the block.
+        for &l in &layers[..4] {
+            drop(off.route(l, &routing(&[0, 1, 2, 3])).expect("fill"));
+        }
+        off.read_ahead(layers[0], &[8, 9, 10]).expect("read ahead");
+        off.set_bulk_hint(true);
+        drop(
+            off.route(layers[1], &routing(&[4, 5, 6, 7]))
+                .expect("staged call"),
+        );
+        assert!(off.bank.lock().unwrap().in_staging());
+        off.read_ahead(layers[2], &[8, 9, 10]).expect("skipped");
+        assert!(
+            off.ahead.lock().unwrap().is_none(),
+            "nothing read ahead while staging"
+        );
+        off.set_bulk_hint(false);
+        drop(
+            off.route(layers[2], &routing(&[0, 1, 2, 3]))
+                .expect("back to the pool"),
+        );
     }
 }

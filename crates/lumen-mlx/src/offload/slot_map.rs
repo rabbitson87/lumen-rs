@@ -189,7 +189,8 @@ impl SlotMap {
     /// evict an expert that a later request in the same call is about to hit.
     ///
     /// `kind` tells a learning eviction policy whether this call's routing is the kind it learns
-    /// from; CLOCK and GCLOCK ignore it.
+    /// from; CLOCK and GCLOCK ignore it. An [`CallKind::Ahead`] call leaves the hit and miss
+    /// counts alone: it routes nothing.
     pub(crate) fn plan_as(
         &mut self,
         needed: &[ExpertKey],
@@ -238,8 +239,10 @@ impl SlotMap {
             pinned.insert(key, slot);
             slots[i] = slot;
         }
-        self.stats.hits += hits;
-        self.stats.misses += loads.len() as u64;
+        if kind != CallKind::Ahead {
+            self.stats.hits += hits;
+            self.stats.misses += loads.len() as u64;
+        }
         Ok(Plan { slots, loads })
     }
 

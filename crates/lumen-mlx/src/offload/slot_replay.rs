@@ -280,9 +280,9 @@ pub(super) fn replay(trace: &Trace, setup: &Setup) -> Run {
     run
 }
 
-/// Read the prediction for call `c` as a call of its own. Prefill-kind, so `bias` does not learn
-/// a transition from experts nobody routed to; its decay clock still ticks once more, which a
-/// real read ahead could avoid.
+/// Read the prediction for call `c` as a call of its own, as `LUMEN_MOE_READ_AHEAD` does: an
+/// `Ahead` call, so `bias` does not learn a transition from experts nobody routed to (its decay
+/// clock still ticks once more, in the engine too).
 fn read_ahead(
     d: &mut Driver,
     c: &Call,
@@ -302,7 +302,7 @@ fn read_ahead(
     if keys.is_empty() {
         return;
     }
-    d.call(keys, CallKind::Prefill);
+    d.call(keys, CallKind::Ahead);
     run.ahead_reads += keys.len() as u64;
     run.ahead_used += keys.iter().filter(|k| c.ids.contains(&k.expert)).count() as u64;
 }

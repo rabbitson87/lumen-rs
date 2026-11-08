@@ -276,6 +276,11 @@ impl ExpertBank {
         self.n_slots - (self.regions - region) * self.width
     }
 
+    /// Whether the staging blocks are lent out (a staged call ran, and no pool-path call since).
+    pub(crate) fn in_staging(&self) -> bool {
+        self.staging
+    }
+
     /// How many staging regions this pool lends: with one, a layer's reads cannot start before
     /// the layer before it is done, so nothing is prefetched.
     pub(crate) fn regions(&self) -> usize {

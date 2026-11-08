@@ -35,6 +35,7 @@ value → on.
 | `LUMEN_MOE_IO_THROTTLE_GBPS` | off | Diagnostic | `lumen_mlx::offload::io::io_throttle` |
 | `LUMEN_MOE_OVERLAP` | off | Optimization | `lumen_mlx::offload::overlap` |
 | `LUMEN_MOE_PROBE_LAYER_SYNC` | off | Diagnostic | `lumen_mlx::native_moe::imp::moe_layer_sync_probe` |
+| `LUMEN_MOE_READ_AHEAD` | off | Optimization | `lumen_mlx::offload::read_ahead` |
 | `LUMEN_MOE_TRACE` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace` |
 | `LUMEN_MOE_TRACE_PREDICT` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace_predict` |
 | `LUMEN_MTP_COARSE_HEAD` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::mtp_coarse_head` |
@@ -436,6 +437,20 @@ Task 023 Phase 0 probe: read the routed expert ids back to the CPU at
  expert cache needs exactly this readback, so the decode-time delta
  against the default is the sync tax on its own. Output unchanged.
 
+### `LUMEN_MOE_READ_AHEAD`
+
+*Optimization, default off.*
+
+Read the next layer's likely experts into the pool while the GPU works. After each layer
+ call of a decode step or a speculative verify, the next layer's gate is asked about this
+ layer's streams, mixed the way the next layer mixes its MoE input (the ranking is computed
+ with the routing it follows), and up to 3 of its 10 best-ranked experts per row that are
+ not resident are read into slots on an async ticket. The next layer call waits for those
+ reads, usually landed by then, and finds them resident. Only which experts are resident
+ when changes, never the output. Replayed on a recorded Flash-Next trace at a 19.8 GB pool
+ (7,161 slots): decode hit rate 88.1% -> 94.6%, reads a step waits for 57 -> 26 per token,
+ but 77 reads in all, 59% of those read ahead used. Off until measured on the real server.
+
 ### `LUMEN_MOE_TRACE`
 
 *Diagnostic, default off.*
@@ -452,8 +467,8 @@ Write a binary trace of the expert pool's layer calls (expert ids in request ord
 
 With `LUMEN_MOE_TRACE`: also record, before each layer's decode call, the experts that
  layer's gate ranks highest for the streams before the previous layer's experts: the newest
- thing a read ahead could know. Only `LUMEN_QWEN4_BUILD_AHEAD` decode steps record it. Adds
- one mix and one gate per layer per token; never changes the output or what is resident.
+ thing a read ahead could know. Only single-row decode steps record it. Adds one mix and one
+ gate per layer per token; never changes the output or what is resident.
 
 ### `LUMEN_MTP_COARSE_HEAD`
 

@@ -30,7 +30,7 @@ use crate::native_rope::rope;
 use crate::native_ssm::{compute_g, gated_delta_step_kernel};
 use crate::offload::lowbit::LowbitSpec;
 use crate::offload::trace::PREDICT_TOP;
-use crate::offload::{IoMode, IoTuning, MoeOffload};
+use crate::offload::{IoMode, IoTuning, MoeOffload, Prediction};
 use crate::qwen3_5_moe::{NativeWeights, ResolvedLinear};
 
 mod mtp;
@@ -1627,7 +1627,14 @@ impl Qwen4ExpModel {
                     probe::stage(Stage::Ple, &[&h])?;
                 }
                 h = self
-                    .layer_forward(layer, &h, &mut cache.layers[i], None, at)
+                    .layer_forward(
+                        layer,
+                        self.layers.get(i + 1),
+                        &h,
+                        &mut cache.layers[i],
+                        None,
+                        at,
+                    )
                     .with_context(|| format!("layer {i}"))?;
             }
         }
@@ -1703,6 +1710,7 @@ impl Qwen4ExpModel {
             h = self
                 .layer_forward(
                     layer,
+                    self.layers.get(i + 1),
                     &h,
                     &mut cache.layers[i],
                     Some(&mut gdn_first[i]),
@@ -2057,7 +2065,7 @@ impl Qwen4ExpModel {
                         None => RopeAt::Index,
                     };
                     *h = self
-                        .layer_forward(layer, h, &mut f.cache.layers[i], None, at)
+                        .layer_forward(layer, None, h, &mut f.cache.layers[i], None, at)
                         .with_context(|| format!("layer {i}"))?;
                     if layer_major {
                         // Settle the chunk before the next one starts: the staged experts the
@@ -2401,9 +2409,12 @@ impl Qwen4ExpModel {
         self.low.as_ref().map(|low| low.offload.report())
     }
 
+    /// One layer. `next` is the layer after it, whose experts the offload may read ahead while
+    /// this one computes (see [`Self::next_layer_ranked`]); `None` where nothing is read ahead.
     fn layer_forward(
         &self,
         layer: &Layer,
+        next: Option<&Layer>,
         h: &Array,
         state: &mut LayerState,
         first_row: Option<&mut Option<GdnState>>,
@@ -2411,7 +2422,21 @@ impl Qwen4ExpModel {
     ) -> Result<Array> {
         let front = self.layer_front(layer, h, state, first_row, at)?;
         let view = self.expert_view(&layer.moe);
+        let predicted = match self.expert_source() {
+            Some(off) => {
+                self.next_layer_ranked(off, next, &front.h_mid, front.x.shape()[1] as usize)?
+            }
+            None => None,
+        };
+        if let Some(p) = &predicted {
+            // Ahead of the routing, so the routing's readback finds it computed.
+            mlx_rs::transforms::async_eval([&p.ranked])
+                .context("submit the next layer's ranking")?;
+        }
         let x = moe_block_forward(&front.x, &view).context("moe block")?;
+        if let (Some(off), Some(p)) = (self.expert_source(), &predicted) {
+            off.predicted(p).context("read ahead")?;
+        }
         self.layer_back(&front.h_mid, &x, &front.inject)
     }
 
@@ -2498,9 +2523,10 @@ impl Qwen4ExpModel {
                 moe_router(&front.x, &view).with_context(|| format!("layer {i}"))?;
             let k = inds.shape().last().copied().unwrap_or(1).max(1) as usize;
             let flat = mlx_rs::ops::reshape(&inds, &[-1])?;
-            let predicted = self.next_layer_ranked(off, i, &front.h_mid)?;
+            let predicted =
+                self.next_layer_ranked(off, self.layers.get(i + 1), &front.h_mid, rows)?;
             let mut submit = vec![&flat];
-            submit.extend(predicted.iter().map(|(_, ranked)| ranked));
+            submit.extend(predicted.iter().map(|p| &p.ranked));
             mlx_rs::transforms::async_eval(submit).with_context(|| format!("layer {i}: submit"))?;
             let (routed, slots) = off.routed_ahead(layer.moe.layer, inds.shape())?;
             let moe_out = moe_after_routing(&front.x, &view, &routed, &scores)
@@ -2513,8 +2539,9 @@ impl Qwen4ExpModel {
             };
             off.route_ahead(layer.moe.layer, &flat, k, &slots)
                 .with_context(|| format!("layer {i}: expert offload routing failed"))?;
-            if let Some((next_layer, ranked)) = &predicted {
-                off.trace_prediction(*next_layer, ranked)?;
+            if let Some(p) = &predicted {
+                off.predicted(p)
+                    .with_context(|| format!("layer {i}: read ahead"))?;
             }
             match next {
                 Some(f) => front = f,
@@ -2524,24 +2551,28 @@ impl Qwen4ExpModel {
         Ok(h)
     }
 
-    /// For the routing trace: layer `i + 1`'s gate on the streams after layer `i`'s mixer, mixed the
-    /// way layer `i + 1` mixes its MoE input, flattened, with the experts it ranks highest last
-    /// (see [`moe_ranked`]). The newest thing that exists before layer `i`'s experts do.
+    /// For the read ahead and the routing trace, when the offload wants one after a call of
+    /// `rows` rows: `next`'s gate on the streams after this layer's mixer (`h_mid`), mixed the way
+    /// `next` mixes its MoE input, with the experts it ranks highest last (see [`moe_ranked`]).
+    /// The newest thing that exists before this layer's experts do.
     fn next_layer_ranked(
         &self,
         off: &MoeOffload,
-        i: usize,
+        next: Option<&Layer>,
         h_mid: &Array,
-    ) -> Result<Option<(u16, Array)>> {
-        let Some(next) = self.layers.get(i + 1).filter(|_| off.traces_predictions()) else {
+        rows: usize,
+    ) -> Result<Option<Prediction>> {
+        let Some(next) = next.filter(|_| off.wants_prediction(rows)) else {
             return Ok(None);
         };
         let (x, _) = self.hyper_mix(&next.mlp_hc, h_mid)?;
         let ranked = moe_ranked(&x, &self.expert_view(&next.moe), PREDICT_TOP)?;
-        Ok(Some((
-            next.moe.layer,
-            mlx_rs::ops::reshape(&ranked, &[-1])?,
-        )))
+        let per_row = ranked.shape().last().copied().unwrap_or(0).max(0) as usize;
+        Ok(Some(Prediction {
+            layer: next.moe.layer,
+            ranked: mlx_rs::ops::reshape(&ranked, &[-1])?,
+            per_row,
+        }))
     }
 
     /// Layer `i`'s front half on the streams `h`, with its n-gram injection first when it has one.

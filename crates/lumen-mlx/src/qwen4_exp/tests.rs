@@ -399,6 +399,75 @@ fn the_trace_predicts_each_later_layer_and_changes_nothing() {
     }
 }
 
+/// `LUMEN_MOE_READ_AHEAD` reads the experts the next layer's gate ranks highest while the
+/// current layer computes. It changes which experts are resident when, never what is computed:
+/// a prompt, single steps and two-row verify passes give the same logits bit for bit with it on
+/// and off, on the plain and the pipelined decode paths, at pool sizes from every-call-evicts to
+/// all-resident. Where the pool is small it must actually read ahead, and some of it must hit.
+#[test]
+fn reading_ahead_changes_no_logit() {
+    use crate::offload::read_ahead;
+
+    let dir = fixture_dir();
+    let ids = fixture_ids(&dir);
+    let run = |model: &Qwen4ExpModel| -> Vec<f32> {
+        let mut cache = model.make_cache();
+        let mut out = host_f32(&model.forward(&ids[..40], &mut cache, false).unwrap());
+        let mut t = 40;
+        while t + 2 < ids.len() {
+            out.extend(host_f32(
+                &model.forward(&ids[t..t + 1], &mut cache, false).unwrap(),
+            ));
+            let v = model
+                .forward_verify(&ids[t + 1..t + 3], &mut cache)
+                .unwrap();
+            out.extend(host_f32(&v.logits));
+            t += 3;
+        }
+        out
+    };
+    let read_ahead_of = |model: &Qwen4ExpModel| -> (u64, u64) {
+        let report = model.offload_report().expect("offload on");
+        let Some(rest) = report.split("read ahead ").nth(1) else {
+            return (0, 0);
+        };
+        // "read ahead {n} experts on {calls} calls, {pct}% of them used, ..."
+        let n = |s: &str, end: char| {
+            s.split(end)
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        };
+        let read: u64 = n(rest, ' ');
+        let used_pct: u64 = n(rest.split("calls, ").nth(1).unwrap_or(""), '%');
+        (read, read * used_pct / 100)
+    };
+    for pipelined in [false, true] {
+        for budget in [1u64, 20 * 9_900, 34 * 9_900, u64::MAX / 2] {
+            let load = || Qwen4ExpModel::load(&dir, Some(budget)).expect("load with offload");
+            let plain = super::model::build_ahead::with(pipelined, || {
+                read_ahead::with(false, || run(&load()))
+            });
+            let model = load();
+            let got = super::model::build_ahead::with(pipelined, || {
+                read_ahead::with(true, || run(&model))
+            });
+            let (read, used) = read_ahead_of(&model);
+            eprintln!("pipelined {pipelined}, budget {budget}: read ahead {read}, ~{used} used");
+            assert!(
+                got == plain,
+                "pipelined {pipelined}, budget {budget}: reading ahead changed the logits"
+            );
+            if budget < 100 * 9_900 {
+                assert!(
+                    read > 0 && used > 0,
+                    "budget {budget}: nothing read ahead, or none of it used"
+                );
+            }
+        }
+    }
+}
+
 /// Token streams cut into prefill pieces of many sizes: each piece is one layer call of
 /// `rows x 4` index entries, and the sorted gather's kernel depends on that count against the
 /// number of experts in what it gathers over, so a pool of any size must still give the
