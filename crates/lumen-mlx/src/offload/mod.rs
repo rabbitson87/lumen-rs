@@ -17,9 +17,9 @@
 //! * [`trace`] — opt-in recording of every layer call's expert ids (`LUMEN_MOE_TRACE`).
 //!
 //! [`MoeOffload`] is what the model holds: every MoE layer calls
-//! [`MoeOffload::route`] between computing its routing and gathering. With
-//! `LUMEN_MOE_READ_AHEAD` it then hands [`MoeOffload::predicted`] the next layer's ranking, and
-//! the next call finds the experts that ranking put first already read.
+//! [`MoeOffload::route`] between computing its routing and gathering. Flash-Next then hands
+//! [`MoeOffload::predicted`] the next layer's ranking (`LUMEN_MOE_READ_AHEAD`, on by default),
+//! and the next call finds the experts that ranking put first already read.
 
 pub(crate) mod expert_bank;
 pub(crate) mod expert_store;
@@ -76,12 +76,16 @@ lumen_flags::flag! {
     /// with the routing it follows), and up to 3 of its 10 best-ranked experts per row that are
     /// not resident are read into slots on an async ticket. The next layer call waits for those
     /// reads, usually landed by then, and finds them resident. Only which experts are resident
-    /// when changes, never the output. Replayed on a recorded Flash-Next trace at a 19.8 GB pool
-    /// (7,161 slots): decode hit rate 88.1% -> 94.6%, reads a step waits for 57 -> 26 per token,
-    /// but 77 reads in all, 59% of those read ahead used. Off until measured on the real server.
+    /// when changes, never the output (with `LUMEN_QWEN4_MTP`, the draft governor picks rounds
+    /// by measured speed, so a faster step can change which tokens a verify pass computes; that
+    /// holds for any speed change). Only Flash-Next (`qwen4_exp`) asks; other models are
+    /// unaffected. Measured on the real checkpoint (M3 Max, server, ABBA, warm tok/s, pools
+    /// exact): at 15 GB, +14.6% plain, +17.3% with drafts, +7.1% on the `3,64,top` copy, +18.5%
+    /// on the copy with drafts; at 6.7 GB, +10.7%, +13.8%, +14.2%, +15.9%. The hit rate rises
+    /// 5-15 points, 57-72% of what is read ahead is used, and the reads in all grow about 20%.
     pub(crate) read_ahead {
         env: "LUMEN_MOE_READ_AHEAD",
-        default: false,
+        default: true,
         kind: Optimization,
     }
 }
