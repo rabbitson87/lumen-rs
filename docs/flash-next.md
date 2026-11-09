@@ -515,8 +515,9 @@ history, over 7,040 positions of the checkpoint's own replies. Two rows of the c
 The 14 GB column comes from the runs that got 13.3–15.0 GB: the server lowers a requested pool to what is free
 at load, so check the `expert bank` line of its log before reading a speed against a pool size. These speeds are
 without reading ahead; with it, `top` + the draft head gives 10.7 at 6.7 GB and 16.3 at 15 GB (see Reading the
-next layer's experts ahead). At 2 bits, `top`
-agrees 90.80% (86.33% on long prompts); its speed has not been measured.
+next layer's experts ahead). At 2 bits, `top` agrees 90.80% (86.33% on long prompts). With reading ahead on, it
+ran 14.8 alone and 16.2 with the draft head at 6.7 GB, and 18.4 and 21.5 at 15 GB; 3-bit `top` ran 9.9 and 11.1,
+and 14.4 and 16.9, in the same runs (six a side, load 2–5).
 
 - **3 bits holds up on tasks.** Over 80 GSM8K problems it got 78 right against the checkpoint's 77, and over 54
   rounds of tool use it made 0 syntax and 2 schema errors in 60 calls against 0 and 4 in 71. All 267 differences
