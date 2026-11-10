@@ -15,6 +15,12 @@
 //! bits left out are all it takes to get the source's codes back. That costs quality: most weights
 //! sit in the middle of a group's range, so they share few of the levels.
 //!
+//! `pick4` keeps four of the source's own codes per group instead, the four that leave the
+//! group's squared error smallest, with the source's scales and biases. Its levels go where the
+//! group's weights are. It is stored at the source's width, so the source's kernels read it as
+//! they are: it shows what such a format would serve before a kernel for it exists. Packed tight,
+//! it would cost which four (11 bits for four of 16) and two bits a weight.
+//!
 //! This is lossy by design, and it is not what the exact path serves.
 
 use anyhow::{Result, bail};
@@ -30,6 +36,8 @@ pub enum Recipe {
     Top,
     /// The source's top bits, with `(scale, bias)` solved for them.
     TopFit,
+    /// Four of the source's codes per group, the best four, at the source's width.
+    Pick4,
 }
 
 impl Recipe {
@@ -39,6 +47,7 @@ impl Recipe {
             Self::LeastSquares => "lsq",
             Self::Top => "top",
             Self::TopFit => "topfit",
+            Self::Pick4 => "pick4",
         }
     }
 
@@ -53,7 +62,8 @@ impl Recipe {
             "lsq" => Ok(Self::LeastSquares),
             "top" => Ok(Self::Top),
             "topfit" => Ok(Self::TopFit),
-            other => bail!("recipe {other:?} is not `minmax`, `lsq`, `top` or `topfit`"),
+            "pick4" => Ok(Self::Pick4),
+            other => bail!("recipe {other:?} is not `minmax`, `lsq`, `top`, `topfit` or `pick4`"),
         }
     }
 }
@@ -332,7 +342,7 @@ fn fit_group(
     let held = |(s, b): (f32, f32)| (scale_type.held(s), scale_type.held(b));
     let min_max = fit_min_max(xs, top);
     match recipe {
-        Recipe::MinMax | Recipe::Top | Recipe::TopFit => held(min_max),
+        Recipe::MinMax | Recipe::Top | Recipe::TopFit | Recipe::Pick4 => held(min_max),
         Recipe::LeastSquares => {
             let spread = fit_spread(xs, top);
             // A candidate is judged as stored: that is what gets served.
@@ -343,6 +353,67 @@ fn fit_group(
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map_or((0.0, 0.0), |(c, _)| c)
         }
+    }
+}
+
+/// The most codes [`Recipe::Pick4`] picks from: a 4-bit source's.
+const PICK_FROM: usize = 16;
+/// The codes [`Recipe::Pick4`] keeps per group.
+const PICKED: usize = 4;
+
+/// Of the codes counted in `hist`, the [`PICKED`] that leave the least squared error with every
+/// code on the nearest of them, written as `to[code] = the kept code it goes to`.
+///
+/// Kept codes cut the line into runs, and a code goes to its run's. So this is the cheapest split
+/// of the codes into [`PICKED`] runs, each on its best code: the run's mean rounded, where
+/// `Σ n (c - r)²` is least. Exact, by dynamic programming over where each run starts.
+fn pick_codes(hist: &[u32], to: &mut [u32]) {
+    let n = hist.len();
+    debug_assert!((PICKED..=PICK_FROM).contains(&n) && to.len() >= n);
+    // Prefix sums of the counts, the codes and their squares, so a run's error takes O(1).
+    let (mut k, mut s, mut q) = (
+        [0i64; PICK_FROM + 1],
+        [0i64; PICK_FROM + 1],
+        [0i64; PICK_FROM + 1],
+    );
+    for (c, &h) in hist.iter().enumerate() {
+        let (h, c64) = (i64::from(h), c as i64);
+        k[c + 1] = k[c] + h;
+        s[c + 1] = s[c] + h * c64;
+        q[c + 1] = q[c] + h * c64 * c64;
+    }
+    // The error of codes `lo..=hi` on their best code, and that code.
+    let run = |lo: usize, hi: usize| -> (i64, usize) {
+        let (k, s, q) = (k[hi + 1] - k[lo], s[hi + 1] - s[lo], q[hi + 1] - q[lo]);
+        if k == 0 {
+            return (0, lo);
+        }
+        // The mean, rounded: it lies in the run, so the code does too.
+        let r = (2 * s + k) / (2 * k);
+        (q - 2 * r * s + r * r * k, r as usize)
+    };
+    // `best[p][hi]`: the least error of codes `0..=hi` in `p + 1` runs; `from`: where the last
+    // of them starts.
+    let mut best = [[i64::MAX; PICK_FROM]; PICKED];
+    let mut from = [[0usize; PICK_FROM]; PICKED];
+    for hi in 0..n {
+        best[0][hi] = run(0, hi).0;
+    }
+    for p in 1..PICKED {
+        for hi in p..n {
+            for lo in p..=hi {
+                let e = best[p - 1][lo - 1] + run(lo, hi).0;
+                if e < best[p][hi] {
+                    (best[p][hi], from[p][hi]) = (e, lo);
+                }
+            }
+        }
+    }
+    let mut hi = n - 1;
+    for p in (0..PICKED).rev() {
+        let lo = if p == 0 { 0 } else { from[p][hi] };
+        to[lo..=hi].fill(run(lo, hi).1 as u32);
+        hi = lo.saturating_sub(1);
     }
 }
 
@@ -383,6 +454,21 @@ pub(crate) fn requantize(
             src.group_size
         );
     }
+    let picks = spec.recipe == Recipe::Pick4;
+    if picks
+        && (spec.group_size != src.group_size
+            || spec.bits != src.bits
+            || (1usize << src.bits) > PICK_FROM)
+    {
+        bail!(
+            "pick4 is stored as its source is, at most 4 bits: not {} bits in groups of {} from {} \
+             in groups of {}",
+            spec.bits,
+            spec.group_size,
+            src.bits,
+            src.group_size
+        );
+    }
     let shift = src.bits.saturating_sub(spec.bits);
     let t = src.scale_type;
     let src_groups = src.cols / src.group_size;
@@ -407,6 +493,7 @@ pub(crate) fn requantize(
     let mut row = vec![0f32; src.cols];
     let mut codes = vec![0f32; spec.group_size];
     let mut fits = vec![(0f32, 0f32); src_groups];
+    let mut picked = [0u32; PICK_FROM];
 
     for r in 0..src.rows {
         let weight = &src.weight[r * src_row..(r + 1) * src_row];
@@ -427,8 +514,17 @@ pub(crate) fn requantize(
         dst_words.fill(0);
         for (g, xs) in row.chunks_exact(spec.group_size).enumerate() {
             let start = g * spec.group_size;
-            let kept = |i: usize| (read_code(&src_words, start + i, src.bits) >> shift) as f32;
+            let source_code = |i: usize| read_code(&src_words, start + i, src.bits);
+            let kept = |i: usize| (source_code(i) >> shift) as f32;
             let (fs, fb) = match spec.recipe {
+                Recipe::Pick4 => {
+                    let mut hist = [0u32; PICK_FROM];
+                    for i in 0..spec.group_size {
+                        hist[source_code(i) as usize] += 1;
+                    }
+                    pick_codes(&hist[..1 << src.bits], &mut picked);
+                    fits[g]
+                }
                 Recipe::Top => {
                     let (s, b) = fits[g];
                     let step = (1u32 << shift) as f32;
@@ -446,6 +542,8 @@ pub(crate) fn requantize(
             for (i, &x) in xs.iter().enumerate() {
                 let q = if keeps {
                     kept(i)
+                } else if picks {
+                    picked[source_code(i) as usize] as f32
                 } else {
                     code_of(x, fs, fb, top)
                 };
@@ -733,6 +831,148 @@ mod tests {
         assert!(run(2, 32));
         assert!(!run(2, 64), "other groups");
         assert!(!run(4, 32), "as many bits");
+    }
+
+    /// Squared code error of `hist` with every code on `to[code]`.
+    fn code_error(hist: &[u32], to: &[u32]) -> i64 {
+        hist.iter()
+            .enumerate()
+            .map(|(c, &h)| i64::from(h) * (c as i64 - i64::from(to[c])).pow(2))
+            .sum()
+    }
+
+    /// The least squared code error of `hist` over every four of its codes, each code on the
+    /// nearest of them.
+    fn best_four_by_search(hist: &[u32]) -> i64 {
+        let n = hist.len() as i64;
+        let mut best = i64::MAX;
+        for a in 0..n {
+            for b in a + 1..n {
+                for c in b + 1..n {
+                    for d in c + 1..n {
+                        let e = (0..n)
+                            .map(|x| {
+                                let near = [a, b, c, d].map(|r| (x - r).pow(2)).into_iter().min();
+                                i64::from(hist[x as usize]) * near.unwrap_or(0)
+                            })
+                            .sum();
+                        best = best.min(e);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn pick4_finds_the_four_codes_a_search_of_every_four_finds() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for trial in 0..300 {
+            let mut hist = [0u32; 16];
+            match trial % 5 {
+                // Bunched like real weights, at different spreads.
+                0 | 1 => {
+                    let spread = 0.5 + 3.0 * rng.next();
+                    for _ in 0..64 {
+                        let c = (7.5 + spread * rng.gauss()).round().clamp(0.0, 15.0);
+                        hist[c as usize] += 1;
+                    }
+                }
+                // Uniform.
+                2 => (0..64).for_each(|_| hist[(rng.next() * 16.0) as usize % 16] += 1),
+                // Four codes or fewer: nothing is lost.
+                3 => {
+                    (0..64).for_each(|_| hist[[0, 5, 6, 15][(rng.next() * 4.0) as usize % 4]] += 1)
+                }
+                // A few heavy codes and lone outliers.
+                _ => {
+                    hist[(rng.next() * 16.0) as usize % 16] += 40;
+                    (0..24).for_each(|_| hist[(rng.next() * 16.0) as usize % 16] += 1);
+                }
+            }
+            let mut to = [0u32; 16];
+            pick_codes(&hist, &mut to);
+            let kept: std::collections::BTreeSet<u32> =
+                (0..16).filter(|&c| hist[c] > 0).map(|c| to[c]).collect();
+            assert!(kept.len() <= 4, "trial {trial}: {kept:?}");
+            assert_eq!(
+                code_error(&hist, &to),
+                best_four_by_search(&hist),
+                "trial {trial}"
+            );
+            if trial % 5 == 3 {
+                assert_eq!(code_error(&hist, &to), 0, "trial {trial}");
+            }
+        }
+        // Four codes of a 2-bit source are all of them.
+        let mut to = [0u32; 4];
+        pick_codes(&[3, 1, 4, 1], &mut to);
+        assert_eq!(to, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn pick4_keeps_the_sources_scales_and_four_of_its_codes_a_group() {
+        let (rows, cols, gs) = (8, 128, 64);
+        let src = bunched(rows, cols, gs, 25);
+        let spec = LowbitSpec::new(4, gs, Recipe::Pick4).unwrap();
+        let (w, s, b, f) = requantized(proj(&src, rows, cols, gs), spec);
+        assert_eq!(
+            (&s, &b),
+            (&src.1, &src.2),
+            "the scales and biases are the source's"
+        );
+        let (source_codes, copy) = (words(&src.0), words(&w));
+        for g in 0..rows * cols / gs {
+            let codes: Vec<u32> = (g * gs..(g + 1) * gs)
+                .map(|i| read_code(&copy, i, 4))
+                .collect();
+            let kept: std::collections::BTreeSet<u32> = codes.iter().copied().collect();
+            assert!(kept.len() <= 4, "group {g}: {kept:?}");
+            let mut hist = [0u32; 16];
+            for i in g * gs..(g + 1) * gs {
+                hist[read_code(&source_codes, i, 4) as usize] += 1;
+            }
+            let mut to = [0u32; 16];
+            for (i, &c) in (g * gs..(g + 1) * gs).zip(&codes) {
+                to[read_code(&source_codes, i, 4) as usize] = c;
+            }
+            assert_eq!(
+                code_error(&hist, &to),
+                best_four_by_search(&hist),
+                "group {g}"
+            );
+        }
+        // Where the weights bunch, levels that go to them beat levels spread evenly.
+        let top = requantized(
+            proj(&src, rows, cols, gs),
+            LowbitSpec::new(2, gs, Recipe::Top).unwrap(),
+        )
+        .3;
+        assert!(f.err < top.err * 0.6, "{} against top's {}", f.err, top.err);
+    }
+
+    #[test]
+    fn pick4_is_stored_as_its_source_is() {
+        let src = source(2, 128, 32, 26);
+        let run = |bits, gs| {
+            let groups = 128 / gs;
+            let (mut w, mut s, mut b) = (
+                vec![0u8; 2 * row_bytes(128, bits).unwrap()],
+                vec![0u8; 2 * groups * 2],
+                vec![0u8; 2 * groups * 2],
+            );
+            let dst = PackedProjMut {
+                weight: &mut w,
+                scales: &mut s,
+                biases: &mut b,
+            };
+            let spec = LowbitSpec::new(bits, gs, Recipe::Pick4).unwrap();
+            requantize(proj(&src, 2, 128, 32), spec, dst).is_ok()
+        };
+        assert!(run(4, 32));
+        assert!(!run(4, 64), "other groups");
+        assert!(!run(2, 32), "fewer bits");
+        assert!(!run(8, 32), "more bits");
     }
 
     /// What MLX itself reads out of packed words, scales and biases.

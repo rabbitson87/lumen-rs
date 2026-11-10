@@ -2,8 +2,10 @@
 //!
 //! ```text
 //! cargo run --release -p lumen-mlx --features mlx-native --example qwen4_exp_lowbit_pack -- \
-//!     <model_dir> [--bits 2] [--group 64] [--recipe lsq|minmax|top|topfit]
+//!     <model_dir> [--bits 2] [--group 64] [--recipe lsq|minmax|top|topfit|pick4]
 //! ```
+//!
+//! `pick4` is stored at the source's width: `--bits 4 --recipe pick4` for a 4-bit checkpoint.
 //!
 //! Prints how close each projection stayed, in dB. The copy is another model, not a cache of this
 //! one: nothing reads it unless asked to.
@@ -30,7 +32,7 @@ fn main() -> anyhow::Result<()> {
         .context("--group")?;
     let recipe = Recipe::parse(take("--recipe").as_deref().unwrap_or("lsq"))?;
     let [dir] = args.as_slice() else {
-        bail!("usage: <model_dir> [--bits 2] [--group 64] [--recipe lsq|minmax|top|topfit]");
+        bail!("usage: <model_dir> [--bits 2] [--group 64] [--recipe lsq|minmax|top|topfit|pick4]");
     };
     let dir = PathBuf::from(dir);
     let cfg = Qwen4ExpConfig::load(&dir)?;
