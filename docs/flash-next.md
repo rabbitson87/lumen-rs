@@ -530,3 +530,9 @@ and 14.4 and 16.9, in the same runs (six a side, load 2–5).
   state of the linear attention layers and stays there to the end of the text. `top` holds better on the same
   text, KL 0.27, and is not free of it. The next user turn cleared it in the one case tried, and the reply agreed
   as usual (93%). A very long single reply has not been measured.
+- **Correcting a copy where it is unsure does not bring it to the checkpoint.** Running a position again on the
+  checkpoint's experts when the copy's top two are close (`qwen4_exp_quant_quality correct`) fixed about a
+  quarter of the corrected tokens and broke 7–10% that the copy had right, because the state before them is the
+  copy's. 2 bits went from 90.80% to 93.35% with 14% of positions corrected, 3 bits from 96.21% to 96.51% with
+  3%, and both ran 12–18% slower than 3 bits alone at the same memory (without the draft head). For agreement
+  closer to the checkpoint, use more bits or the checkpoint itself.
