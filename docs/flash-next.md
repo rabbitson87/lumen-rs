@@ -536,3 +536,10 @@ and 14.4 and 16.9, in the same runs (six a side, load 2–5).
   copy's. 2 bits went from 90.80% to 93.35% with 14% of positions corrected, 3 bits from 96.21% to 96.51% with
   3%, and both ran 12–18% slower than 3 bits alone at the same memory (without the draft head). For agreement
   closer to the checkpoint, use more bits or the checkpoint itself.
+- **Choosing each group's four levels does not help 2 bits either.** `pick4` keeps, per group of 64, the four
+  of the checkpoint's 16 codes that leave the least weight error, the way some 2-bit formats pick their levels
+  per block. It agreed 90.36% (86.32% on long prompts) against 90.80% for `top`, whose levels are fixed: the
+  same, within the measure, though its weight error is the lowest of the 2-bit copies. The best fit pulls a
+  group's few extreme weights in toward the rest, and it missed twice as many tokens the checkpoint was sure
+  of. Both copies miss mostly the same positions. `pick4` is stored at 4 bits so the checkpoint's kernels
+  serve it (`4,64,pick4`, the checkpoint's size): it is a measurement, not a faster mode.
