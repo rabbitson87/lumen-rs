@@ -52,6 +52,20 @@
 //!
 //! feeds one recorded text through the checkpoint and the copy side by side, in one process, and
 //! writes how far apart each layer's state is after every chunk.
+//!
+//! A copy corrected from the checkpoint where it is unsure, along the same history:
+//!
+//! ```text
+//! ... correct <model_dir> <out.tsv> <ref.bin...> --low 2,64,top [--gate 0.65]
+//!         [--low-budget-gb 12] [--budget-gb 3]
+//! ```
+//!
+//! feeds each record's prompt and tokens through the copy, one position at a time after the
+//! prompt. Where the copy's own top two are closer than `--gate`, its step is thrown away and run
+//! again on the checkpoint's experts from the state before it, and that state is the one carried
+//! on: what a correcting decode would serve. Without `--gate` it is the copy alone. It prints how
+//! often the result is the record's token, how many positions were corrected, the time of a plain
+//! and of a corrected position, and tokens/s. Each TSV row is one position.
 
 #[cfg(feature = "mlx-native")]
 mod imp {
@@ -714,6 +728,124 @@ mod imp {
         Ok(())
     }
 
+    /// Positions of a `correct` run and the time they took.
+    #[derive(Default)]
+    struct Corrected {
+        n: usize,
+        same: usize,
+        corrected: usize,
+        plain_s: f64,
+        corrected_s: f64,
+    }
+
+    impl Corrected {
+        fn add(&mut self, same: bool, corrected: bool, secs: f64) {
+            self.n += 1;
+            self.same += usize::from(same);
+            if corrected {
+                self.corrected += 1;
+                self.corrected_s += secs;
+            } else {
+                self.plain_s += secs;
+            }
+        }
+
+        fn merge(&mut self, other: &Self) {
+            self.n += other.n;
+            self.same += other.same;
+            self.corrected += other.corrected;
+            self.plain_s += other.plain_s;
+            self.corrected_s += other.corrected_s;
+        }
+
+        fn line(&self) -> String {
+            let share = |k: usize| 100.0 * k as f64 / self.n.max(1) as f64;
+            let ms = |secs: f64, k: usize| 1e3 * secs / k.max(1) as f64;
+            format!(
+                "{} positions, {:.2}% same, {} corrected ({:.2}%); plain {:.1} ms, corrected {:.1} ms; \
+                 {:.2} tok/s",
+                self.n,
+                share(self.same),
+                self.corrected,
+                share(self.corrected),
+                ms(self.plain_s, self.n - self.corrected),
+                ms(self.corrected_s, self.corrected),
+                self.n as f64 / (self.plain_s + self.corrected_s).max(1e-9),
+            )
+        }
+    }
+
+    /// One decode step on whichever tier is set: the top two after `token`.
+    fn step(model: &Qwen4ExpModel, token: u32, cache: &mut Qwen4ExpCache) -> Result<Top2> {
+        Top2::of(&last_row(&model.forward(&[token], cache, true)?)?)
+    }
+
+    fn correct(
+        model: &Qwen4ExpModel,
+        out: &Path,
+        recs: &[PathBuf],
+        gate: Option<f32>,
+    ) -> Result<()> {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
+        writeln!(
+            w,
+            "seq\tpos\tref_top1\tref_margin\tlow_top1\tlow_margin\tcorrected\ttop1\tms"
+        )?;
+        let mut all = Corrected::default();
+        let mut s = 0;
+        for rec in recs {
+            for seq in load_greedy(rec)? {
+                let t0 = Instant::now();
+                let mut cache = model.make_cache();
+                model.set_expert_tier(ExpertTier::Low)?;
+                feed_prompt(model, &seq.prompt, &mut cache)?;
+                let prefill = t0.elapsed().as_secs_f64();
+                // The token before position `i`: the prompt's last, then the record's own picks.
+                let feed = std::iter::once(seq.prompt[seq.prompt.len() - 1])
+                    .chain(seq.steps.iter().map(|t| t.ids[0]));
+                let mut tally = Corrected::default();
+                for (pos, (token, r)) in feed.zip(&seq.steps).enumerate() {
+                    let at = Instant::now();
+                    let before = gate.map(|_| cache.clone());
+                    let low = step(model, token, &mut cache)?;
+                    let full = match before {
+                        Some(before) if gate.is_some_and(|g| low.margin() < g) => {
+                            cache = before;
+                            model.set_expert_tier(ExpertTier::Full)?;
+                            let full = step(model, token, &mut cache);
+                            model.set_expert_tier(ExpertTier::Low)?;
+                            Some(full?)
+                        }
+                        _ => None,
+                    };
+                    let secs = at.elapsed().as_secs_f64();
+                    let top1 = full.unwrap_or(low).ids[0];
+                    tally.add(top1 == r.ids[0], full.is_some(), secs);
+                    writeln!(
+                        w,
+                        "{s}\t{pos}\t{}\t{:.4}\t{}\t{:.4}\t{}\t{top1}\t{:.2}",
+                        r.ids[0],
+                        r.margin(),
+                        low.ids[0],
+                        low.margin(),
+                        u8::from(full.is_some()),
+                        secs * 1e3,
+                    )?;
+                }
+                eprintln!(
+                    "seq {s}: {} prompt tokens in {prefill:.1} s; {}",
+                    seq.prompt.len(),
+                    tally.line()
+                );
+                all.merge(&tally);
+                s += 1;
+            }
+        }
+        w.flush()?;
+        println!("{}", all.line());
+        Ok(())
+    }
+
     pub fn main() -> Result<()> {
         let mut args: Vec<String> = std::env::args().skip(1).collect();
         let mut take = |flag: &str| -> Option<String> {
@@ -748,9 +880,13 @@ mod imp {
             .and_then(|v| v.parse().ok())
             .unwrap_or(12.0);
         let low = take("--low").map(|v| LowbitSpec::parse(&v)).transpose()?;
+        let gate = take("--gate")
+            .map(|v| v.parse::<f32>().with_context(|| format!("--gate {v:?}")))
+            .transpose()?;
         let usage = "usage: record <model_dir> <out.bin> <text files...> | \
              compare <model_dir> <ref.bin> | greedy <model_dir> <out.bin> <prompt files...> | \
-             audit <model_dir> <ref.bin> <out.tsv> | state <model_dir> <ref.bin> <out.tsv>";
+             audit <model_dir> <ref.bin> <out.tsv> | state <model_dir> <ref.bin> <out.tsv> | \
+             correct <model_dir> <out.tsv> <ref.bin...>";
         let (mode, dir, file) = match args.as_slice() {
             [m, d, f, ..] => (m.clone(), PathBuf::from(d), PathBuf::from(f)),
             _ => bail!(usage),
@@ -816,6 +952,25 @@ mod imp {
                 audit(&model, &dir, &file, &out, plan)?;
                 if let Some(report) = model.low_offload_report() {
                     eprintln!("[low] {report}");
+                }
+                Ok(())
+            }
+            "correct" => {
+                if low.is_none() {
+                    bail!(
+                        "correct runs a copy and corrects it from the checkpoint: it needs --low"
+                    );
+                }
+                let recs: Vec<PathBuf> = args[3..].iter().map(PathBuf::from).collect();
+                if recs.is_empty() {
+                    bail!(usage);
+                }
+                correct(&model, &file, &recs, gate)?;
+                if let Some(report) = model.low_offload_report() {
+                    eprintln!("[low] {report}");
+                }
+                if let Some(report) = model.offload_report() {
+                    eprintln!("[checkpoint] {report}");
                 }
                 Ok(())
             }
