@@ -4,7 +4,8 @@ Flash-Next (`pipenetwork/Qwen3.8-Flash-Next-MLX-4bit`, 125B parameters, 6B activ
 mixture-of-experts model whose routed experts are 68 GB of its 97 GB. lumen keeps the rest (about 3.6 GB
 of attention, DeltaNet and shared weights) in memory and serves the routed experts from the SSD through
 a pool of memory slots, so the model runs on a Mac whose RAM is a fraction of its size. The output is
-the model's own: an expert's bytes are the checkpoint's bytes, read from disk instead of memory.
+the model's own: an expert's bytes are the checkpoint's bytes, read from disk instead of memory. The same
+publisher's mixed 4/8-bit build is much closer to the original weights; see the last section.
 
 This page lists the options. Every one of them changes speed or memory, none changes what the model
 computes, except speculative decoding, which is marked.
@@ -523,8 +524,9 @@ and 14.4 and 16.9, in the same runs (six a side, load 2–5).
   rounds of tool use it made 0 syntax and 2 schema errors in 60 calls against 0 and 4 in 71. All 267 differences
   in agreement are close calls: the checkpoint's top token never led by 2 logits or more where the copy picked
   another.
-- **2 bits does not.** It picks another token at about 10% of positions, some of them confident ones, and it
-  was not put through the task checks.
+- **2 bits does not, on this build.** It picks another token at about 10% of positions, some of them confident
+  ones, and it was not put through the task checks here. On the mixed 4/8-bit build it was, and held up: see the
+  next section.
 - **Inside one long text a copy can drift.** Fed a long document as raw text, a 3-bit `lsq` copy followed the
   checkpoint on seven documents and left it on one, KL 1.11 against about 0.1: the error sits in the recurrent
   state of the linear attention layers and stays there to the end of the text. `top` holds better on the same
@@ -543,3 +545,47 @@ and 14.4 and 16.9, in the same runs (six a side, load 2–5).
   group's few extreme weights in toward the rest, and it missed twice as many tokens the checkpoint was sure
   of. Both copies miss mostly the same positions. `pick4` is stored at 4 bits so the checkpoint's kernels
   serve it (`4,64,pick4`, the checkpoint's size): it is a measurement, not a faster mode.
+
+## The mixed 4/8-bit build
+
+The same publisher's `pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit` keeps the routed experts at 4 bits and
+puts the other 498 matrices (embeddings, attention, DeltaNet, the shared experts) at 8 bits. Its card gives it
++1.3% wikitext perplexity over the bf16 original, against +20.6% for the uniform 4-bit build this page is written
+around. Most of what 4 bits costs this model is in the small weights every token reads, not in the experts.
+lumen serves it as it is. It is 106 GB, 2.4 GB more than the uniform build, and those 2.4 GB stay in memory.
+
+Its routed experts are the uniform build's, byte for byte. A pack or a copy is still tied to the shards it was
+made from, so make them again in the new folder: 63 s for the pack, 72 s for a 2-bit copy. The draft head's two
+files (`mtp.safetensors`, `mtp.json`) can be copied or linked across.
+
+```sh
+lumen-server --pack-experts path/to/mixed-4_8bit
+cargo run --release -p lumen-mlx --features mlx-native --example qwen4_exp_lowbit_pack -- \
+    path/to/mixed-4_8bit --bits 2 --group 64 --recipe top
+LUMEN_QWEN4_EXPERT_COPY=2,64,top MODEL_ID=path/to/mixed-4_8bit lumen-server
+```
+
+Measured on a 36 GB M3 Max, load about 2, reading ahead on. Perplexity is over 40,178 positions of five long
+texts (Rust code, English documentation, Korean). Agreement is how often a build picks the mixed build's token at
+the same history, over 7,067 positions of the mixed build's own replies. Tokens/s are warm rounds as above, and the
+mixed build gets 2.4 GB less pool, so both use the same memory. Task checks are 80 GSM8K problems and 54 rounds
+of tool use (calls, syntax errors, schema errors).
+
+| | Perplexity | Agrees | 6.7 GB | + draft head | 15 GB | + draft head | GSM8K right / wrong / cut | Tool calls |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| Uniform 4-bit | 3.921 | 91.37% | 8.97 | 9.55 | 11.78 | 13.18 | 77 / 1 / 2 | 71, 0, 4 |
+| Mixed 4/8-bit | 3.469 | 100% | 7.27 | 7.99 | 10.72 | 11.02 | 78 / 1 / 1 | 61, 0, 0 |
+| Mixed, 2-bit `top` copy | 3.837 | 91.69% | 11.85 | 11.14 | 15.30 | 16.29 | 79 / 0 / 1 | 60, 0, 0 |
+
+The mixed build alone was measured in a separate run, against the uniform build at 9.00, 9.34, 12.22 and 13.40.
+
+- **The mixed build is the better model and the slower one.** Its perplexity is 11.5% lower, and the two builds
+  pick a different greedy token at 8.6% of positions (14.5% on prompts of 6–10K tokens). At the same memory it
+  runs 0.81× at 6.7 GB and 0.88× at 15 GB: its 8-bit weights take 2.4 GB of pool and are read every token
+  (how much each part costs was not measured).
+- **With a 2-bit copy it is better and faster than the uniform build.** Its perplexity is 2.1% below the uniform
+  build's, against +12.8% for the same copy on the uniform build. It ran 1.32× at 6.7 GB and 1.30× at 15 GB;
+  best against best (with or without the draft head), 1.24× at both. The draft head costs it speed at 6.7 GB
+  and pays at 15 GB.
+- The task checks are small: one problem or a few calls either way is within what a rerun can move.
+- A 3-bit copy of the mixed build has not been measured.
