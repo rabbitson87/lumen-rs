@@ -57,6 +57,14 @@ pub struct QuantSpec {
     pub bits: i32,
 }
 
+impl QuantSpec {
+    /// Bytes of `weights` values stored at this quantization, with a bf16 scale and bias per group.
+    fn stored_bytes(self, weights: u64) -> u64 {
+        let groups = weights / self.group_size.max(1) as u64;
+        weights * self.bits.max(0) as u64 / 8 + groups * 2 * 2
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QuantMap {
     default: QuantSpec,
@@ -517,19 +525,16 @@ impl Qwen4ExpConfig {
         let q = self
             .quant
             .for_base("language_model.model.layers.0.mlp.switch_mlp");
-        let weights = (self.hidden_size * self.moe_intermediate_size) as u64;
-        let groups = weights / q.group_size.max(1) as u64;
-        3 * (weights * q.bits.max(0) as u64 / 8 + groups * 2 * 2)
+        3 * q.stored_bytes((self.hidden_size * self.moe_intermediate_size) as u64)
     }
 
     /// Bytes of the token embedding table as stored: packed rows, with a bf16 scale and bias per
     /// group (0.68 GB on the mixed 4/8-bit build: 248,320 x 2,560, 8-bit, groups of 64). What
     /// reading it from disk ([`super::model::embed_from_disk`]) takes out of memory.
     pub fn token_embedding_bytes(&self) -> u64 {
-        let q = self.quant.for_base(TOKEN_EMBEDDING);
-        let weights = (self.vocab_size * self.hidden_size) as u64;
-        let groups = weights / q.group_size.max(1) as u64;
-        weights * q.bits.max(0) as u64 / 8 + groups * 2 * 2
+        self.quant
+            .for_base(TOKEN_EMBEDDING)
+            .stored_bytes((self.vocab_size * self.hidden_size) as u64)
     }
 
     /// Bytes of the image tower in bf16 (patch embedding, position grid, blocks, merger), for
