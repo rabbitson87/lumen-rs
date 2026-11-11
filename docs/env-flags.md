@@ -67,7 +67,7 @@ value → on.
 | `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
 | `LUMEN_QWEN4_BUILD_AHEAD` | off | Optimization | `lumen_mlx::qwen4_exp::model::build_ahead` |
-| `LUMEN_QWEN4_EMBED_DISK` | off | Optimization | `lumen_mlx::qwen4_exp::model::embed_from_disk` |
+| `LUMEN_QWEN4_EMBED_DISK` | on | Optimization | `lumen_mlx::qwen4_exp::model::embed_from_disk` |
 | `LUMEN_QWEN4_EXPERT_COPY` | off | Behavior | `lumen_mlx::qwen4_exp::runner::expert_copy` |
 | `LUMEN_QWEN4_KV_BF16` | on | Behavior | `lumen_mlx::qwen4_exp::config::kv_bf16` |
 | `LUMEN_QWEN4_MEM_LOG` | off | Diagnostic | `lumen_mlx::qwen4_exp::runner::mem_log` |
@@ -935,7 +935,7 @@ Decode with the offloaded layers pipelined one segment ahead: submit the GPU wor
 
 ### `LUMEN_QWEN4_EMBED_DISK`
 
-*Optimization, default off.*
+*Optimization, default on.*
 
 Read the token embedding's rows from the checkpoint's files instead of holding the table
  in memory, the way the n-gram table is served. A token needs one row of the table (2.7 KB
@@ -945,7 +945,7 @@ Read the token embedding's rows from the checkpoint's files instead of holding t
  the expert pool. On the mixed build (M3 Max): greedy server text is the same with and
  without it; at a fixed pool the process takes 0.57–0.59 GB less; at the same total memory
  decode speed moves −3.0% to +3.7% (no copy and the 2-bit copy, 6.7 and 15 GB pools, four
- runs a side), within noise. Opt-in.
+ runs a side), within noise. On by default; `0` holds the table in memory.
 
 ### `LUMEN_QWEN4_EXPERT_COPY`
 
