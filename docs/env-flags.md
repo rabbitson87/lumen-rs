@@ -942,7 +942,10 @@ Read the token embedding's rows from the checkpoint's files instead of holding t
  of the mixed 4/8-bit build's 0.68 GB), and the output layer has weights of its own, so
  nothing else needs the table. The rows are the same bytes through the same
  dequantization: the output is bit-identical. The memory plan gives the table's bytes to
- the expert pool. Not measured on the real checkpoint yet. Opt-in.
+ the expert pool. On the mixed build (M3 Max): greedy server text is the same with and
+ without it; at a fixed pool the process takes 0.57–0.59 GB less; at the same total memory
+ decode speed moves −3.0% to +3.7% (no copy and the 2-bit copy, 6.7 and 15 GB pools, four
+ runs a side), within noise. Opt-in.
 
 ### `LUMEN_QWEN4_EXPERT_COPY`
 
