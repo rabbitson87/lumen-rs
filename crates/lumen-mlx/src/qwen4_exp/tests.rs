@@ -601,6 +601,130 @@ fn serving_the_ngram_table_from_disk_matches_holding_it_in_memory() {
     );
 }
 
+/// The token embedding read from the checkpoint's files a row at a time
+/// (`LUMEN_QWEN4_EMBED_DISK`) gives the logits the resident table does, whole and fed in
+/// pieces, and a second pass over the same tokens reads nothing.
+#[test]
+fn serving_the_token_embedding_from_disk_matches_holding_it_in_memory() {
+    use super::model::embed_from_disk;
+    let dir = fixture_dir();
+    let want = reference(&dir);
+    let ids: Vec<u32> = want["ids"]
+        .as_slice::<i32>()
+        .iter()
+        .map(|&t| t as u32)
+        .collect();
+    let whole = |model: &Qwen4ExpModel| -> Vec<f32> {
+        let mut cache = model.make_cache();
+        host_f32(&model.forward(&ids, &mut cache, false).unwrap())
+    };
+    // The prompt, then two more tokens one at a time, as decode feeds them.
+    let stepped = |model: &Qwen4ExpModel| -> Vec<f32> {
+        let mut cache = model.make_cache();
+        let (head, tail) = ids.split_at(ids.len() - 2);
+        let mut out = host_f32(&model.forward(head, &mut cache, true).unwrap());
+        for t in tail {
+            out.extend(host_f32(&model.forward(&[*t], &mut cache, true).unwrap()));
+        }
+        out
+    };
+    let resident = embed_from_disk::with(false, || Qwen4ExpModel::load(&dir, None)).unwrap();
+    assert!(resident.embed_stats().is_none());
+    let (baseline, baseline_stepped) = (whole(&resident), stepped(&resident));
+    drop(resident);
+
+    let from_disk = embed_from_disk::with(true, || Qwen4ExpModel::load(&dir, None)).unwrap();
+    assert!(
+        whole(&from_disk) == baseline,
+        "an embedding read from disk changes the logits"
+    );
+    let first = from_disk.embed_stats().expect("read from disk");
+    assert_eq!(first.requested, ids.len() as u64);
+    assert!(first.read_from_disk > 0 && first.read_from_disk <= first.requested);
+    assert!(stepped(&from_disk) == baseline_stepped);
+    let second = from_disk.embed_stats().unwrap();
+    assert_eq!(second.requested, 2 * ids.len() as u64);
+    assert_eq!(
+        second.read_from_disk, first.read_from_disk,
+        "the second pass should have been served from the row cache"
+    );
+    // The pool the model would be given: the experts from disk as well.
+    let both = embed_from_disk::with(true, || Qwen4ExpModel::load(&dir, Some(40 * 9_900))).unwrap();
+    assert!(whole(&both) == baseline);
+}
+
+/// On the real checkpoint: embedding rows read from its files are the rows MLX's own lookup
+/// gives, over a spread of the vocabulary and its last token, with a row cache smaller than the
+/// request. Reads only the embedding (0.68 GB), not the model. Run with `--ignored` and
+/// `LUMEN_QWEN4_MODEL_DIR` set.
+#[test]
+#[ignore = "needs the real Flash-Next checkpoint; set LUMEN_QWEN4_MODEL_DIR"]
+fn real_embedding_rows_read_from_disk_are_the_rows_the_resident_lookup_gives() {
+    use super::config::TOKEN_EMBEDDING;
+    use super::ngram_table::FileTable;
+    use crate::native_embedding::quantized_embedding_lookup_with_mode;
+    use crate::native_quant::MODE_AFFINE;
+    use crate::offload::IoMode;
+    let Ok(dir) = std::env::var("LUMEN_QWEN4_MODEL_DIR") else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    let cfg = Qwen4ExpConfig::load(dir).unwrap();
+    let q = cfg.quant.for_base(TOKEN_EMBEDDING);
+    let mut weights = crate::qwen3_5_moe::NativeWeights::load_dir(dir).unwrap();
+    weights.sanitize().unwrap();
+    let part = |name: &str| {
+        weights
+            .require(&format!("{TOKEN_EMBEDDING}.{name}"))
+            .unwrap()
+    };
+    let last = cfg.vocab_size as u32 - 1;
+    let ids: Vec<u32> = (0..last).step_by(97).chain([last, 0, last]).collect();
+    let ids_i32: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
+    let resident = quantized_embedding_lookup_with_mode(
+        part("weight"),
+        part("scales"),
+        Some(part("biases")),
+        &Array::from_slice(&ids_i32, &[ids.len() as i32]),
+        q.group_size,
+        q.bits,
+        MODE_AFFINE,
+    )
+    .unwrap();
+    let table = FileTable::open(
+        dir,
+        1,
+        &|_| TOKEN_EMBEDDING.to_string(),
+        q.group_size,
+        q.bits,
+        64,
+        IoMode::Buffered,
+    )
+    .unwrap();
+    let rows: Vec<u64> = ids.iter().map(|&t| u64::from(t)).collect();
+    let from_disk = table.gather(&rows).unwrap();
+    assert_eq!(from_disk.shape(), resident.shape());
+    assert_eq!(from_disk.dtype(), resident.dtype());
+    assert_eq!(
+        from_disk.shape(),
+        &[ids.len() as i32, cfg.hidden_size as i32]
+    );
+    let (a, b) = (host_f32(&from_disk), host_f32(&resident));
+    assert!(a.iter().any(|&v| v != 0.0));
+    assert!(
+        a == b,
+        "rows read from disk differ from the resident lookup"
+    );
+    eprintln!(
+        "{} rows of {} ({}-bit, groups of {}): identical; {} read from disk",
+        ids.len(),
+        cfg.hidden_size,
+        q.bits,
+        q.group_size,
+        table.stats().read_from_disk
+    );
+}
+
 /// A request for more rows than the row cache holds still returns every row: a call's rows
 /// come from its own reads and from what the cache held when it started, whatever the cache
 /// keeps afterwards. The table here is the fixture's token embedding, read as one shard.
@@ -610,7 +734,7 @@ fn a_request_larger_than_the_row_cache_returns_every_row() {
     use crate::offload::IoMode;
     let dir = fixture_dir();
     let cfg = Qwen4ExpConfig::load(&dir).unwrap();
-    let base = "language_model.model.embed_tokens";
+    let base = super::config::TOKEN_EMBEDDING;
     let q = cfg.quant.for_base(base);
     let open = |row_cache| {
         FileTable::open(

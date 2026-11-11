@@ -31,6 +31,9 @@ lumen_flags::flag! {
     }
 }
 
+/// The token embedding table's tensors: `<this>.weight`, `.scales` and `.biases`.
+pub(crate) const TOKEN_EMBEDDING: &str = "language_model.model.embed_tokens";
+
 /// Bytes of one cached K, V or indexer-key element: 2 under [`kv_bf16`], else 4.
 pub fn kv_elem_bytes() -> u64 {
     if kv_bf16::get() { 2 } else { 4 }
@@ -519,6 +522,16 @@ impl Qwen4ExpConfig {
         3 * (weights * q.bits.max(0) as u64 / 8 + groups * 2 * 2)
     }
 
+    /// Bytes of the token embedding table as stored: packed rows, with a bf16 scale and bias per
+    /// group (0.68 GB on the mixed 4/8-bit build: 248,320 x 2,560, 8-bit, groups of 64). What
+    /// reading it from disk ([`super::model::embed_from_disk`]) takes out of memory.
+    pub fn token_embedding_bytes(&self) -> u64 {
+        let q = self.quant.for_base(TOKEN_EMBEDDING);
+        let weights = (self.vocab_size * self.hidden_size) as u64;
+        let groups = weights / q.group_size.max(1) as u64;
+        weights * q.bits.max(0) as u64 / 8 + groups * 2 * 2
+    }
+
     /// Bytes of the image tower in bf16 (patch embedding, position grid, blocks, merger), for
     /// the memory plan under `LUMEN_VISION`; 0 for a checkpoint without one.
     pub fn vision_tower_bytes(&self) -> u64 {
@@ -601,6 +614,18 @@ mod tests {
                 "rope_parameters": {"rope_theta": 10000.0, "partial_rotary_factor": 0.25}
             }
         })
+    }
+
+    /// The mixed 4/8-bit build's table: 248,320 rows of 2,560 at 8 bits (635.7 MB) and 40 groups
+    /// a row with a 2-byte scale and bias each (39.7 MB).
+    #[test]
+    fn the_token_embedding_is_sized_from_its_own_quantization() {
+        let mut json = tiny_json();
+        json["quantization"][TOKEN_EMBEDDING] =
+            serde_json::json!({"group_size": 64, "bits": 8, "mode": "affine"});
+        let mut cfg = Qwen4ExpConfig::from_json(&json).unwrap();
+        (cfg.vocab_size, cfg.hidden_size) = (248_320, 2_560);
+        assert_eq!(cfg.token_embedding_bytes(), 635_699_200 + 39_731_200);
     }
 
     #[test]

@@ -178,6 +178,8 @@ pub struct RowStats {
     pub read_from_disk: u64,
 }
 
+/// A table of quantized rows read from the checkpoint's safetensors files on demand. The n-gram
+/// table is 128 shards of one; the token embedding, under `LUMEN_QWEN4_EMBED_DISK`, a single shard.
 pub struct FileTable {
     pool: IoPool,
     shards: Vec<ShardAt>,
