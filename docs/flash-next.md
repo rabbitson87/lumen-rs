@@ -555,7 +555,7 @@ around. Most of what 4 bits costs this model is in the small weights every token
 lumen serves it as it is. It is 106 GB, 2.4 GB more than the uniform build, and those 2.4 GB stay in memory.
 
 Its routed experts are the uniform build's, byte for byte. A pack or a copy is still tied to the shards it was
-made from, so make them again in the new folder: 63 s for the pack, 72 s for a 2-bit copy. The draft head's two
+made from, so make them again in the new folder: 63 s for the pack, about 70 s for a 2-bit or a 3-bit copy. The draft head's two
 files (`mtp.safetensors`, `mtp.json`) can be copied or linked across.
 
 ```sh
@@ -564,6 +564,8 @@ cargo run --release -p lumen-mlx --features mlx-native --example qwen4_exp_lowbi
     path/to/mixed-4_8bit --bits 2 --group 64 --recipe top
 LUMEN_QWEN4_EXPERT_COPY=2,64,top MODEL_ID=path/to/mixed-4_8bit lumen-server
 ```
+
+For the 3-bit copy, `--bits 3` and `3,64,top`.
 
 Measured on a 36 GB M3 Max, load about 2, reading ahead on. Perplexity is over 40,178 positions of five long
 texts (Rust code, English documentation, Korean). Agreement is how often a build picks the mixed build's token at
@@ -575,9 +577,11 @@ of tool use (calls, syntax errors, schema errors).
 |---|---:|---:|---:|---:|---:|---:|---|---|
 | Uniform 4-bit | 3.921 | 91.37% | 8.97 | 9.55 | 11.78 | 13.18 | 77 / 1 / 2 | 71, 0, 4 |
 | Mixed 4/8-bit | 3.469 | 100% | 7.27 | 7.99 | 10.72 | 11.02 | 78 / 1 / 1 | 61, 0, 0 |
+| Mixed, 3-bit `top` copy | 3.570 | 96.18% | 9.46 | 10.01 | 13.01 | 15.12 | 79 / 0 / 1 | 61, 0, 0 |
 | Mixed, 2-bit `top` copy | 3.837 | 91.69% | 11.85 | 11.14 | 15.30 | 16.29 | 79 / 0 / 1 | 60, 0, 0 |
 
 The mixed build alone was measured in a separate run, against the uniform build at 9.00, 9.34, 12.22 and 13.40.
+The 3-bit copy was measured in a third, beside the 2-bit copy at 11.16 and 15.30 without the draft head.
 
 - **The mixed build is the better model and the slower one.** Its perplexity is 11.5% lower, and the two builds
   pick a different greedy token at 8.6% of positions (14.5% on prompts of 6–10K tokens). At the same memory it
@@ -587,5 +591,10 @@ The mixed build alone was measured in a separate run, against the uniform build 
   build's, against +12.8% for the same copy on the uniform build. It ran 1.32× at 6.7 GB and 1.30× at 15 GB;
   best against best (with or without the draft head), 1.24× at both. The draft head costs it speed at 6.7 GB
   and pays at 15 GB.
-- The task checks are small: one problem or a few calls either way is within what a rerun can move.
-- A 3-bit copy of the mixed build has not been measured.
+- **A 3-bit copy keeps nearly all of the mixed build.** Its perplexity is 2.9% above the mixed build's and 8.9%
+  below the uniform build's. It agrees 96.18% (95.12% on long prompts), as the 3-bit copy of the uniform build
+  did with its own (96.21%). It ran 0.85× the 2-bit copy in the same run, and with the draft head at 15 GB as
+  fast as the 2-bit copy without it. Against the uniform build, which was not in that run, that is about 1.05×
+  at 6.7 GB and 1.10–1.15× at 15 GB.
+- The task checks are small: one problem or a few calls either way is within what a rerun can move. The 3-bit
+  copy named one file that does not exist, in 61 calls; no other build did.
