@@ -302,13 +302,13 @@ impl FileTable {
         self.w_bytes + 2 * self.s_bytes
     }
 
-    fn gather(&self, row_ids: &[u64]) -> Result<Array> {
+    pub(crate) fn gather(&self, row_ids: &[u64]) -> Result<Array> {
         let rb = self.row_bytes();
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
 
-        // Distinct rows this call has to fetch.
+        // Distinct rows this call has to fetch, and where each lands in `buf`.
         let mut missing: Vec<u64> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut fresh: HashMap<u64, usize> = HashMap::new();
         for &id in row_ids {
             if (id / self.rows_per_shard) as usize >= self.shards.len() {
                 bail!(
@@ -317,13 +317,14 @@ impl FileTable {
                     self.shards.len()
                 );
             }
-            if cache.get(id).is_none() && seen.insert(id) {
+            if cache.get(id).is_none() && !fresh.contains_key(&id) {
+                fresh.insert(id, missing.len());
                 missing.push(id);
             }
         }
 
+        let mut buf = vec![0u8; missing.len() * rb];
         if !missing.is_empty() {
-            let mut buf = vec![0u8; missing.len() * rb];
             let base = buf.as_mut_ptr();
             let mut jobs = Vec::with_capacity(missing.len() * 3);
             for (n, &id) in missing.iter().enumerate() {
@@ -353,9 +354,6 @@ impl FileTable {
             // SAFETY: every destination is a distinct slice of `buf`, which outlives the
             // call and is not touched until it returns.
             unsafe { self.pool.run(jobs) }.context("n-gram table: read rows")?;
-            for (n, &id) in missing.iter().enumerate() {
-                cache.insert(id, buf[n * rb..(n + 1) * rb].to_vec().into_boxed_slice());
-            }
         }
         {
             let mut st = self.stats.lock().unwrap_or_else(|p| p.into_inner());
@@ -363,18 +361,26 @@ impl FileTable {
             st.read_from_disk += missing.len() as u64;
         }
 
-        // Rows in request order, one buffer per tensor.
+        // Rows in request order, one buffer per tensor. A row is one this call read or one the
+        // cache held when the call began; the cache takes the new rows only afterwards, so a
+        // request larger than the cache cannot push out a row it still needs.
         let n = row_ids.len();
         let mut w = Vec::with_capacity(n * self.w_bytes);
         let mut s = Vec::with_capacity(n * self.s_bytes);
         let mut b = Vec::with_capacity(n * self.s_bytes);
         for &id in row_ids {
-            let row = cache
-                .get(id)
-                .ok_or_else(|| anyhow!("n-gram row {id} vanished from the cache"))?;
+            let row = match fresh.get(&id) {
+                Some(&at) => &buf[at * rb..(at + 1) * rb],
+                None => cache
+                    .get(id)
+                    .ok_or_else(|| anyhow!("n-gram row {id} vanished from the cache"))?,
+            };
             w.extend_from_slice(&row[..self.w_bytes]);
             s.extend_from_slice(&row[self.w_bytes..self.w_bytes + self.s_bytes]);
             b.extend_from_slice(&row[self.w_bytes + self.s_bytes..]);
+        }
+        for (at, &id) in missing.iter().enumerate() {
+            cache.insert(id, buf[at * rb..(at + 1) * rb].to_vec().into_boxed_slice());
         }
         drop(cache);
         let n = n as i32;

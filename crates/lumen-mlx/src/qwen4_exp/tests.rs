@@ -601,6 +601,39 @@ fn serving_the_ngram_table_from_disk_matches_holding_it_in_memory() {
     );
 }
 
+/// A request for more rows than the row cache holds still returns every row: a call's rows
+/// come from its own reads and from what the cache held when it started, whatever the cache
+/// keeps afterwards. The table here is the fixture's token embedding, read as one shard.
+#[test]
+fn a_request_larger_than_the_row_cache_returns_every_row() {
+    use super::ngram_table::FileTable;
+    use crate::offload::IoMode;
+    let dir = fixture_dir();
+    let cfg = Qwen4ExpConfig::load(&dir).unwrap();
+    let base = "language_model.model.embed_tokens";
+    let q = cfg.quant.for_base(base);
+    let open = |row_cache| {
+        FileTable::open(
+            &dir,
+            1,
+            &|_| base.to_string(),
+            q.group_size,
+            q.bits,
+            row_cache,
+            IoMode::Buffered,
+        )
+        .unwrap()
+    };
+    // Every row, then the first few again.
+    let ids: Vec<u64> = (0..cfg.vocab_size as u64).chain(0..8).collect();
+    let roomy = host_f32(&open(1 << 16).gather(&ids).unwrap());
+    let tight = open(4);
+    assert!(host_f32(&tight.gather(&ids).unwrap()) == roomy);
+    // Again, with a cache that holds a few of the rows and has to drop them on the way.
+    assert!(host_f32(&tight.gather(&ids).unwrap()) == roomy);
+    assert_eq!(tight.stats().requested, 2 * ids.len() as u64);
+}
+
 /// The server loads the model on one thread and runs it on another. MLX streams
 /// are per thread, so everything the forward pass touches must work from a thread
 /// that did not build the model.
