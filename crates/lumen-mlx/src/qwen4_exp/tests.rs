@@ -648,6 +648,13 @@ fn serving_the_token_embedding_from_disk_matches_holding_it_in_memory() {
         second.read_from_disk, first.read_from_disk,
         "the second pass should have been served from the row cache"
     );
+    // A token past the vocabulary is refused, not read from whatever follows the table.
+    let vocab = from_disk.config().vocab_size as u32;
+    assert!(
+        from_disk
+            .forward(&[vocab], &mut from_disk.make_cache(), false)
+            .is_err()
+    );
     // The pool the model would be given: the experts from disk as well.
     let both = embed_from_disk::with(true, || Qwen4ExpModel::load(&dir, Some(40 * 9_900))).unwrap();
     assert!(whole(&both) == baseline);
@@ -750,12 +757,19 @@ fn a_request_larger_than_the_row_cache_returns_every_row() {
     };
     // Every row, then the first few again.
     let ids: Vec<u64> = (0..cfg.vocab_size as u64).chain(0..8).collect();
+    let vocab = cfg.vocab_size as u64;
     let roomy = host_f32(&open(1 << 16).gather(&ids).unwrap());
     let tight = open(4);
     assert!(host_f32(&tight.gather(&ids).unwrap()) == roomy);
+    // Each distinct row once, the repeats included.
+    assert_eq!(tight.stats().read_from_disk, vocab);
     // Again, with a cache that holds a few of the rows and has to drop them on the way.
     assert!(host_f32(&tight.gather(&ids).unwrap()) == roomy);
-    assert_eq!(tight.stats().requested, 2 * ids.len() as u64);
+    let stats = tight.stats();
+    assert_eq!(stats.requested, 2 * ids.len() as u64);
+    assert!((2 * vocab - 4..=2 * vocab).contains(&stats.read_from_disk));
+    // A row past the table is refused.
+    assert!(tight.gather(&[vocab]).is_err());
 }
 
 /// The server loads the model on one thread and runs it on another. MLX streams
