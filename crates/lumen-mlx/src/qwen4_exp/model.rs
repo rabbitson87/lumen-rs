@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use mlx_rs::ops::indexing::{TryIndexOp, put_along_axis, take_along_axis};
 use mlx_rs::{Array, Dtype};
 
-use super::config::{LayerKind, Qwen4ExpConfig, kv_bf16};
+use super::config::{LayerKind, Qwen4ExpConfig, TOKEN_EMBEDDING, kv_bf16};
 use super::ngram::NgramHasher;
 use super::ngram_table::{DEFAULT_ROW_CACHE, FileTable, NgramTable, ResidentTable, ShardArrays};
 use crate::decode_probe::{self as probe, Stage};
@@ -100,13 +100,21 @@ fn group_rms_norm(
 /// would surface that on some later request. Arrays *computed* at load (a folded norm, a
 /// transposed router) carry the loading thread's GPU stream the same way and are
 /// evaluated where they are built. The routed experts and the n-gram table
-/// stay lazy on purpose: they are never evaluated, only read from disk by offsets.
-fn materialize_trunk(weights: &NativeWeights, with_experts: bool) -> Result<()> {
+/// stay lazy on purpose: they are never evaluated, only read from disk by offsets. So does
+/// the token embedding when it is read from disk ([`embed_from_disk`]).
+fn materialize_trunk(
+    weights: &NativeWeights,
+    with_experts: bool,
+    with_embedding: bool,
+) -> Result<()> {
+    let embedding = format!("{TOKEN_EMBEDDING}.");
     let resident: Vec<&Array> = weights
         .tensors()
         .iter()
         .filter(|(name, _)| {
-            (with_experts || !name.contains(".switch_mlp.")) && !name.contains(".ngram_embedding.")
+            (with_experts || !name.contains(".switch_mlp."))
+                && !name.contains(".ngram_embedding.")
+                && (with_embedding || !name.starts_with(&embedding))
         })
         .map(|(_, a)| a)
         .collect();
@@ -223,6 +231,27 @@ lumen_flags::flag! {
         kind: Optimization,
     }
 }
+
+lumen_flags::flag! {
+    /// Read the token embedding's rows from the checkpoint's files instead of holding the table
+    /// in memory, the way the n-gram table is served. A token needs one row of the table (2.7 KB
+    /// of the mixed 4/8-bit build's 0.68 GB), and the output layer has weights of its own, so
+    /// nothing else needs the table. The rows are the same bytes through the same
+    /// dequantization: the output is bit-identical. The memory plan gives the table's bytes to
+    /// the expert pool. On the mixed build (M3 Max): greedy server text is the same with and
+    /// without it; at a fixed pool the process takes 0.57–0.59 GB less; at the same total memory
+    /// decode speed moves −3.0% to +3.7% (no copy and the 2-bit copy, 6.7 and 15 GB pools, four
+    /// runs a side), within noise. Opt-in.
+    pub(crate) embed_from_disk {
+        env: "LUMEN_QWEN4_EMBED_DISK",
+        default: false,
+        kind: Optimization,
+    }
+}
+
+/// Embedding rows kept after use when the table is read from disk: ~11 MB of the mixed build's
+/// 2.7 KB rows. A decode step needs one row, so the cache saves three small reads at most.
+const EMBED_ROW_CACHE: usize = 4_096;
 
 fn widen(a: Array) -> Result<Array> {
     if a.dtype() == Dtype::Float32 {
@@ -574,9 +603,17 @@ struct QuantEmbedding {
     bits: i32,
 }
 
+/// The token embedding table, dequantized a row at a time.
+enum TokenEmbedding {
+    /// Held as MLX arrays.
+    Resident(QuantEmbedding),
+    /// Read from the checkpoint's files as a one-shard table ([`embed_from_disk`]).
+    File(FileTable),
+}
+
 pub struct Qwen4ExpModel {
     cfg: Qwen4ExpConfig,
-    embed: QuantEmbedding,
+    embed: TokenEmbedding,
     layers: Vec<Layer>,
     mixer: HyperConnection,
     lm_head: Option<Proj>,
@@ -1029,7 +1066,8 @@ impl Qwen4ExpModel {
                     .map(|k| (k.to_string(), v))
             })
             .collect();
-        materialize_trunk(&weights, expert_budget_bytes.is_none())
+        let embedding_on_disk = embed_from_disk::get();
+        materialize_trunk(&weights, expert_budget_bytes.is_none(), !embedding_on_disk)
             .context("qwen4_exp: read the resident weights")?;
         cfg.norms_centered = detect_centered_norms(&weights, &cfg)?;
         if cfg.norms_centered {
@@ -1038,14 +1076,31 @@ impl Qwen4ExpModel {
             );
         }
 
-        let embed_base = "language_model.model.embed_tokens";
-        let eq = cfg.quant.for_base(embed_base);
-        let embed = QuantEmbedding {
-            weight: require(&weights, &format!("{embed_base}.weight"))?,
-            scales: require(&weights, &format!("{embed_base}.scales"))?,
-            biases: weights.get(&format!("{embed_base}.biases")).cloned(),
-            group_size: eq.group_size,
-            bits: eq.bits,
+        let eq = cfg.quant.for_base(TOKEN_EMBEDDING);
+        let embed = if embedding_on_disk {
+            let table = FileTable::open(
+                model_dir,
+                1,
+                &|_| TOKEN_EMBEDDING.to_string(),
+                eq.group_size,
+                eq.bits,
+                EMBED_ROW_CACHE,
+                IoMode::Buffered,
+            )
+            .context("qwen4_exp: read embed_tokens from disk (LUMEN_QWEN4_EMBED_DISK)")?;
+            eprintln!(
+                "[qwen4_exp] token embedding read from disk: {:.2} GB less in memory",
+                cfg.token_embedding_bytes() as f64 / 1e9
+            );
+            TokenEmbedding::File(table)
+        } else {
+            TokenEmbedding::Resident(QuantEmbedding {
+                weight: require(&weights, &format!("{TOKEN_EMBEDDING}.weight"))?,
+                scales: require(&weights, &format!("{TOKEN_EMBEDDING}.scales"))?,
+                biases: weights.get(&format!("{TOKEN_EMBEDDING}.biases")).cloned(),
+                group_size: eq.group_size,
+                bits: eq.bits,
+            })
         };
 
         let ple_layers = cfg.ple_layers();
@@ -1199,6 +1254,15 @@ impl Qwen4ExpModel {
             Some(profile) => format!("{}\n{profile}", o.report()),
             None => o.report(),
         })
+    }
+
+    /// Rows requested from the token embedding when it is read from disk
+    /// ([`embed_from_disk`]) and how many of them had to be read; `None` when it is resident.
+    pub fn embed_stats(&self) -> Option<super::ngram_table::RowStats> {
+        match &self.embed {
+            TokenEmbedding::File(table) => Some(table.stats()),
+            TokenEmbedding::Resident(_) => None,
+        }
     }
 
     /// Rows requested from the file-backed n-gram table and how many of them
@@ -1788,17 +1852,24 @@ impl Qwen4ExpModel {
                 cfg.vocab_size
             );
         }
-        let ids_i32: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
-        let ids_arr = Array::from_slice(&ids_i32, &[l]);
-        let embedded = quantized_embedding_lookup_with_mode(
-            &self.embed.weight,
-            &self.embed.scales,
-            self.embed.biases.as_ref(),
-            &ids_arr,
-            self.embed.group_size,
-            self.embed.bits,
-            MODE_AFFINE,
-        )
+        let embedded = match &self.embed {
+            TokenEmbedding::Resident(e) => {
+                let ids_i32: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
+                quantized_embedding_lookup_with_mode(
+                    &e.weight,
+                    &e.scales,
+                    e.biases.as_ref(),
+                    &Array::from_slice(&ids_i32, &[l]),
+                    e.group_size,
+                    e.bits,
+                    MODE_AFFINE,
+                )
+            }
+            TokenEmbedding::File(table) => {
+                let rows: Vec<u64> = ids.iter().map(|&t| u64::from(t)).collect();
+                table.gather(&rows)
+            }
+        }
         .context("qwen4_exp: embed_tokens lookup")?;
         Ok(mlx_rs::ops::reshape(&embedded, &[1, l, d])?)
     }

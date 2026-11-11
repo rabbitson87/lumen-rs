@@ -31,6 +31,9 @@ lumen_flags::flag! {
     }
 }
 
+/// The token embedding table's tensors: `<this>.weight`, `.scales` and `.biases`.
+pub(crate) const TOKEN_EMBEDDING: &str = "language_model.model.embed_tokens";
+
 /// Bytes of one cached K, V or indexer-key element: 2 under [`kv_bf16`], else 4.
 pub fn kv_elem_bytes() -> u64 {
     if kv_bf16::get() { 2 } else { 4 }
@@ -52,6 +55,14 @@ pub enum LayerKind {
 pub struct QuantSpec {
     pub group_size: i32,
     pub bits: i32,
+}
+
+impl QuantSpec {
+    /// Bytes of `weights` values stored at this quantization, with a bf16 scale and bias per group.
+    fn stored_bytes(self, weights: u64) -> u64 {
+        let groups = weights / self.group_size.max(1) as u64;
+        weights * self.bits.max(0) as u64 / 8 + groups * 2 * 2
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -514,9 +525,16 @@ impl Qwen4ExpConfig {
         let q = self
             .quant
             .for_base("language_model.model.layers.0.mlp.switch_mlp");
-        let weights = (self.hidden_size * self.moe_intermediate_size) as u64;
-        let groups = weights / q.group_size.max(1) as u64;
-        3 * (weights * q.bits.max(0) as u64 / 8 + groups * 2 * 2)
+        3 * q.stored_bytes((self.hidden_size * self.moe_intermediate_size) as u64)
+    }
+
+    /// Bytes of the token embedding table as stored: packed rows, with a bf16 scale and bias per
+    /// group (0.68 GB on the mixed 4/8-bit build: 248,320 x 2,560, 8-bit, groups of 64). What
+    /// reading it from disk ([`super::model::embed_from_disk`]) takes out of memory.
+    pub fn token_embedding_bytes(&self) -> u64 {
+        self.quant
+            .for_base(TOKEN_EMBEDDING)
+            .stored_bytes((self.vocab_size * self.hidden_size) as u64)
     }
 
     /// Bytes of the image tower in bf16 (patch embedding, position grid, blocks, merger), for
@@ -601,6 +619,18 @@ mod tests {
                 "rope_parameters": {"rope_theta": 10000.0, "partial_rotary_factor": 0.25}
             }
         })
+    }
+
+    /// The mixed 4/8-bit build's table: 248,320 rows of 2,560 at 8 bits (635.7 MB) and 40 groups
+    /// a row with a 2-byte scale and bias each (39.7 MB).
+    #[test]
+    fn the_token_embedding_is_sized_from_its_own_quantization() {
+        let mut json = tiny_json();
+        json["quantization"][TOKEN_EMBEDDING] =
+            serde_json::json!({"group_size": 64, "bits": 8, "mode": "affine"});
+        let mut cfg = Qwen4ExpConfig::from_json(&json).unwrap();
+        (cfg.vocab_size, cfg.hidden_size) = (248_320, 2_560);
+        assert_eq!(cfg.token_embedding_bytes(), 635_699_200 + 39_731_200);
     }
 
     #[test]

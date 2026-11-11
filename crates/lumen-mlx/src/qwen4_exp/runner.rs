@@ -383,7 +383,8 @@ struct MemoryPlan {
     scores_budget: u64,
     /// Memory a prefill needs beyond the trunk and the expert pool.
     reserve: u64,
-    /// The resident weights: [`TRUNK_BYTES`], and the image tower under `LUMEN_VISION`.
+    /// The resident weights: [`TRUNK_BYTES`], less the token embedding when it is read from disk
+    /// (`LUMEN_QWEN4_EMBED_DISK`), and the image tower under `LUMEN_VISION`.
     trunk: u64,
     /// What is left for the expert pool.
     pool: u64,
@@ -421,7 +422,12 @@ fn plan_memory(
     let scores =
         (cfg.num_attention_heads as u64 * chunk as u64 * ctx_tokens as u64 * 4).min(scores_budget);
     let reserve = prefill_reserve(chunk, ctx_tokens, cfg.kv_bytes_per_token(), scores);
-    let trunk = TRUNK_BYTES
+    let embedding_on_disk = if super::model::embed_from_disk::get() {
+        cfg.token_embedding_bytes()
+    } else {
+        0
+    };
+    let trunk = TRUNK_BYTES.saturating_sub(embedding_on_disk)
         + if crate::vision_splice::tower::vision_enabled() {
             cfg.vision_tower_bytes()
         } else {
@@ -2318,6 +2324,22 @@ mod tests {
                 plan.pool as f64 / 1e9
             )
         );
+    }
+
+    #[test]
+    fn an_embedding_read_from_disk_gives_its_bytes_to_the_pool() {
+        f32_kv(|| {
+            let cfg = real_config();
+            let table = cfg.token_embedding_bytes();
+            assert!(table > 0);
+            let held = plan_memory(DEVICE_36GB, &cfg, None, None);
+            let on_disk = super::super::model::embed_from_disk::with(true, || {
+                plan_memory(DEVICE_36GB, &cfg, None, None)
+            });
+            assert_eq!(on_disk.trunk + table, held.trunk);
+            assert_eq!(on_disk.pool, held.pool + table);
+            assert_eq!(on_disk.reserve, held.reserve);
+        })
     }
 
     #[test]
