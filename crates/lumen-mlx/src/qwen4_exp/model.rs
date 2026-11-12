@@ -241,10 +241,10 @@ lumen_flags::flag! {
     /// the expert pool. On the mixed build (M3 Max): greedy server text is the same with and
     /// without it; at a fixed pool the process takes 0.57–0.59 GB less; at the same total memory
     /// decode speed moves −3.0% to +3.7% (no copy and the 2-bit copy, 6.7 and 15 GB pools, four
-    /// runs a side), within noise. Opt-in.
+    /// runs a side), within noise. On by default; `0` holds the table in memory.
     pub(crate) embed_from_disk {
         env: "LUMEN_QWEN4_EMBED_DISK",
-        default: false,
+        default: true,
         kind: Optimization,
     }
 }

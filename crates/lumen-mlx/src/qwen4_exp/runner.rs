@@ -2332,7 +2332,9 @@ mod tests {
             let cfg = real_config();
             let table = cfg.token_embedding_bytes();
             assert!(table > 0);
-            let held = plan_memory(DEVICE_36GB, &cfg, None, None);
+            let held = super::super::model::embed_from_disk::with(false, || {
+                plan_memory(DEVICE_36GB, &cfg, None, None)
+            });
             let on_disk = super::super::model::embed_from_disk::with(true, || {
                 plan_memory(DEVICE_36GB, &cfg, None, None)
             });
@@ -2351,7 +2353,7 @@ mod tests {
             let choice = choose_pool(DEVICE_36GB, Some(free), &plan, None, pool_floor_bytes(&cfg));
             assert_eq!(choice.usable, free);
             assert_eq!(choice.clamped_by, DEVICE_36GB - free);
-            assert_eq!(choice.pool, free - TRUNK_BYTES - plan.reserve);
+            assert_eq!(choice.pool, free - plan.trunk - plan.reserve);
             assert_eq!(plan.pool - choice.pool, choice.clamped_by);
             // 19.5 GB of pool on an idle 36 GB Mac, 8.6 GB with these apps open.
             assert!(
@@ -2384,7 +2386,7 @@ mod tests {
         let floor = pool_floor_bytes(&cfg);
         // 15 GB fits the working set, not what other apps leave.
         let choice = choose_pool(DEVICE_36GB, Some(free), &plan, Some(15_000_000_000), floor);
-        assert_eq!(choice.pool, free - TRUNK_BYTES - plan.reserve);
+        assert_eq!(choice.pool, free - plan.trunk - plan.reserve);
         assert_eq!(choice.lowered_from, Some(15_000_000_000));
         let line = plan_line(DEVICE_36GB, &choice, &plan, false);
         assert!(
@@ -2461,7 +2463,7 @@ mod tests {
         assert!(choice.at_floor);
         assert_eq!(choice.pool, floor);
         // The plan is for what the floor holds: MLX gets that, not the 6.3 GB.
-        assert_eq!(choice.usable, TRUNK_BYTES + floor + plan.reserve);
+        assert_eq!(choice.usable, plan.trunk + floor + plan.reserve);
         assert_eq!(choice.clamped_by, DEVICE_36GB - free);
         let line = plan_line(DEVICE_36GB, &choice, &plan, false);
         assert!(

@@ -24,7 +24,8 @@ computes, except speculative decoding, which is marked.
 The GPU's working set (the part of RAM the OS lets one process keep resident, about 75% of it,
 times 0.88 for the headroom other apps need; `LUMEN_MEMORY_LIMIT_GB` lowers it, and so does what
 other apps hold at load, below) is split into the
-3.6 GB of resident weights, a reserve for prefilling, and the expert pool, which gets the rest. The
+3.6 GB of resident weights (less the token embedding, 0.68 GB on the mixed build, which is read from
+disk unless `LUMEN_QWEN4_EMBED_DISK=0`), a reserve for prefilling, and the expert pool, which gets the rest. The
 reserve is 0.6 GB of buffers, about 1.1 MB per token of the prefill chunk, the KV cache of the
 longest prompt the plan allows (30 KB per token in bf16, below; 60 KB in f32), and half the attention scores. So the longest prompt
 and the pool trade against each other: `LUMEN_MAX_PROMPT_TOKENS` (the server's prompt cap, which the
@@ -405,7 +406,7 @@ named all three, in 14 s for a 334-token prompt, and again with an 11K-character
 
 | Variable | Default | What it does |
 |---|---|---|
-| `LUMEN_MOE_EXPERT_CACHE_GB` | `auto` | Size of the expert pool: `auto`, or a size such as `4g`, `8GB`, `12.5g`, `512m` (a plain number is GB). `auto` takes what the GPU's working set (or what other apps leave free at load, when that is less) leaves after the 3.6 GB of resident weights and the prefill reserve. A size that does not fit beside them (at the longest prompt the plan allows) is lowered to what does, and the log says so; a shorter `LUMEN_MAX_PROMPT_TOKENS` makes room. Measured on a 36 GB M3 Max with the pack and direct reads, 300 tokens: 4.2 GB 6.1 tok/s, 6.7 GB 7.2, 10 GB 9.0, 15 GB 11.2, 19.8 GB 13.0. |
+| `LUMEN_MOE_EXPERT_CACHE_GB` | `auto` | Size of the expert pool: `auto`, or a size such as `4g`, `8GB`, `12.5g`, `512m` (a plain number is GB). `auto` takes what the GPU's working set (or what other apps leave free at load, when that is less) leaves after the 3.6 GB of resident weights (less the token embedding read from disk) and the prefill reserve. A size that does not fit beside them (at the longest prompt the plan allows) is lowered to what does, and the log says so; a shorter `LUMEN_MAX_PROMPT_TOKENS` makes room. Measured on a 36 GB M3 Max with the pack and direct reads, 300 tokens: 4.2 GB 6.1 tok/s, 6.7 GB 7.2, 10 GB 9.0, 15 GB 11.2, 19.8 GB 13.0. |
 | `LUMEN_QWEN35_PREFILL_CHUNK` | 1024 (512 under 11 GB) | Tokens per prefill chunk. Prefill speed does not depend on it; its activations come out of the pool. |
 | `LUMEN_MAX_PROMPT_TOKENS` | 16384 (8192 under 11 GB) | Longest prompt; the KV cache for it is planned out of the pool. |
 | `LUMEN_MEMORY_LIMIT_GB` | 32 | Cap on MLX's memory in GiB; the pool is planned within it. |
