@@ -295,7 +295,13 @@ pub async fn download_model(
             let _ = app_emit.emit("lumen://download", p);
         }
     });
-    let res = models::download(&dir, &repo_id, files, tx).await;
+    let revision = state
+        .catalog
+        .lock()
+        .await
+        .pinned_revision(&repo_id)
+        .map(str::to_owned);
+    let res = models::download(&dir, &repo_id, revision.as_deref(), files, tx).await;
     let _ = pump.await;
     // Successful (re-)download clears the outdated flag — the SHA marker we
     // just wrote inside the download is the new ground truth.
@@ -305,7 +311,8 @@ pub async fn download_model(
     res.map(|_| ()).map_err(err)
 }
 
-/// Check each provided installed model against its HF Hub `main` commit SHA.
+/// Check each provided installed model against its HF Hub `main` commit SHA,
+/// or the commit its catalog row pins (no network call for those).
 /// Returns a status entry per model.  Side-effect: updates
 /// `AppState.outdated_models` so `start_server` can refuse to launch with a
 /// stale active model.
@@ -328,6 +335,11 @@ pub async fn check_model_updates(
 
     let cat = state.catalog.lock().await;
     let entries = models::scan_local(&dir, &cat).map_err(err)?;
+    // A pinned row is current while its install is that commit: `main` moving does not matter.
+    let pins: std::collections::HashMap<&str, String> = repo_ids
+        .iter()
+        .filter_map(|id| Some((id.as_str(), cat.pinned_revision(id)?.to_owned())))
+        .collect();
     drop(cat);
 
     // 8s timeout — anonymous HF API replies in <200ms; if we hit the cap
@@ -348,7 +360,9 @@ pub async fn check_model_updates(
             .find(|m| &m.id == repo_id)
             .and_then(|m| m.local_sha.clone());
 
-        let remote_sha = if is_hf_id {
+        let remote_sha = if let Some(pin) = pins.get(repo_id.as_str()) {
+            Some(pin.clone())
+        } else if is_hf_id {
             match models::fetch_hub_sha(&client, repo_id).await {
                 Ok(s) => Some(s),
                 Err(e) => {

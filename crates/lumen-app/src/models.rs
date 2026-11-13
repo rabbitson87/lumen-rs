@@ -668,12 +668,14 @@ pub struct DownloadProgress {
 /// (Qwen 0.5B/1.5B) fall through to plain `model.safetensors`.
 ///
 /// HF resolve URL pattern:
-///   `https://huggingface.co/<repo_id>/resolve/main/<file>`
+///   `https://huggingface.co/<repo_id>/resolve/<revision>/<file>`
 /// 302-redirects to the LFS storage for large files. `reqwest` follows
-/// redirects by default (up to 10 hops).
+/// redirects by default (up to 10 hops). `revision` is the commit a catalog row
+/// pins the repo to, else `main`.
 pub async fn download(
     models_dir: &Path,
     repo_id: &str,
+    revision: Option<&str>,
     files: Option<Vec<String>>,
     tx: tokio::sync::mpsc::Sender<DownloadProgress>,
 ) -> Result<PathBuf> {
@@ -683,8 +685,7 @@ pub async fn download(
     std::fs::create_dir_all(&target)
         .with_context(|| format!("create_dir_all {}", target.display()))?;
 
-    let resolve_url =
-        |file: &str| format!("https://huggingface.co/{}/resolve/main/{}", repo_id, file);
+    let url_of = |file: &str| resolve_url(repo_id, revision, file);
 
     // Resolve file list: caller-supplied OR probe repo for standard layout.
     let files = match files {
@@ -703,7 +704,7 @@ pub async fn download(
             ];
 
             // Probe for sharded weights.
-            let idx_url = resolve_url("model.safetensors.index.json");
+            let idx_url = url_of("model.safetensors.index.json");
             let idx_resp = client
                 .get(&idx_url)
                 .send()
@@ -737,7 +738,7 @@ pub async fn download(
     };
 
     for file in &files {
-        let url = resolve_url(file);
+        let url = url_of(file);
         let dest = target.join(file);
         let part = target.join(format!("{file}.part"));
 
@@ -900,7 +901,12 @@ pub async fn download(
     // the same repo id has been re-uploaded with different weights.  Best-
     // effort — `fetch_hub_sha` failure (offline finish, transient 5xx) just
     // skips the marker; the model is still usable, the user just won't see
-    // an Update notification if the repo changes later.
+    // an Update notification if the repo changes later. A pinned download
+    // is that commit's files, so the pin is the marker.
+    if let Some(pin) = revision {
+        write_sha_marker(&target, pin);
+        return Ok(target);
+    }
     match fetch_hub_sha(&client, repo_id).await {
         Ok(sha) => write_sha_marker(&target, &sha),
         Err(e) => eprintln!(
@@ -910,6 +916,12 @@ pub async fn download(
     }
 
     Ok(target)
+}
+
+/// The URL of `file` in `repo_id` at `revision` (`main` when the catalog pins none).
+fn resolve_url(repo_id: &str, revision: Option<&str>, file: &str) -> String {
+    let rev = revision.unwrap_or("main");
+    format!("https://huggingface.co/{repo_id}/resolve/{rev}/{file}")
 }
 
 pub async fn delete(models_dir: &Path, repo_id: &str) -> Result<()> {
@@ -975,6 +987,18 @@ mod tests {
             .unwrap();
         f.write_all(header_bytes).unwrap();
         f.write_all(&vec![0u8; actual_body as usize]).unwrap();
+    }
+
+    #[test]
+    fn a_pinned_download_reads_that_commit() {
+        assert_eq!(
+            resolve_url("org/repo", Some("b2c422f3"), "model-00001.safetensors"),
+            "https://huggingface.co/org/repo/resolve/b2c422f3/model-00001.safetensors"
+        );
+        assert_eq!(
+            resolve_url("org/repo", None, "config.json"),
+            "https://huggingface.co/org/repo/resolve/main/config.json"
+        );
     }
 
     #[test]

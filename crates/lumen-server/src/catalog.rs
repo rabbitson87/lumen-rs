@@ -43,6 +43,12 @@ pub struct FamilyInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct RecommendedModel {
     pub id: &'static str,
+    /// The Hugging Face commit the app downloads, and checks for updates against, instead of
+    /// `main`. Set where files are built from the weights (Flash-Next's pack and 3-bit copy, tens
+    /// of GB): an upstream commit would otherwise flag the install out of date, and the update
+    /// deletes the folder with them. Moving it is a release change, measured like any other.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<&'static str>,
     pub family: ModelFamily,
     pub label: &'static str,
     pub approx_size_gb: u32,
@@ -129,6 +135,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         // own, and on an M3 Max 36 GB at the uniform build's memory 9.46 / 13.01 tok/s against its
         // 8.97 / 11.78 (6.7 / 15 GB of pool for the uniform build; docs/flash-next.md).
         id: "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit",
+        revision: Some("b2c422f3c643e36f04227a64d61796b44a4b1029"),
         family: ModelFamily::Qwen4Exp,
         label: "Qwen 3.8 — Flash-Next 125B-A6B mixed 4/8-bit (SSD-streamed)",
         approx_size_gb: 106,
@@ -147,6 +154,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         // The gs64 build is used because its experts are 10% smaller to read than the
         // mlx-community group-32 build (97 GB vs 104 GB on disk), which also loads.
         id: "pipenetwork/Qwen3.8-Flash-Next-MLX-4bit",
+        revision: Some("aa7c790e804bbf9d491ddb109c3d61bc4a555f7c"),
         family: ModelFamily::Qwen4Exp,
         label: "Qwen 3.8 — Flash-Next 125B-A6B 4-bit (SSD-streamed, smaller download)",
         approx_size_gb: 97,
@@ -155,6 +163,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
     },
     RecommendedModel {
         id: "mlx-community/Qwen3.6-35B-A3B-mxfp4",
+        revision: None,
         family: ModelFamily::Qwen35Moe,
         label: "Qwen 3.6 — 35B A3B (MXFP4)",
         approx_size_gb: 19,
@@ -170,6 +179,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         // so prefer this MTPLX build. Serve with MTP: native runner + LUMEN_QWEN35_MTP=1
         // + LUMEN_SPEC=mtp + LUMEN_QWEN35_HF_ORIGINAL=<this model dir>.
         id: "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
+        revision: None,
         family: ModelFamily::Qwen35Dense,
         label: "Qwen 3.6 — 27B Dense (MTPLX)",
         approx_size_gb: 16,
@@ -193,6 +203,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         // roughly 2x the baseline decode rate. Needs no env vars — the head
         // auto-enables from the repo's own `mtp.safetensors`.
         id: "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed",
+        revision: None,
         family: ModelFamily::Qwen35Dense,
         label: "Qwen 3.8 — 27B Dense (MTPLX)",
         approx_size_gb: 21,
@@ -211,6 +222,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         // re-quantizing select tensors. Fastest decode + best clean/Korean
         // perplexity of the family; same weights Ollama's `gemma4:26b-mlx` serves.
         id: "mlx-community/gemma-4-26b-a4b-it-nvfp4",
+        revision: None,
         family: ModelFamily::Gemma4,
         label: "Gemma 4 — Basic (Community NVFP4)",
         approx_size_gb: 16,
@@ -225,6 +237,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         // agreement of any variant (KL 0.96 / top-1 72.7% vs base). Decode 59.7
         // tok/s — far faster than the retired full-affine hybrid route (52.9).
         id: "hsng95/gemma-4-26b-a4b-nvfp4-qmax-mlx",
+        revision: None,
         family: ModelFamily::Gemma4,
         label: "Gemma 4 — Quality-Max (NVFP4 hybrid)",
         approx_size_gb: 16,
@@ -239,6 +252,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         // average absorbs the 3-bit expert reconstruction noise. Closer to the
         // base (KL 1.42) than stock affine it-4bit (1.95) despite being smaller.
         id: "hsng95/gemma-4-26b-a4b-nvfp4-smin-mlx",
+        revision: None,
         family: ModelFamily::Gemma4,
         label: "Gemma 4 — Size-Min (NVFP4 hybrid)",
         approx_size_gb: 12,
@@ -478,6 +492,40 @@ mod tests {
                 .any(|f| matches!(f.family, ModelFamily::Qwen4Exp))
         );
         assert_eq!(family_of(row.id), Some(row.family));
+    }
+
+    #[test]
+    fn flash_next_downloads_a_pinned_commit() {
+        let cat = catalog();
+        for r in cat
+            .recommended
+            .iter()
+            .filter(|r| matches!(r.family, ModelFamily::Qwen4Exp))
+        {
+            let rev = r
+                .revision
+                .unwrap_or_else(|| panic!("{} has no revision", r.id));
+            assert!(
+                rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{}: {rev} is not a full commit id",
+                r.id
+            );
+        }
+        let json = serde_json::to_value(&cat).unwrap();
+        let rows = json["recommended"].as_array().unwrap();
+        let mixed = rows
+            .iter()
+            .find(|r| r["id"] == "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit")
+            .unwrap();
+        assert_eq!(
+            mixed["revision"],
+            "b2c422f3c643e36f04227a64d61796b44a4b1029"
+        );
+        let unpinned = rows
+            .iter()
+            .find(|r| r["id"] == "mlx-community/Qwen3.6-35B-A3B-mxfp4")
+            .unwrap();
+        assert!(unpinned.get("revision").is_none());
     }
 
     #[test]

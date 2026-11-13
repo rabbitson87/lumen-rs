@@ -33,6 +33,9 @@ pub struct FamilyInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecommendedModel {
     pub id: String,
+    /// The commit to download and to check for updates against, instead of `main`.
+    #[serde(default)]
+    pub revision: Option<String>,
     pub family: ModelFamily,
     pub label: String,
     pub approx_size_gb: u32,
@@ -114,6 +117,14 @@ impl Catalog {
         })
     }
 
+    /// The commit a catalog row pins `repo_id` to. Exact ids only: a pin names one repo's commit.
+    pub fn pinned_revision(&self, repo_id: &str) -> Option<&str> {
+        self.recommended
+            .iter()
+            .find(|r| r.id == repo_id)
+            .and_then(|r| r.revision.as_deref())
+    }
+
     /// Find a text-to-image model entry by id (exact or trailing-component).
     pub fn find_image_model(&self, id: &str) -> Option<&RecommendedImageModel> {
         let suffix = id.rsplit('/').next().unwrap_or(id);
@@ -159,4 +170,26 @@ pub fn fetch(binary: &std::path::Path) -> Result<Catalog> {
     let cat: Catalog = serde_json::from_slice(&out.stdout)
         .context("parse catalog JSON from lumen-server --catalog")?;
     Ok(cat)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_row_pins_its_own_repo_only() {
+        let cat: Catalog = serde_json::from_str(
+            r#"{"families": [], "recommended": [
+                {"id": "org/pinned", "revision": "b2c422f3", "family": "qwen4-exp", "label": "",
+                 "approx_size_gb": 1, "min_ram_gb": 1, "notes": ""},
+                {"id": "org/free", "family": "gemma4", "label": "",
+                 "approx_size_gb": 1, "min_ram_gb": 1, "notes": ""}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cat.pinned_revision("org/pinned"), Some("b2c422f3"));
+        assert_eq!(cat.pinned_revision("org/free"), None);
+        // A local folder that only shares the name is not that commit.
+        assert_eq!(cat.pinned_revision("other/pinned"), None);
+        assert_eq!(cat.pinned_revision("pinned"), None);
+    }
 }
