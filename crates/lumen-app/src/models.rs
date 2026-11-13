@@ -13,7 +13,7 @@ pub struct ModelEntry {
     /// Absolute path to the model directory.
     pub path: PathBuf,
     /// Total size of weight files in bytes. The expert pack and draft head a Flash-Next
-    /// directory gains later are not weights and are left out (see `DERIVED_FILES`).
+    /// directory gains later are not weights and are left out (see `is_derived_file`).
     pub size_bytes: u64,
     /// `true` if this directory looks like a complete HF snapshot
     /// (`config.json` + at least one `.safetensors`).
@@ -39,10 +39,14 @@ pub struct ModelEntry {
 }
 
 /// Files a model directory gains after download that are not part of its weights: the expert
-/// pack the server builds from the shards (68 GB for Flash-Next) and the draft head fetched
-/// alongside them. They count against the disk, not against what the model is: this size
-/// becomes `LUMEN_WIRED_LIMIT_BYTES`, and a pack would put ~70 GB on a 97 GB model.
-const DERIVED_FILES: &[&str] = &["experts.lpack", "mtp.safetensors", "mtp.json"];
+/// pack the server builds from the shards (68 GB for Flash-Next), its low-bit copies of the
+/// experts (`experts.3b64.top.lpack`, 54 GB) and the draft head fetched alongside them. They count
+/// against the disk, not against what the model is: this size becomes `LUMEN_WIRED_LIMIT_BYTES`,
+/// and a pack would put ~70 GB on a 97 GB model.
+fn is_derived_file(name: &str) -> bool {
+    matches!(name, "mtp.safetensors" | "mtp.json")
+        || (name.starts_with("experts.") && name.ends_with(".lpack"))
+}
 
 /// Total size of the model's weight files under `path` (the first four levels), without the
 /// derived files above. `follow_links` stays off, so symlinks in HF snapshots aren't counted
@@ -53,11 +57,7 @@ fn weights_size_bytes(path: &Path) -> u64 {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            !DERIVED_FILES
-                .iter()
-                .any(|d| e.file_name().to_str() == Some(*d))
-        })
+        .filter(|e| !e.file_name().to_str().is_some_and(is_derived_file))
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
         .sum()
@@ -1075,6 +1075,7 @@ mod tests {
         std::fs::write(dir.join("model-00002.safetensors"), vec![1u8; 6000]).unwrap();
         if derived {
             std::fs::write(dir.join("experts.lpack"), vec![2u8; 70_000]).unwrap();
+            std::fs::write(dir.join("experts.3b64.top.lpack"), vec![2u8; 50_000]).unwrap();
             std::fs::write(dir.join("mtp.safetensors"), vec![3u8; 1500]).unwrap();
             std::fs::write(dir.join("mtp.json"), b"{}").unwrap();
         }

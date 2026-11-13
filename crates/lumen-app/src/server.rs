@@ -913,6 +913,9 @@ fn apply_env(
         for (key, value) in typed {
             cmd.env(key, value);
         }
+        if let Some((key, value)) = flash_next::copy_env(cfg, Path::new(model_id)) {
+            cmd.env(key, value);
+        }
     }
 
     // ── Advanced ───────────────────────────────────────────────────
@@ -1023,7 +1026,9 @@ pub fn launch_env_on(
 #[cfg(test)]
 mod launch_env_tests {
     use super::*;
-    use crate::config::{FlashNextConfig, FlashNextDraftHead, FlashNextIoMode, FlashNextPack};
+    use crate::config::{
+        FlashNextConfig, FlashNextCopy, FlashNextDraftHead, FlashNextIoMode, FlashNextPack,
+    };
 
     /// The env a default-config UI launch hands the server.
     fn ui_launch_env(model_id: &str) -> BTreeMap<String, String> {
@@ -1268,7 +1273,47 @@ mod launch_env_tests {
             draft_head: FlashNextDraftHead::Auto,
             io_mode: FlashNextIoMode::Direct,
             io_lanes: Some(16),
+            expert_copy: FlashNextCopy::Off,
         };
+    }
+
+    /// A Flash-Next weights folder, with the 3-bit copy as a sparse file of `copy_len` bytes
+    /// (none when `None`).
+    fn flash_next_folder(name: &str, copy_len: Option<u64>) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("lumen-copy-{name}-{}", std::process::id()))
+            .join("pipenetwork--Qwen3.8-Flash-Next-MLX-mixed-4_8bit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"qwen4_exp"}"#).unwrap();
+        if let Some(len) = copy_len {
+            let f = std::fs::File::create(dir.join(flash_next::COPY_FILE)).unwrap();
+            f.set_len(len).unwrap();
+        }
+        dir
+    }
+
+    /// The copy is served once it is built and the setting allows it; an unfinished copy, which
+    /// the server would refuse to load, is not named, and nor is any copy when it is off.
+    #[test]
+    fn the_3_bit_copy_is_served_only_when_it_is_built_and_allowed() {
+        let copy = |name: &str, len: Option<u64>, setting: FlashNextCopy| {
+            let dir = flash_next_folder(name, len);
+            let env = launch_on(dir.to_str().unwrap(), 36, |c| {
+                c.flash_next.expert_copy = setting
+            });
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+            env.get("LUMEN_QWEN4_EXPERT_COPY").cloned()
+        };
+        let built = Some(flash_next::COPY_BYTES);
+        assert_eq!(
+            copy("auto", built, FlashNextCopy::Auto).as_deref(),
+            Some("3,64,top")
+        );
+        assert_eq!(copy("off", built, FlashNextCopy::Off), None);
+        assert_eq!(copy("none", None, FlashNextCopy::Auto), None);
+        let unfinished = copy("part", Some(5_000_000_000), FlashNextCopy::Auto);
+        assert_eq!(unfinished, None, "an unfinished copy");
     }
 
     /// The Flash-Next card's settings reach the child as exactly the values chosen (a plain
@@ -1499,6 +1544,8 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
     "LUMEN_QWEN4_MTP",
     "LUMEN_MOE_IO_MODE",
     "LUMEN_MOE_IO_LANES",
+    // Sent only when the 3-bit copy is built and `expert_copy` allows it.
+    "LUMEN_QWEN4_EXPERT_COPY",
 ];
 
 /// Public wrapper for `resolve_binary` — used by the doctor module so the

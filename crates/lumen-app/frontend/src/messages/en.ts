@@ -626,6 +626,7 @@ export const en: Record<string, string> = {
   "flashnext.disk": "Disk needed",
   "flashnext.disk.detail": "{model} GB weights",
   "flashnext.disk.pack": "GB expert pack",
+  "flashnext.disk.copy": "GB 3-bit copy",
   "flashnext.disk.mtp": "GB draft head",
   "flashnext.active": "Active:",
   "flashnext.default": "default",
@@ -641,9 +642,10 @@ export const en: Record<string, string> = {
   "flashnext.opt.mtp": "Draft head",
   "flashnext.opt.io": "Expert reads",
   "flashnext.opt.lanes": "Reader threads",
+  "flashnext.opt.copy": "3-bit expert copy",
   "flashnext.prompt": "Longest prompt",
   "flashnext.summary":
-    "Runs with: pool {pool} GB ({how}), prompts up to {prompt} tokens, expert pack {pack}, draft head {head}",
+    "Runs with: pool {pool} GB ({how}), prompts up to {prompt} tokens, expert pack {pack}, 3-bit copy {copy}, draft head {head}",
   "flashnext.summary.speed":
     "about {tps} tok/s on this Mac",
   "flashnext.summary.speedUnknown":
@@ -654,7 +656,7 @@ export const en: Record<string, string> = {
   "flashnext.summary.noFit": "this does not fit the GPU's memory",
   "flashnext.reset": "Reset to recommended",
   "flashnext.reset.hint":
-    "Puts every option in this card back to the server's own default (nothing is sent for it). Env overrides are left alone.",
+    "Puts every option in this card back to the server's own default (nothing is sent for it), and the 3-bit copy back to Auto (served once it is built). Env overrides are left alone.",
   "flashnext.pool.custom": "Custom…",
   "flashnext.pool.custom.hint": "GB: 8, 8g, 8GB, 12.5g",
   "flashnext.pool.custom.invalid": "Not a size: try 8, 8g or 12.5g.",
@@ -688,6 +690,7 @@ export const en: Record<string, string> = {
     "Pack present: experts.lpack ({gb} GB), decode about 7-15% faster.",
   "flashnext.pack.inUse": "in use",
   "flashnext.pack.unused": "not used while Off",
+  "flashnext.pack.copyServed": "not read while the 3-bit copy is served",
   "flashnext.pack.status.incomplete":
     "An unfinished pack ({gb} GB) is on disk; the server ignores it. Building makes a new one.",
   "flashnext.pack.status.absent": "No pack yet. It needs {need} GB of disk; {free} GB is free.",
@@ -708,6 +711,32 @@ export const en: Record<string, string> = {
   "flashnext.pack.block.server_running":
     "Stop the server first: the build reads the whole model from the same disk.",
   "flashnext.pack.block.not_enough_disk": "Needs {need} GB free; this volume has {free} GB.",
+  "flashnext.copy.mode.auto": "Serve the copy once it is built.",
+  "flashnext.copy.mode.off": "Serve the checkpoint's own experts, even when the copy is built.",
+  "flashnext.copy.status.complete": "Copy present: experts.3b64.top.lpack ({gb} GB).",
+  "flashnext.copy.inUse": "served",
+  "flashnext.copy.unused": "not served while Off",
+  "flashnext.copy.status.incomplete":
+    "An unfinished copy ({gb} GB) is on disk; it is not served. Building makes a new one.",
+  "flashnext.copy.status.absent": "No copy yet. It needs {need} GB of disk; {free} GB is free.",
+  "flashnext.copy.status.absentNoFree": "No copy yet. It needs {need} GB of disk.",
+  "flashnext.copy.build": "Build 3-bit copy",
+  "flashnext.copy.build.hint":
+    "Runs lumen-server --build-expert-copy on the model (3,64,top) in the background and writes a 54 GB file next to the weights.",
+  "flashnext.copy.starting": "Starting the build…",
+  "flashnext.copy.building": "Building the copy: layer {n} of {total}",
+  "flashnext.copy.cancel": "Cancel",
+  "flashnext.copy.cancelled": "Build cancelled. Nothing was left on disk.",
+  "flashnext.copy.failed": "The build failed:",
+  "flashnext.copy.built": "The copy is built. The next Flash-Next launch serves it unless the copy is set to Off.",
+  "flashnext.copy.block.not_installed": "Flash-Next is not installed.",
+  "flashnext.copy.block.building": "A build is already running.",
+  "flashnext.copy.block.already_built": "The copy is already built.",
+  "flashnext.copy.block.server_running":
+    "Stop the server first: the build reads the whole model from the same disk.",
+  "flashnext.copy.block.not_enough_disk": "Needs {need} GB free; this volume has {free} GB.",
+  "flashnext.copy.note":
+    "Another model, not an exact copy: it keeps the top 3 bits of each expert, so replies differ slightly from the checkpoint's (about 96% of tokens are the same). An expert takes 2.15 MB instead of 2.76, so the same memory holds more of them: on the mixed 4/8-bit build decode measured 21-30% faster at the same pool. Takes 54 GB of disk; while it is served the expert pack is not read.",
   "flashnext.mtp.mode.auto":
     "Use the draft head when mtp.safetensors is installed, under the server's speed governor.",
   "flashnext.mtp.mode.on":
@@ -835,6 +864,7 @@ export const en: Record<string, string> = {
   "doctor.check.flash_next_ram.name": "Flash-Next memory",
   "doctor.check.flash_next_disk.name": "Flash-Next disk",
   "doctor.check.flash_next_pack.name": "Flash-Next expert pack",
+  "doctor.check.flash_next_copy.name": "Flash-Next 3-bit expert copy",
   "doctor.check.flash_next_mtp.name": "Flash-Next draft head",
   "doctor.check.flash_next_ssd.name": "Flash-Next SSD",
 
@@ -875,6 +905,11 @@ export const en: Record<string, string> = {
   "doctor.msg.flash_next_pack.present": "experts.lpack present ({gb} GB)",
   "doctor.msg.flash_next_pack.absent": "no expert pack (optional)",
   "doctor.msg.flash_next_pack.incomplete": "experts.lpack incomplete ({gb} GB of {full} GB)",
+  "doctor.msg.flash_next_copy.served": "experts.3b64.top.lpack present ({gb} GB), served",
+  "doctor.msg.flash_next_copy.off":
+    "experts.3b64.top.lpack present ({gb} GB), not served (the copy setting is off)",
+  "doctor.msg.flash_next_copy.absent": "no 3-bit copy (optional)",
+  "doctor.msg.flash_next_copy.incomplete": "experts.3b64.top.lpack incomplete ({gb} GB of {full} GB)",
   "doctor.msg.flash_next_mtp.present": "draft head present (mtp.safetensors)",
   "doctor.msg.flash_next_mtp.off":
     "draft head installed, not used (off by default)",
@@ -943,6 +978,8 @@ export const en: Record<string, string> = {
     "The expert pack is optional. To use it, free about 70 GB on this volume, then build it with the command below.",
   "doctor.hint.flash_next_pack.incomplete":
     "The server ignores an unfinished pack and reads the shards instead. Delete it and build it again.",
+  "doctor.hint.flash_next_copy.incomplete":
+    "An unfinished copy is not served; the checkpoint's own experts are. Delete it and build it again.",
   "doctor.hint.flash_next_mtp.required":
     "The server refuses to start with LUMEN_QWEN4_MTP=on and no draft head. Download the head (1.5 GB) with the command below, or remove the override.",
   "doctor.hint.flash_next_mtp.absent":
@@ -961,6 +998,8 @@ export const en: Record<string, string> = {
     "With less than 4.2 GB the pool has room for one staging region only, so prefill cannot read the next layer while it computes the current one.",
   "doctor.detail.flash_next_pack.absent":
     "Without the pack the server reads each expert as nine scattered ranges of the weight shards. The pack stores the same bytes as one record per expert.",
+  "doctor.detail.flash_next_copy.absent":
+    "The copy keeps the top 3 bits of every routed expert (54 GB): an expert takes 2.15 MB instead of 2.76, so the same pool holds more of them and fewer are read from the SSD. It is another model: about 96% of tokens are the checkpoint's own.",
   "doctor.detail.flash_next_ssd":
     "Read {total} MB of {shard} with the page cache bypassed: {seq} MB front to back, then {rand} MB as {reads} random {rec} MB reads on 4 threads, the way the server fetches experts.",
   "doctor.detail.flash_next_ssd.pack":

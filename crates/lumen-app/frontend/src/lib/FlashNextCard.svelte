@@ -14,6 +14,8 @@
   import PoolPicker from "./PoolPicker.svelte";
   import PromptPicker from "./PromptPicker.svelte";
   import type {
+    BuildKind,
+    FlashNextCopy,
     FlashNextSettings,
     FlashNextStatus,
     MeasureProgress,
@@ -24,8 +26,10 @@
   import { fill } from "./format";
   import {
     FLASH_NEXT,
+    FLASH_NEXT_COPY_ENV_KEY,
     FLASH_NEXT_LANE_PRESETS,
     FLASH_NEXT_LANES_DEFAULT,
+    copyInUse,
     envChoice,
     flashNextEffective,
     flashNextEnv,
@@ -55,8 +59,8 @@
     /** The live memory monitor's reading: what other apps leave free now. */
     memoryNow?: MemoryUsage | null;
     status: FlashNextStatus | null;
-    /** The latest expert-pack build report of this session. */
-    build: PackProgress | null;
+    /** The latest build report of this session, per kind (the pack and the 3-bit copy). */
+    builds: Record<BuildKind, PackProgress | null>;
     /** The latest Measure report of this session. */
     measure: MeasureProgress | null;
     /** Store some settings (`null` = back to the server's default). */
@@ -64,7 +68,8 @@
     onReset: () => void;
     /** Remove env overrides that replace the card's settings. */
     onClearOverrides: (keys: string[]) => void;
-    onBuild: () => Promise<void>;
+    onBuild: (kind: BuildKind) => Promise<void>;
+    /** Stops whichever build runs (one runs at a time). */
     onCancelBuild: () => Promise<void>;
     onMeasure: () => Promise<void>;
     onCancelMeasure: () => Promise<void>;
@@ -78,7 +83,7 @@
     contextMax,
     memoryNow = null,
     status,
-    build,
+    builds,
     measure,
     onChange,
     onReset,
@@ -91,8 +96,9 @@
 
   const ram = $derived(ramGb && ramGb > 0 ? ramGb : 16);
   const usable = $derived(flashNextUsableBytes(ram, memoryLimitGb));
-  // What a launch carries: the settings, replaced by overrides of the same name.
-  const env = $derived(flashNextEnv(settings, overrides));
+  // What a launch carries: the settings (and the 3-bit copy once it is built), replaced by
+  // overrides of the same name.
+  const env = $derived(flashNextEnv(settings, overrides, status));
   // This Mac's measured memory and SSD speeds; the card shows no speed for it until both exist.
   const hw = $derived(flashNextHardware(status?.hardware).hw);
   const eff = $derived(flashNextEffective({ env, contextMax, usableBytes: usable, status, hw }));
@@ -104,6 +110,11 @@
   const head = $derived(mtpMode(env.LUMEN_QWEN4_MTP));
   const ioMode = $derived(envChoice(env.LUMEN_MOE_IO_MODE, ["auto", "direct", "buffered"] as const, "auto"));
   const lanes = $derived(lanesValue(env.LUMEN_MOE_IO_LANES));
+  // The setting, unless an override of the copy's variable decides instead. The variable itself is
+  // sent only while the copy is complete, so it cannot stand for the setting the way the others do.
+  const copyMode = $derived<FlashNextCopy>(
+    FLASH_NEXT_COPY_ENV_KEY in overrides ? (copyInUse(overrides) ? "auto" : "off") : settings.expert_copy,
+  );
   const poolGb = $derived(
     eff.poolExplicit ? (parseGbInput(env.LUMEN_MOE_EXPERT_CACHE_GB ?? "") ?? null) : null,
   );
@@ -129,6 +140,10 @@
     { value: "off", label: t("flashnext.choice.off"), sub: t("flashnext.default"), title: t("flashnext.mtp.mode.off") },
     { value: "auto", label: t("flashnext.choice.auto"), title: t("flashnext.mtp.mode.auto") },
     { value: "on", label: t("flashnext.choice.on"), title: t("flashnext.mtp.mode.on") },
+  ]);
+  const copyChips = $derived<Chip[]>([
+    { value: "auto", label: t("flashnext.choice.auto"), title: t("flashnext.copy.mode.auto") },
+    { value: "off", label: t("flashnext.choice.off"), title: t("flashnext.copy.mode.off") },
   ]);
   const ioChips = $derived<Chip[]>([
     { value: "auto", label: t("flashnext.choice.auto"), title: t("flashnext.io.mode.auto") },
@@ -171,6 +186,7 @@
           : t("flashnext.summary.auto"),
       prompt: eff.promptTokens.toLocaleString("en-US"),
       pack: eff.pack ? t("flashnext.on") : t("flashnext.off"),
+      copy: eff.copy ? t("flashnext.on") : t("flashnext.off"),
       head: eff.head ? t("flashnext.on") : t("flashnext.off"),
     }) +
       ", " +
@@ -303,7 +319,13 @@
               <span class="text-ok">
                 {fill(t("flashnext.pack.status.complete"), { gb: gb(status.pack_bytes) })}
               </span>
-              <span class="dim">· {packMode === "off" ? t("flashnext.pack.unused") : t("flashnext.pack.inUse")}</span>
+              <span class="dim">
+                · {packMode === "off"
+                  ? t("flashnext.pack.unused")
+                  : eff.copy
+                    ? t("flashnext.pack.copyServed")
+                    : t("flashnext.pack.inUse")}
+              </span>
             {:else if status.pack === "incomplete"}
               <span class="text-warn">
                 {fill(t("flashnext.pack.status.incomplete"), { gb: gb(status.pack_bytes) })}
@@ -315,8 +337,67 @@
                   : fill(t("flashnext.pack.status.absent"), { need: gb(status.need_bytes), free: gb(status.free_bytes) })}
               </span>
             {/if}
+            {#if status?.installed && status.pack !== "complete" && eff.copy && packMode !== "off"}
+              <span class="dim">· {t("flashnext.pack.copyServed")}</span>
+            {/if}
           </div>
-          <PackBuildControl {status} {build} disabled={off} onBuild={onBuild} onCancel={onCancelBuild} />
+          <PackBuildControl
+            kind="pack"
+            {status}
+            build={builds.pack}
+            disabled={off}
+            onBuild={() => onBuild("pack")}
+            onCancel={onCancelBuild}
+          />
+        </div>
+      </div>
+
+      <!-- 3-bit expert copy: another model, built on request -->
+      <div class="grid grid-cols-[165px_1fr] gap-x-3 gap-y-1">
+        <div>
+          <div class="font-medium">{t("flashnext.opt.copy")}</div>
+          <div class="mono text-[9.5px] text-text-dim">LUMEN_QWEN4_EXPERT_COPY</div>
+        </div>
+        <div class="flex flex-col gap-1.5">
+          <ChoiceChips
+            options={copyChips}
+            value={copyMode}
+            label={t("flashnext.opt.copy")}
+            disabled={off}
+            onSelect={(v) => onChange({ expert_copy: v as FlashNextCopy })}
+          />
+          <div class="text-[10.5px] leading-snug">
+            {#if !status || !status.installed}
+              <span class="dim">{t("flashnext.pack.status.notInstalled")}</span>
+            {:else if status.copy === "complete"}
+              <span class="text-ok">
+                {fill(t("flashnext.copy.status.complete"), { gb: gb(status.copy_bytes) })}
+              </span>
+              <span class="dim">· {eff.copy ? t("flashnext.copy.inUse") : t("flashnext.copy.unused")}</span>
+            {:else if status.copy === "incomplete"}
+              <span class="text-warn">
+                {fill(t("flashnext.copy.status.incomplete"), { gb: gb(status.copy_bytes) })}
+              </span>
+            {:else}
+              <span class="dim">
+                {status.free_bytes == null
+                  ? fill(t("flashnext.copy.status.absentNoFree"), { need: gb(status.copy_need_bytes) })
+                  : fill(t("flashnext.copy.status.absent"), {
+                      need: gb(status.copy_need_bytes),
+                      free: gb(status.free_bytes),
+                    })}
+              </span>
+            {/if}
+          </div>
+          <PackBuildControl
+            kind="copy"
+            {status}
+            build={builds.copy}
+            disabled={off}
+            onBuild={() => onBuild("copy")}
+            onCancel={onCancelBuild}
+          />
+          <div class="dim text-[10px] leading-snug">{t("flashnext.copy.note")}</div>
         </div>
       </div>
 

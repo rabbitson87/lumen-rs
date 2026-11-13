@@ -594,6 +594,11 @@ fn flash_next_checks(cfg: &PersistentConfig) -> Vec<CheckResult> {
         env("LUMEN_MOE_PACK").as_deref() == Some("build"),
     ));
     out.push(flash_next_pack_check(&dir, pack));
+    out.push(flash_next_copy_check(
+        &dir,
+        flash_next::copy_state(&dir),
+        flash_next::copy_env(cfg, &dir).is_some(),
+    ));
     out.push(flash_next_mtp_check(
         &dir,
         flash_next::has_mtp_head(&dir),
@@ -783,6 +788,65 @@ fn flash_next_pack_check(dir: &Path, pack: PackState) -> CheckResult {
                     "experts.lpack incomplete ({:.0} GB of {:.0} GB)",
                     gb(len),
                     gb(flash_next::PACK_BYTES)
+                ),
+            )
+        },
+    }
+}
+
+/// The 3-bit copy of the experts: optional, and served once it is built unless the setting is
+/// off (`served`). An unfinished one is never served, so it is only a warning.
+fn flash_next_copy_check(dir: &Path, copy: PackState, served: bool) -> CheckResult {
+    const NAME: &str = "Flash-Next 3-bit expert copy";
+    let file = flash_next::COPY_FILE;
+    match copy {
+        PackState::Complete(len) => row(
+            "flash_next_copy",
+            NAME,
+            CheckStatus::Pass,
+            if served {
+                format!("{file} present ({:.0} GB), served", gb(len))
+            } else {
+                format!(
+                    "{file} present ({:.0} GB), not served (the copy setting is off)",
+                    gb(len)
+                )
+            },
+        ),
+        PackState::Absent => CheckResult {
+            detail: Some(
+                "The copy keeps the top 3 bits of every routed expert (54 GB): an expert takes \
+                 2.15 MB instead of 2.76, so the same pool holds more of them and fewer are read \
+                 from the SSD. It is another model: about 96% of tokens are the checkpoint's own."
+                    .into(),
+            ),
+            ..row(
+                "flash_next_copy",
+                NAME,
+                CheckStatus::Pass,
+                "no 3-bit copy (optional)".into(),
+            )
+        },
+        PackState::Incomplete(len) => CheckResult {
+            fix_hint: Some(
+                "An unfinished copy is not served; the checkpoint's own experts are. Delete it \
+                 and build it again."
+                    .into(),
+            ),
+            fix_command: Some(format!(
+                "rm {} && lumen-server --build-expert-copy {} {}",
+                sh_quote(&dir.join(file)),
+                sh_quote(dir),
+                flash_next::COPY_SPEC
+            )),
+            ..row(
+                "flash_next_copy",
+                NAME,
+                CheckStatus::Warn,
+                format!(
+                    "{file} incomplete ({:.0} GB of {:.0} GB)",
+                    gb(len),
+                    gb(flash_next::COPY_BYTES)
                 ),
             )
         },
@@ -1269,6 +1333,44 @@ mod flash_next_tests {
     }
 
     #[test]
+    fn the_copy_row_tells_served_unused_absent_and_unfinished_apart() {
+        use crate::flash_next::{COPY_BYTES, COPY_COMPLETE_MIN_BYTES};
+        let dir = Path::new("/m");
+        let served = flash_next_copy_check(dir, PackState::Complete(COPY_BYTES), true);
+        assert_eq!(served.status, CheckStatus::Pass);
+        assert_eq!(
+            served.message,
+            "experts.3b64.top.lpack present (54 GB), served"
+        );
+        let off = flash_next_copy_check(dir, PackState::Complete(COPY_BYTES), false);
+        assert_eq!(
+            off.message,
+            "experts.3b64.top.lpack present (54 GB), not served (the copy setting is off)"
+        );
+
+        let none = flash_next_copy_check(dir, PackState::Absent, false);
+        assert_eq!(
+            (none.status, none.message.as_str()),
+            (CheckStatus::Pass, "no 3-bit copy (optional)")
+        );
+
+        let cut = flash_next_copy_check(
+            dir,
+            PackState::Incomplete(COPY_COMPLETE_MIN_BYTES - 1),
+            false,
+        );
+        assert_eq!(cut.status, CheckStatus::Warn);
+        assert_eq!(
+            cut.message,
+            "experts.3b64.top.lpack incomplete (48 GB of 54 GB)"
+        );
+        assert_eq!(
+            cut.fix_command.as_deref(),
+            Some("rm /m/experts.3b64.top.lpack && lumen-server --build-expert-copy /m 3,64,top")
+        );
+    }
+
+    #[test]
     fn a_draft_head_is_optional_unless_the_user_demanded_it() {
         let dir = Path::new("/m");
         let status = |present, mode| flash_next_mtp_check(dir, present, mode).status;
@@ -1515,6 +1617,7 @@ mod flash_next_tests {
         let ids: Vec<_> = flash_next_checks(&cfg).iter().map(|c| c.id).collect();
         assert!(ids.contains(&"flash_next_disk"), "{ids:?}");
         assert!(ids.contains(&"flash_next_pack"), "{ids:?}");
+        assert!(ids.contains(&"flash_next_copy"), "{ids:?}");
         assert!(ids.contains(&"flash_next_mtp"), "{ids:?}");
         // Only the user may start the 1 GB read.
         assert!(!ids.contains(&"flash_next_ssd"), "{ids:?}");

@@ -73,6 +73,18 @@ pub const PACK_BYTES: u64 = 68_100_000_000;
 /// A pack smaller than this is an interrupted copy; the server ignores it.
 pub const PACK_COMPLETE_MIN_BYTES: u64 = 60_000_000_000;
 
+/// The low-bit copy of the routed experts the app builds and serves (`LUMEN_QWEN4_EXPERT_COPY`):
+/// the top 3 bits of every 4-bit code, in groups of 64. An expert takes 2.15 MB instead of 2.76,
+/// so the same pool holds more of them. It is another model: about 96% of tokens are the
+/// checkpoint's own (`docs/flash-next.md`).
+pub const COPY_SPEC: &str = "3,64,top";
+/// Its file next to the weights, as `lumen-server --build-expert-copy <dir> 3,64,top` writes it.
+pub const COPY_FILE: &str = "experts.3b64.top.lpack";
+/// Its size: 48 x 512 experts of 2,207,744 bytes (54,257,582,080 bytes; a draft head adds a layer).
+pub const COPY_BYTES: u64 = 54_300_000_000;
+/// A copy smaller than this is an interrupted file copy, which the server would refuse to load.
+pub const COPY_COMPLETE_MIN_BYTES: u64 = 48_000_000_000;
+
 /// The part of `ram_bytes` the server may fill, lowered to `memory_limit` (what
 /// `LUMEN_MEMORY_LIMIT_GB` allows) when there is one.
 pub fn usable_bytes(ram_bytes: u64, memory_limit: Option<u64>) -> u64 {
@@ -452,9 +464,14 @@ pub fn find_model_dir(cfg: &PersistentConfig) -> Option<PathBuf> {
         .filter(|e| e.ready && is_flash_next_id(&e.id))
         .collect();
     found.sort_by_key(|e| cfg.active_model.as_deref() != Some(e.id.as_str()));
-    let path = &found.first()?.path;
+    weights_dir(&found.first()?.path)
+}
+
+/// The folder that holds a model's weights: `path` itself, or the snapshot inside a Hugging Face
+/// cache folder.
+pub fn weights_dir(path: &Path) -> Option<PathBuf> {
     if path.join("config.json").is_file() {
-        return Some(path.clone());
+        return Some(path.to_path_buf());
     }
     models::resolve_hf_snapshot(path)
 }
@@ -468,11 +485,32 @@ pub enum PackState {
 }
 
 pub fn pack_state(dir: &Path) -> PackState {
-    match std::fs::metadata(dir.join("experts.lpack")) {
-        Ok(m) if m.len() >= PACK_COMPLETE_MIN_BYTES => PackState::Complete(m.len()),
+    file_state(&dir.join("experts.lpack"), PACK_COMPLETE_MIN_BYTES)
+}
+
+/// The 3-bit copy ([`COPY_FILE`]) in `dir`, by the same rule as the pack.
+pub fn copy_state(dir: &Path) -> PackState {
+    file_state(&dir.join(COPY_FILE), COPY_COMPLETE_MIN_BYTES)
+}
+
+fn file_state(path: &Path, complete_from: u64) -> PackState {
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() >= complete_from => PackState::Complete(m.len()),
         Ok(m) => PackState::Incomplete(m.len()),
         Err(_) => PackState::Absent,
     }
+}
+
+/// The variable that makes a launch of the model at `model_path` serve the 3-bit copy: only when
+/// the setting allows it and the copy in its weights folder is complete. The server refuses to
+/// load a copy it was told to serve and cannot read, so an unfinished one is not named.
+pub fn copy_env(cfg: &PersistentConfig, model_path: &Path) -> Option<(&'static str, String)> {
+    if cfg.flash_next.expert_copy == crate::config::FlashNextCopy::Off {
+        return None;
+    }
+    let dir = weights_dir(model_path)?;
+    matches!(copy_state(&dir), PackState::Complete(_))
+        .then(|| ("LUMEN_QWEN4_EXPERT_COPY", COPY_SPEC.to_string()))
 }
 
 pub fn has_mtp_head(dir: &Path) -> bool {

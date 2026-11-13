@@ -104,6 +104,7 @@ fn main() {
             commands::cancel_measure,
             commands::flash_next_status,
             commands::start_pack_build,
+            commands::start_copy_build,
             commands::cancel_pack_build,
             updater::check_for_updates,
             updater::install_update,

@@ -38,6 +38,8 @@ const {
   flashNextSlowSsd,
   FLASH_NEXT_LANE_PRESETS,
   FLASH_NEXT_LANES_DEFAULT,
+  FLASH_NEXT_COPY_ENV_KEY,
+  FLASH_NEXT_COPY_SPEC,
   FLASH_NEXT_DEFAULTS,
   FLASH_NEXT_ENV_KEYS,
   FLASH_NEXT_POOL_PRESETS_GB,
@@ -55,6 +57,7 @@ const {
   formatGbValue,
   formatPromptShort,
   lanesValue,
+  copyInUse,
   mtpInUse,
   mtpMode,
   packInUse,
@@ -596,6 +599,7 @@ const everyOptionChosen = settings({
   draft_head: "on",
   io_mode: "direct",
   io_lanes: 16,
+  expert_copy: "off",
 });
 
 test("the card is operable only while the Flash-Next model is the selected one", () => {
@@ -638,6 +642,32 @@ test("the defaults send nothing: an unset option is the server's own default", (
   assert.ok(flashNextIsDefault(FLASH_NEXT_DEFAULTS));
   // Choosing the server's default (32 reader threads) is not choosing.
   assert.deepEqual(flashNextSettingsEnv(settings({ io_lanes: FLASH_NEXT_LANES_DEFAULT })), {});
+});
+
+test("the 3-bit copy is served once it is complete, unless it is switched off", () => {
+  assert.equal(FLASH_NEXT_DEFAULTS.expert_copy, "auto");
+  const complete = { installed: true, pack: "complete", copy: "complete", mtp_present: false };
+  const unfinished = { ...complete, copy: "incomplete" };
+  const served = { [FLASH_NEXT_COPY_ENV_KEY]: FLASH_NEXT_COPY_SPEC };
+  // Its variable is not one of the settings' own: it needs the disk too, so env() never writes it.
+  assert.deepEqual(flashNextSettingsEnv(FLASH_NEXT_DEFAULTS), {});
+  assert.deepEqual(flashNextSettingsEnv(settings({ expert_copy: "off" })), {});
+  assert.ok(!(FLASH_NEXT_ENV_KEYS as readonly string[]).includes(FLASH_NEXT_COPY_ENV_KEY));
+  // The launch carries it only for a complete copy and the `auto` setting (`flash_next::copy_env`).
+  assert.deepEqual(flashNextEnv(FLASH_NEXT_DEFAULTS, {}, complete), served);
+  assert.deepEqual(flashNextEnv(settings({ expert_copy: "off" }), {}, complete), {});
+  assert.deepEqual(flashNextEnv(FLASH_NEXT_DEFAULTS, {}, unfinished), {});
+  assert.deepEqual(flashNextEnv(FLASH_NEXT_DEFAULTS, {}, null), {});
+  assert.deepEqual(flashNextEnv(FLASH_NEXT_DEFAULTS, {}), {});
+  // An override of the same name wins, read as the server reads a flag.
+  assert.ok(copyInUse(served));
+  assert.ok(!copyInUse({}));
+  assert.ok(!copyInUse(flashNextEnv(FLASH_NEXT_DEFAULTS, { [FLASH_NEXT_COPY_ENV_KEY]: " Off " }, complete)));
+  assert.ok(!copyInUse({ [FLASH_NEXT_COPY_ENV_KEY]: "0" }));
+  assert.ok(copyInUse(flashNextEnv(settings({ expert_copy: "off" }), { [FLASH_NEXT_COPY_ENV_KEY]: "3,64,top" }, null)));
+  // Switching it off is a choice the card can reset, though it sends nothing.
+  assert.ok(flashNextIsDefault(FLASH_NEXT_DEFAULTS));
+  assert.ok(!flashNextIsDefault(settings({ expert_copy: "off" })));
 });
 
 test("every chosen option maps to its variable as a plain value (as FlashNextConfig::env does)", () => {
@@ -683,15 +713,29 @@ test("an env override replaces the setting of the same name and nothing else", (
     "LUMEN_MOE_IO_LANES",
   ]);
   assert.deepEqual(flashNextShadowedKeys({}), []);
+  // The copy's variable replaces the copy setting.
+  assert.deepEqual(flashNextShadowedKeys({ [FLASH_NEXT_COPY_ENV_KEY]: "off", LUMEN_MOE_PACK: "off" }), [
+    "LUMEN_MOE_PACK",
+    FLASH_NEXT_COPY_ENV_KEY,
+  ]);
 });
 
 test("the Flash-Next names shadow a typed setting only while Flash-Next is selected", () => {
-  const typed = new Set(["LUMEN_MAX_PROMPT_TOKENS", "LUMEN_QWEN35_PREFILL_CHUNK", "LUMEN_MOE_PACK", "LUMEN_KV_DISK"]);
+  const typed = new Set([
+    "LUMEN_MAX_PROMPT_TOKENS",
+    "LUMEN_QWEN35_PREFILL_CHUNK",
+    "LUMEN_MOE_PACK",
+    FLASH_NEXT_COPY_ENV_KEY,
+    "LUMEN_KV_DISK",
+  ]);
   // The prompt cap and the prefill chunk are rows of the env panel for every family.
   assert.equal(envShadowsTypedKey("LUMEN_MAX_PROMPT_TOKENS", typed, false), false);
   assert.equal(envShadowsTypedKey("LUMEN_MAX_PROMPT_TOKENS", typed, true), true);
   assert.equal(envShadowsTypedKey("LUMEN_QWEN35_PREFILL_CHUNK", typed, false), false);
   assert.equal(envShadowsTypedKey("LUMEN_MOE_PACK", typed, true), true);
+  // The copy is served only by a Flash-Next launch: for another model its name is a plain entry.
+  assert.equal(envShadowsTypedKey(FLASH_NEXT_COPY_ENV_KEY, typed, false), false);
+  assert.equal(envShadowsTypedKey(FLASH_NEXT_COPY_ENV_KEY, typed, true), true);
   // Anything else typed shadows regardless; an untyped name never does.
   assert.equal(envShadowsTypedKey("LUMEN_KV_DISK", typed, false), true);
   assert.equal(envShadowsTypedKey("LUMEN_TEMPERATURE", typed, true), false);
@@ -700,6 +744,7 @@ test("the Flash-Next names shadow a typed setting only while Flash-Next is selec
 test("the settings, their variables and the defaults match the Rust side", () => {
   const cfg = readFileSync(new URL("../../../src/config.rs", import.meta.url), "utf8");
   const srv = readFileSync(new URL("../../../src/server.rs", import.meta.url), "utf8");
+  const fnx = readFileSync(new URL("../../../src/flash_next.rs", import.meta.url), "utf8");
   // The field names of `FlashNextConfig` are the keys of the settings object.
   const body = cfg.match(/pub struct FlashNextConfig \{([^}]+)\}/)?.[1];
   assert.ok(body, "FlashNextConfig not found in config.rs");
@@ -713,12 +758,25 @@ test("the settings, their variables and the defaults match the Rust side", () =>
   const typedBlock = srv.slice(srv.indexOf("pub const TYPED_ENV_KEYS"));
   const typed = new Set([...typedBlock.slice(0, typedBlock.indexOf("];")).matchAll(/"(LUMEN_[A-Z0-9_]+)"/g)].map((m) => m[1]));
   for (const k of FLASH_NEXT_ENV_KEYS) assert.ok(typed.has(k), `${k} is not in TYPED_ENV_KEYS`);
+  // The copy's variable is typed too, and `copy_env` sends it with the spec the card sends.
+  assert.ok(typed.has(FLASH_NEXT_COPY_ENV_KEY), `${FLASH_NEXT_COPY_ENV_KEY} is not in TYPED_ENV_KEYS`);
+  const copyEnv = fnx.slice(fnx.indexOf("pub fn copy_env("));
+  assert.ok(copyEnv.slice(0, copyEnv.indexOf("\n}\n")).includes(`("${FLASH_NEXT_COPY_ENV_KEY}", COPY_SPEC`), "copy_env");
+  assert.equal(fnx.match(/pub const COPY_SPEC: &str = "([^"]+)";/)?.[1], FLASH_NEXT_COPY_SPEC);
   // The choices and the server's own number of reader threads.
   const variants = (name: string) =>
     [...(cfg.match(new RegExp(`pub enum ${name} \\{([^}]+)\\}`))?.[1] ?? "").matchAll(/^\s{4}([A-Z]\w*),/gm)].map((m) => m[1].toLowerCase());
   assert.deepEqual(variants("FlashNextPack"), ["auto", "off", "build"]);
   assert.deepEqual(variants("FlashNextDraftHead"), ["off", "auto", "on"]);
   assert.deepEqual(variants("FlashNextIoMode"), ["auto", "direct", "buffered"]);
+  assert.deepEqual(variants("FlashNextCopy"), ["auto", "off"]);
+  // Each choice's `#[default]` is the card's default.
+  const byDefault = (name: string) =>
+    cfg.match(new RegExp(`pub enum ${name} \\{[^}]*?#\\[default\\]\\s*([A-Z]\\w*),`))?.[1].toLowerCase();
+  assert.equal(byDefault("FlashNextPack"), FLASH_NEXT_DEFAULTS.pack);
+  assert.equal(byDefault("FlashNextDraftHead"), FLASH_NEXT_DEFAULTS.draft_head);
+  assert.equal(byDefault("FlashNextIoMode"), FLASH_NEXT_DEFAULTS.io_mode);
+  assert.equal(byDefault("FlashNextCopy"), FLASH_NEXT_DEFAULTS.expert_copy);
   assert.equal(Number(cfg.match(/FLASH_NEXT_IO_LANES_DEFAULT: u32 = (\d+);/)?.[1]), FLASH_NEXT_LANES_DEFAULT);
   assert.equal(Number(cfg.match(/FLASH_NEXT_IO_LANES_MAX: u32 = (\d+);/)?.[1]), 64);
 });
@@ -840,6 +898,9 @@ test("the pack is in use when it is complete (auto), asked for (build) or not sw
   assert.ok(!packInUse("auto", null));
   assert.ok(packInUse("build", absent));
   assert.ok(!packInUse("off", complete));
+  // While the 3-bit copy is served the experts come from it, so the pack is not read.
+  assert.ok(!packInUse("auto", complete, true));
+  assert.ok(!packInUse("build", absent, true));
   // The head is used only when chosen (auto / on) and installed; off is never used.
   assert.ok(mtpInUse("auto", absent));
   assert.ok(mtpInUse("on", absent));
@@ -893,6 +954,13 @@ test("the summary follows the saved settings", () => {
     flashNextEffective({ env: { LUMEN_MOE_EXPERT_CACHE_GB: "8g" }, usableBytes: usable, status }).estimate.poolBytes,
     8e9,
   );
+  // The copy, once served, is what decode reads instead of the pack.
+  const both = { installed: true, pack: "complete", copy: "complete", mtp_present: false };
+  const copyEnv = flashNextEnv(FLASH_NEXT_DEFAULTS, {}, both);
+  const withCopy = flashNextEffective({ env: copyEnv, usableBytes: usable, status: both });
+  assert.deepEqual([withCopy.copy, withCopy.pack], [true, false]);
+  const copyOff = flashNextEffective({ env: flashNextEnv(settings({ expert_copy: "off" }), {}, both), usableBytes: usable, status: both });
+  assert.deepEqual([copyOff.copy, copyOff.pack], [false, true]);
   // `auto` written by hand is not an explicit pool.
   assert.ok(!flashNextEffective({ env: { LUMEN_MOE_EXPERT_CACHE_GB: "auto" }, usableBytes: usable, status }).poolExplicit);
 });

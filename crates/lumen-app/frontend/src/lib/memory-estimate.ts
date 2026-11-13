@@ -997,18 +997,29 @@ export type FlashNextModelStatus = {
   installed: boolean;
   /** `absent`, `incomplete` or `complete` */
   pack: string;
+  /** The 3-bit copy, by the same rule (absent when not known). */
+  copy?: string;
   mtp_present: boolean;
 } | null;
 
 /** Whether decode will read the expert pack: `auto` uses it when it is complete, `build` makes it
- *  first, `off` never does. */
+ *  first, `off` never does. While the 3-bit copy is served (`copyServed`) the experts come from
+ *  the copy, so the pack is not read whatever the mode. */
 export function packInUse(
   mode: "auto" | "off" | "build",
   status: FlashNextModelStatus,
+  copyServed = false,
 ): boolean {
-  if (mode === "off") return false;
+  if (copyServed || mode === "off") return false;
   if (mode === "build") return true;
   return status?.pack === "complete";
+}
+
+/** Whether a launch with `env` serves a low-bit copy of the experts: `LUMEN_QWEN4_EXPERT_COPY`
+ *  is set to anything but an off word, as the server reads its flags. */
+export function copyInUse(env: Record<string, string>): boolean {
+  const v = env[FLASH_NEXT_COPY_ENV_KEY];
+  return v != null && !["0", "false", "off", "no"].includes(v.trim().toLowerCase());
 }
 
 /** Whether the draft head will be loaded: only when chosen (`auto` / `on`), and needs the file. */
@@ -1017,7 +1028,7 @@ export function mtpInUse(mode: "off" | "auto" | "on", status: FlashNextModelStat
 }
 
 /** What the settings run with, for the summary line: the plan's pool and prompt, whether the
- *  pack and the draft head are in use, and the decode speed that estimates. */
+ *  pack, the 3-bit copy and the draft head are in use, and the decode speed that estimates. */
 export function flashNextEffective(a: {
   env: Record<string, string>;
   contextMax?: number;
@@ -1032,7 +1043,8 @@ export function flashNextEffective(a: {
   const defaults = flashNextPlan(a.usableBytes);
   const chunk = chunkEnv ?? defaults.chunk;
   const launch = flashNextLaunchContext(a.env, a.contextMax, a.usableBytes);
-  const pack = packInUse(envChoice(a.env.LUMEN_MOE_PACK, ["auto", "off", "build"] as const, "auto"), a.status);
+  const copy = copyInUse(a.env);
+  const pack = packInUse(envChoice(a.env.LUMEN_MOE_PACK, ["auto", "off", "build"] as const, "auto"), a.status, copy);
   const head = mtpInUse(mtpMode(a.env.LUMEN_QWEN4_MTP), a.status);
   const estimate = flashNextEstimate({
     usableBytes: a.usableBytes,
@@ -1047,6 +1059,7 @@ export function flashNextEffective(a: {
     promptExplicit: launch.explicit,
     estimate,
     pack,
+    copy,
     head,
     tps: flashNextChipTps(estimate.poolBytes, pack, a.hw ?? null),
     machineDefaultPrompt: defaults.ctxTokens,
@@ -1072,6 +1085,15 @@ export const FLASH_NEXT_ENV_KEYS = [
   "LUMEN_MOE_IO_LANES",
 ] as const;
 
+/** The variable that serves the 3-bit copy of the experts, and its value
+ *  (`flash_next::copy_env` / `COPY_SPEC`). It is not one of `FlashNextConfig::env`'s: the launch
+ *  sends it only while the copy is complete, so it needs the status as well as the setting. */
+export const FLASH_NEXT_COPY_ENV_KEY = "LUMEN_QWEN4_EXPERT_COPY";
+export const FLASH_NEXT_COPY_SPEC = "3,64,top";
+
+/** Every variable a Flash-Next launch sends for the card's settings: the ones above and the copy's. */
+const FLASH_NEXT_TYPED_KEYS: readonly string[] = [...FLASH_NEXT_ENV_KEYS, FLASH_NEXT_COPY_ENV_KEY];
+
 /** The settings of a config that never saw the card: every option left to the server. */
 export const FLASH_NEXT_DEFAULTS: Readonly<FlashNextSettings> = {
   expert_cache_gb: null,
@@ -1081,6 +1103,7 @@ export const FLASH_NEXT_DEFAULTS: Readonly<FlashNextSettings> = {
   draft_head: "off",
   io_mode: "auto",
   io_lanes: null,
+  expert_copy: "auto",
 };
 
 /** The settings are operable only while the Flash-Next model is the selected one. */
@@ -1091,8 +1114,9 @@ export function flashNextSettingsEnabled(selectedModelId: string | null | undefi
 const positiveNumber = (n: number | null | undefined): n is number =>
   n != null && Number.isFinite(n) && n > 0;
 
-/** The variables a Flash-Next launch carries for `s`: only options chosen away from the server's
- *  default, as plain values (`8`, not `8g`). A value that could not be one counts as unset. */
+/** The variables a Flash-Next launch carries for `s` (`FlashNextConfig::env`): only options
+ *  chosen away from the server's default, as plain values (`8`, not `8g`). A value that could not
+ *  be one counts as unset. The copy's variable depends on the disk too: see `flashNextEnv`. */
 export function flashNextSettingsEnv(s: FlashNextSettings): Record<string, string> {
   const env: Record<string, string> = {};
   if (positiveNumber(s.expert_cache_gb)) env.LUMEN_MOE_EXPERT_CACHE_GB = formatGbValue(s.expert_cache_gb);
@@ -1114,22 +1138,27 @@ export function flashNextSettingsEnv(s: FlashNextSettings): Record<string, strin
   return env;
 }
 
-/** What a launch carries: the settings, replaced by an env override of the same name. */
+/** What a launch carries: the settings, the 3-bit copy when `status` says it is complete and the
+ *  setting allows it (as `server.rs` adds it), then an env override of the same name. */
 export function flashNextEnv(
   s: FlashNextSettings,
   overrides: Record<string, string>,
+  status: FlashNextModelStatus = null,
 ): Record<string, string> {
-  return { ...flashNextSettingsEnv(s), ...overrides };
+  const env = flashNextSettingsEnv(s);
+  if (s.expert_copy === "auto" && status?.copy === "complete") env[FLASH_NEXT_COPY_ENV_KEY] = FLASH_NEXT_COPY_SPEC;
+  return { ...env, ...overrides };
 }
 
 /** The env overrides that replace what the card says (applied last, they win). */
 export function flashNextShadowedKeys(overrides: Record<string, string>): string[] {
-  return FLASH_NEXT_ENV_KEYS.filter((k) => k in overrides);
+  return FLASH_NEXT_TYPED_KEYS.filter((k) => k in overrides);
 }
 
-/** Every option is at the server's default: nothing to reset. */
+/** Every option is at its default: nothing to reset. The copy's default (`auto`) sends nothing
+ *  of its own, so it is compared directly. */
 export function flashNextIsDefault(s: FlashNextSettings): boolean {
-  return Object.keys(flashNextSettingsEnv(s)).length === 0;
+  return Object.keys(flashNextSettingsEnv(s)).length === 0 && s.expert_copy === FLASH_NEXT_DEFAULTS.expert_copy;
 }
 
 /** Whether an env-panel entry of this name shadows a typed setting. The Flash-Next names are
@@ -1141,5 +1170,5 @@ export function envShadowsTypedKey(
   flashNextActive: boolean,
 ): boolean {
   if (!typedKeys.has(key)) return false;
-  return flashNextActive || !(FLASH_NEXT_ENV_KEYS as readonly string[]).includes(key);
+  return flashNextActive || !FLASH_NEXT_TYPED_KEYS.includes(key);
 }

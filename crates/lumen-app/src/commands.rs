@@ -16,7 +16,7 @@ use crate::doctor::{self, CheckResult, DoctorReport};
 use crate::flash_next;
 use crate::hardware::{self, MeasureProgress, MeasureStage, SsdOutcome};
 use crate::models::{self, DownloadProgress, ModelEntry};
-use crate::pack_build::{self, EVENT_PACK, FlashNextStatus};
+use crate::pack_build::{self, BuildKind, EVENT_PACK, FlashNextStatus};
 use crate::server::{self, ServerStatus, TYPED_ENV_KEYS};
 use crate::state::AppState;
 use crate::sysinfo::{self, MemoryUsage, SystemInfo};
@@ -821,13 +821,13 @@ async fn server_busy(state: &AppState) -> bool {
     )
 }
 
-/// What the Flash-Next settings show about the model on disk: the pack, the draft head, the
-/// space the pack needs, and whether a build may start.
+/// What the Flash-Next settings show about the model on disk: the pack, the 3-bit copy, the draft
+/// head, the space each build needs, and whether one may start.
 #[tauri::command]
 pub async fn flash_next_status(state: State<'_, AppState>) -> CmdResult<FlashNextStatus> {
     let cfg = state.config.lock().await.clone();
     let busy = server_busy(&state).await;
-    let building = state.pack_builder.is_running().await;
+    let building = state.pack_builder.running_kind().await;
     tokio::task::spawn_blocking(move || pack_build::status(&cfg, busy, building))
         .await
         .map_err(err)
@@ -838,9 +838,21 @@ pub async fn flash_next_status(state: State<'_, AppState>) -> CmdResult<FlashNex
 /// events; the refusals (server running, under 70 GB free, already built) come back as errors.
 #[tauri::command]
 pub async fn start_pack_build(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    start_build(BuildKind::Pack, app, state).await
+}
+
+/// Start building the 3-bit copy of the experts (`lumen-server --build-expert-copy <model dir>
+/// 3,64,top`), like [`start_pack_build`]: under 56 GB free is a refusal. Once it is built a
+/// Flash-Next launch serves it unless the copy setting is off.
+#[tauri::command]
+pub async fn start_copy_build(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    start_build(BuildKind::Copy, app, state).await
+}
+
+async fn start_build(kind: BuildKind, app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
     let cfg = state.config.lock().await.clone();
     let busy = server_busy(&state).await;
-    let building = state.pack_builder.is_running().await;
+    let building = state.pack_builder.running_kind().await;
     let (status, bin) = tokio::task::spawn_blocking(move || {
         let status = pack_build::status(&cfg, busy, building);
         let bin = server::resolve_binary_public(cfg.server_binary_path.as_deref());
@@ -848,8 +860,12 @@ pub async fn start_pack_build(app: AppHandle, state: State<'_, AppState>) -> Cmd
     })
     .await
     .map_err(err)?;
-    if let Some(block) = status.build_block {
-        return Err(pack_build::block_message(block, status.free_bytes));
+    let block = match kind {
+        BuildKind::Pack => status.build_block,
+        BuildKind::Copy => status.copy_block,
+    };
+    if let Some(block) = block {
+        return Err(pack_build::block_message(kind, block, status.free_bytes));
     }
     let dir = status
         .dir
@@ -861,12 +877,13 @@ pub async fn start_pack_build(app: AppHandle, state: State<'_, AppState>) -> Cmd
     });
     state
         .pack_builder
-        .start(bin, std::path::PathBuf::from(dir), emit)
+        .start(kind, bin, std::path::PathBuf::from(dir), emit)
         .await
         .map_err(err)
 }
 
-/// Stop the running pack build; it removes its partial file. `false` when none runs.
+/// Stop the running build (the pack or the copy); it removes its partial file. `false` when
+/// none runs.
 #[tauri::command]
 pub async fn cancel_pack_build(state: State<'_, AppState>) -> CmdResult<bool> {
     Ok(state.pack_builder.cancel().await)

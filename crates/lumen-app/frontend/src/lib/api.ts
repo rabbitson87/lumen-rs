@@ -70,6 +70,9 @@ export interface AdvancedConfig {
 export type FlashNextPack = "auto" | "off" | "build";
 export type FlashNextDraftHead = "off" | "auto" | "on";
 export type FlashNextIoMode = "auto" | "direct" | "buffered";
+/** The 3-bit copy of the routed experts: `auto` serves it once it is built, `off` serves the
+ *  checkpoint's own experts. */
+export type FlashNextCopy = "auto" | "off";
 
 /** The Flash-Next card's settings (`[flash_next]`). `null` / `"auto"` leave the option to the
  *  server: only a value chosen away from its default reaches the server, and only for a
@@ -90,6 +93,9 @@ export interface FlashNextSettings {
   io_mode: FlashNextIoMode;
   /** → LUMEN_MOE_IO_LANES (1-64); null = the server's 32. */
   io_lanes: number | null;
+  /** → LUMEN_QWEN4_EXPERT_COPY=3,64,top, which the launch sends only while the copy is complete
+   *  and this is `auto` (not part of `FlashNextConfig::env`). */
+  expert_copy: FlashNextCopy;
 }
 
 /** What this Mac measured of itself (`[measured_hardware]`); the card reads it through
@@ -268,7 +274,14 @@ export interface DoctorReport {
   checks: CheckResult[];
 }
 
-/** Why the expert-pack build button is refused. */
+/** What a build makes from the weights: the expert pack (`experts.lpack`) or the 3-bit copy of
+ *  the experts (`experts.3b64.top.lpack`). One build runs at a time. */
+export type BuildKind = "pack" | "copy";
+
+/** A derived file next to the weights: `incomplete` is an interrupted copy the server ignores. */
+export type ExpertFileState = "absent" | "incomplete" | "complete";
+
+/** Why a build button is refused. */
 export type BuildBlock =
   | "not_installed"
   | "building"
@@ -293,15 +306,24 @@ export interface HardwareView {
 export interface FlashNextStatus {
   installed: boolean;
   dir: string | null;
-  pack: "absent" | "incomplete" | "complete";
+  pack: ExpertFileState;
   pack_bytes: number;
+  /** The 3-bit copy, by the same rule as the pack. */
+  copy: ExpertFileState;
+  copy_bytes: number;
   mtp_present: boolean;
   free_bytes: number | null;
   /** Free space the pack build needs. */
   need_bytes: number;
+  /** Free space the copy build needs. */
+  copy_need_bytes: number;
   server_running: boolean;
+  /** A build of either kind is running; `building_kind` says which. */
   building: boolean;
+  building_kind: BuildKind | null;
+  /** Why the pack build is refused, and the copy's. */
   build_block: BuildBlock | null;
+  copy_block: BuildBlock | null;
   hardware: HardwareView;
 }
 
@@ -324,8 +346,10 @@ export interface MeasureProgress {
 
 export type PackBuildState = "running" | "done" | "failed" | "cancelled";
 
-/** One report of the expert-pack build (`lumen://pack`). `layers` is 0 until the server says. */
+/** One report of a build (`lumen://pack`), the pack's or the copy's. `layers` is 0 until the
+ *  server says. */
 export interface PackProgress {
+  kind: BuildKind;
   state: PackBuildState;
   layer: number;
   layers: number;
@@ -414,6 +438,9 @@ export const api = {
   flashNextStatus: () => invoke<FlashNextStatus>("flash_next_status"),
   /** Start `lumen-server --pack-experts` in the background; progress arrives as `lumen://pack`. */
   startPackBuild: () => invoke<void>("start_pack_build"),
+  /** Start `lumen-server --build-expert-copy <dir> 3,64,top` the same way. */
+  startCopyBuild: () => invoke<void>("start_copy_build"),
+  /** Stop whichever build runs (only one does). */
   cancelPackBuild: () => invoke<boolean>("cancel_pack_build"),
 
   currentVersion: () => invoke<string>("current_version"),

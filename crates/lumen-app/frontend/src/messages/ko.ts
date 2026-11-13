@@ -616,6 +616,7 @@ export const ko: Record<string, string> = {
   "flashnext.disk": "필요한 디스크",
   "flashnext.disk.detail": "가중치 {model} GB",
   "flashnext.disk.pack": "GB 전문가 팩",
+  "flashnext.disk.copy": "GB 3비트 사본",
   "flashnext.disk.mtp": "GB 드래프트 헤드",
   "flashnext.active": "현재:",
   "flashnext.default": "기본",
@@ -631,9 +632,10 @@ export const ko: Record<string, string> = {
   "flashnext.opt.mtp": "드래프트 헤드",
   "flashnext.opt.io": "전문가 읽기",
   "flashnext.opt.lanes": "리더 스레드",
+  "flashnext.opt.copy": "3비트 전문가 사본",
   "flashnext.prompt": "가장 긴 프롬프트",
   "flashnext.summary":
-    "실행 설정: 풀 {pool} GB ({how}), 프롬프트 최대 {prompt} 토큰, 전문가 팩 {pack}, 드래프트 헤드 {head}",
+    "실행 설정: 풀 {pool} GB ({how}), 프롬프트 최대 {prompt} 토큰, 전문가 팩 {pack}, 3비트 사본 {copy}, 드래프트 헤드 {head}",
   "flashnext.summary.speed":
     "이 Mac에서 약 {tps} tok/s",
   "flashnext.summary.speedUnknown":
@@ -644,7 +646,7 @@ export const ko: Record<string, string> = {
   "flashnext.summary.noFit": "GPU 메모리에 들어가지 않습니다",
   "flashnext.reset": "권장값으로 되돌리기",
   "flashnext.reset.hint":
-    "이 카드의 모든 옵션을 서버 기본값으로 되돌립니다(해당 옵션은 아무것도 보내지 않음). 환경 변수 오버라이드는 건드리지 않습니다.",
+    "이 카드의 모든 옵션을 서버 기본값으로 되돌리고(해당 옵션은 아무것도 보내지 않음), 3비트 사본은 자동(만들어져 있으면 사용)으로 되돌립니다. 환경 변수 오버라이드는 건드리지 않습니다.",
   "flashnext.pool.custom": "직접 입력…",
   "flashnext.pool.custom.hint": "GB: 8, 8g, 8GB, 12.5g",
   "flashnext.pool.custom.invalid": "크기가 아닙니다: 8, 8g, 12.5g처럼 입력하세요.",
@@ -678,6 +680,7 @@ export const ko: Record<string, string> = {
     "팩 있음: experts.lpack ({gb} GB), 디코드 약 7-15% 빠름.",
   "flashnext.pack.inUse": "사용 중",
   "flashnext.pack.unused": "끔 상태에서는 사용 안 함",
+  "flashnext.pack.copyServed": "3비트 사본을 쓰는 동안에는 읽지 않음",
   "flashnext.pack.status.incomplete":
     "미완성 팩({gb} GB)이 디스크에 있고 서버는 이를 무시합니다. 빌드하면 새로 만듭니다.",
   "flashnext.pack.status.absent": "아직 팩이 없습니다. 디스크 {need} GB가 필요하며 {free} GB가 비어 있습니다.",
@@ -698,6 +701,32 @@ export const ko: Record<string, string> = {
   "flashnext.pack.block.server_running":
     "먼저 서버를 중지하세요: 빌드는 같은 디스크에서 모델 전체를 읽습니다.",
   "flashnext.pack.block.not_enough_disk": "여유 공간 {need} GB가 필요한데 이 볼륨에는 {free} GB뿐입니다.",
+  "flashnext.copy.mode.auto": "사본이 만들어져 있으면 사용합니다.",
+  "flashnext.copy.mode.off": "사본이 있어도 체크포인트 자체의 전문가를 씁니다.",
+  "flashnext.copy.status.complete": "사본 있음: experts.3b64.top.lpack ({gb} GB).",
+  "flashnext.copy.inUse": "사용 중",
+  "flashnext.copy.unused": "끔 상태에서는 사용 안 함",
+  "flashnext.copy.status.incomplete":
+    "미완성 사본({gb} GB)이 디스크에 있으며 사용되지 않습니다. 빌드하면 새로 만듭니다.",
+  "flashnext.copy.status.absent": "아직 사본이 없습니다. 디스크 {need} GB가 필요하며 {free} GB가 비어 있습니다.",
+  "flashnext.copy.status.absentNoFree": "아직 사본이 없습니다. 디스크 {need} GB가 필요합니다.",
+  "flashnext.copy.build": "3비트 사본 빌드",
+  "flashnext.copy.build.hint":
+    "백그라운드에서 모델에 lumen-server --build-expert-copy(3,64,top)를 실행해 가중치 옆에 54 GB 파일을 만듭니다.",
+  "flashnext.copy.starting": "빌드를 시작하는 중…",
+  "flashnext.copy.building": "사본 빌드 중: {total}개 레이어 중 {n}번째",
+  "flashnext.copy.cancel": "취소",
+  "flashnext.copy.cancelled": "빌드가 취소되었습니다. 디스크에 남은 것은 없습니다.",
+  "flashnext.copy.failed": "빌드 실패:",
+  "flashnext.copy.built": "사본을 만들었습니다. 끔으로 두지 않으면 다음 Flash-Next 실행부터 사본을 사용합니다.",
+  "flashnext.copy.block.not_installed": "Flash-Next가 설치되어 있지 않습니다.",
+  "flashnext.copy.block.building": "이미 빌드가 실행 중입니다.",
+  "flashnext.copy.block.already_built": "사본이 이미 만들어져 있습니다.",
+  "flashnext.copy.block.server_running":
+    "먼저 서버를 중지하세요: 빌드는 같은 디스크에서 모델 전체를 읽습니다.",
+  "flashnext.copy.block.not_enough_disk": "여유 공간 {need} GB가 필요한데 이 볼륨에는 {free} GB뿐입니다.",
+  "flashnext.copy.note":
+    "정확한 사본이 아니라 다른 모델입니다: 전문가마다 상위 3비트만 남기므로 답변이 체크포인트와 조금 다릅니다(토큰의 약 96%가 같음). 전문가 하나가 2.76 MB 대신 2.15 MB라 같은 메모리에 더 많이 담깁니다. mixed 4/8비트 빌드에서 같은 풀일 때 디코드가 21-30% 빨랐습니다. 디스크 54 GB가 필요하며, 사본을 쓰는 동안에는 전문가 팩을 읽지 않습니다.",
   "flashnext.mtp.mode.auto":
     "mtp.safetensors가 설치되어 있으면 서버의 속도 거버너 아래에서 드래프트 헤드를 사용합니다.",
   "flashnext.mtp.mode.on":
@@ -823,6 +852,7 @@ export const ko: Record<string, string> = {
   "doctor.check.flash_next_ram.name": "Flash-Next 메모리",
   "doctor.check.flash_next_disk.name": "Flash-Next 디스크",
   "doctor.check.flash_next_pack.name": "Flash-Next 전문가 팩",
+  "doctor.check.flash_next_copy.name": "Flash-Next 3비트 전문가 사본",
   "doctor.check.flash_next_mtp.name": "Flash-Next 드래프트 헤드",
   "doctor.check.flash_next_ssd.name": "Flash-Next SSD",
 
@@ -863,6 +893,10 @@ export const ko: Record<string, string> = {
   "doctor.msg.flash_next_pack.present": "experts.lpack 있음 ({gb} GB)",
   "doctor.msg.flash_next_pack.absent": "전문가 팩 없음 (선택)",
   "doctor.msg.flash_next_pack.incomplete": "experts.lpack 불완전 ({full} GB 중 {gb} GB)",
+  "doctor.msg.flash_next_copy.served": "experts.3b64.top.lpack 있음 ({gb} GB), 사용 중",
+  "doctor.msg.flash_next_copy.off": "experts.3b64.top.lpack 있음 ({gb} GB), 사용 안 함 (사본 설정이 꺼짐)",
+  "doctor.msg.flash_next_copy.absent": "3비트 사본 없음 (선택)",
+  "doctor.msg.flash_next_copy.incomplete": "experts.3b64.top.lpack 불완전 ({full} GB 중 {gb} GB)",
   "doctor.msg.flash_next_mtp.present": "드래프트 헤드 있음 (mtp.safetensors)",
   "doctor.msg.flash_next_mtp.off":
     "드래프트 헤드 설치됨, 사용 안 함 (기본값은 꺼짐)",
@@ -931,6 +965,8 @@ export const ko: Record<string, string> = {
     "전문가 팩은 선택 사항입니다. 사용하려면 이 볼륨에 약 70 GB를 확보한 뒤 아래 명령으로 만드세요.",
   "doctor.hint.flash_next_pack.incomplete":
     "서버는 미완성 팩을 무시하고 샤드에서 읽습니다. 삭제하고 다시 만드세요.",
+  "doctor.hint.flash_next_copy.incomplete":
+    "미완성 사본은 쓰이지 않고 체크포인트 자체의 전문가를 읽습니다. 삭제하고 다시 만드세요.",
   "doctor.hint.flash_next_mtp.required":
     "드래프트 헤드가 없으면 서버는 LUMEN_QWEN4_MTP=on 으로 시작하지 않습니다. 아래 명령으로 헤드(1.5 GB)를 받거나 오버라이드를 제거하세요.",
   "doctor.hint.flash_next_mtp.absent":
@@ -949,6 +985,8 @@ export const ko: Record<string, string> = {
     "4.2 GB 미만이면 풀이 스테이징 영역을 하나만 둘 수 있어, prefill이 현재 레이어를 계산하는 동안 다음 레이어를 읽지 못합니다.",
   "doctor.detail.flash_next_pack.absent":
     "팩이 없으면 서버는 전문가 하나를 가중치 샤드의 흩어진 9개 범위로 읽습니다. 팩은 같은 바이트를 전문가당 레코드 하나로 저장합니다.",
+  "doctor.detail.flash_next_copy.absent":
+    "사본은 모든 라우팅 전문가의 상위 3비트만 남깁니다(54 GB). 전문가 하나가 2.76 MB 대신 2.15 MB라 같은 풀에 더 많이 담기고 SSD에서 읽는 횟수가 줄어듭니다. 다른 모델입니다: 토큰의 약 96%가 체크포인트와 같습니다.",
   "doctor.detail.flash_next_ssd":
     "페이지 캐시를 우회해 {shard}에서 {total} MB 읽음: 앞에서부터 {seq} MB, 이어서 서버가 전문가를 가져오는 방식 그대로 스레드 4개로 {rec} MB 무작위 읽기 {reads}회({rand} MB).",
   "doctor.detail.flash_next_ssd.pack":

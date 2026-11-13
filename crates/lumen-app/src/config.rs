@@ -329,6 +329,21 @@ pub struct FlashNextConfig {
     pub io_mode: FlashNextIoMode,
     /// → `LUMEN_MOE_IO_LANES`, reader threads (1 to 64). `None` = the server's 32.
     pub io_lanes: Option<u32>,
+    /// → `LUMEN_QWEN4_EXPERT_COPY`, sent only when the copy is built
+    /// ([`crate::flash_next::copy_env`]), so it is not part of [`FlashNextConfig::env`].
+    pub expert_copy: FlashNextCopy,
+}
+
+/// The 3-bit copy of the routed experts ([`crate::flash_next::COPY_SPEC`]), which the app builds on
+/// request. It is another model: replies differ from the checkpoint's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlashNextCopy {
+    /// Serve it when it is built.
+    #[default]
+    Auto,
+    /// Serve the checkpoint's own experts.
+    Off,
 }
 
 /// The expert pack: one contiguous file of the routed experts, built once from the weights.
@@ -907,6 +922,7 @@ max_batch = 6
             draft_head: FlashNextDraftHead::On,
             io_mode: FlashNextIoMode::Direct,
             io_lanes: Some(16),
+            expert_copy: FlashNextCopy::Off,
         }
     }
 
@@ -955,6 +971,7 @@ max_batch = 6
         assert!(raw.contains("draft_head = \"on\""), "{raw}");
         assert!(raw.contains("io_mode = \"direct\""), "{raw}");
         assert!(raw.contains("expert_cache_gb = 12.5"), "{raw}");
+        assert!(raw.contains("expert_copy = \"off\""), "{raw}");
         let back: PersistentConfig = toml::from_str(&raw).expect("parse");
         assert_eq!(back.flash_next, cfg.flash_next);
         // The defaults round trip too: nothing set stays nothing set.
@@ -977,16 +994,19 @@ max_batch = 6
                 "draft_head": "off",
                 "io_mode": "auto",
                 "io_lanes": null,
+                "expert_copy": "auto",
             })
         );
         let back: FlashNextConfig = serde_json::from_value(serde_json::json!({
             "expert_cache_gb": 8, "max_prompt_tokens": 16384, "prefill_chunk": null,
             "pack": "off", "draft_head": "auto", "io_mode": "buffered", "io_lanes": 64,
+            "expert_copy": "off",
         }))
         .expect("from json");
         assert_eq!(back.expert_cache_gb, Some(8.0));
         assert_eq!(back.pack, FlashNextPack::Off);
         assert_eq!(back.io_lanes, Some(64));
+        assert_eq!(back.expert_copy, FlashNextCopy::Off);
     }
 
     #[test]
