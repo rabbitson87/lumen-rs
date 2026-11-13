@@ -737,6 +737,20 @@ pub async fn download(
         }
     };
 
+    // Refuse a download the volume cannot hold before the first byte, not at the shard that fills
+    // the disk an hour in. A leftover `.part` restarts from zero anyway, so its space counts as
+    // free. When the Hub does not list sizes (offline, an API change) the download goes ahead.
+    for file in &files {
+        let _ = std::fs::remove_file(target.join(format!("{file}.part")));
+    }
+    if let Some(sizes) = remote_sizes(&client, repo_id, revision).await {
+        check_fits(
+            repo_id,
+            bytes_to_fetch(&target, &files, &sizes),
+            crate::doctor::statvfs_free(&target),
+        )?;
+    }
+
     for file in &files {
         let url = url_of(file);
         let dest = target.join(file);
@@ -918,6 +932,71 @@ pub async fn download(
     Ok(target)
 }
 
+/// What a download leaves free on the volume, for the system and the app's own files.
+const DOWNLOAD_HEADROOM_BYTES: u64 = 2_000_000_000;
+
+/// The size of each file at the top of `repo_id` at `revision`, from the Hub's tree listing.
+/// `None` when the Hub does not answer with one.
+async fn remote_sizes(
+    client: &reqwest::Client,
+    repo_id: &str,
+    revision: Option<&str>,
+) -> Option<std::collections::HashMap<String, u64>> {
+    let rev = revision.unwrap_or("main");
+    let url = format!("https://huggingface.co/api/models/{repo_id}/tree/{rev}");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let entries: Vec<serde_json::Value> = resp.json().await.ok()?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|e| {
+                Some((
+                    e.get("path")?.as_str()?.to_owned(),
+                    e.get("size")?.as_u64()?,
+                ))
+            })
+            .collect(),
+    )
+}
+
+/// The bytes a download of `files` into `target` still has to fetch: each file the Hub sizes,
+/// except those already on disk at that size (the loop skips them).
+fn bytes_to_fetch(
+    target: &Path,
+    files: &[String],
+    sizes: &std::collections::HashMap<String, u64>,
+) -> u64 {
+    files
+        .iter()
+        .filter_map(|f| {
+            let size = *sizes.get(f)?;
+            let have = std::fs::metadata(target.join(f)).map(|m| m.len()).ok();
+            (have != Some(size)).then_some(size)
+        })
+        .sum()
+}
+
+/// `Err` when `need` bytes and the headroom do not fit in `free`; `Ok` when they do or `free` is
+/// unknown.
+fn check_fits(repo_id: &str, need: u64, free: Option<u64>) -> Result<()> {
+    match free {
+        Some(free) if need.saturating_add(DOWNLOAD_HEADROOM_BYTES) > free => Err(anyhow::anyhow!(
+            "{repo_id} needs {:.1} GB more disk and {:.1} GB is free: free up {:.1} GB and \
+                 download again",
+            need as f64 / 1e9,
+            free as f64 / 1e9,
+            (need + DOWNLOAD_HEADROOM_BYTES - free) as f64 / 1e9
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// The URL of `file` in `repo_id` at `revision` (`main` when the catalog pins none).
 fn resolve_url(repo_id: &str, revision: Option<&str>, file: &str) -> String {
     let rev = revision.unwrap_or("main");
@@ -987,6 +1066,48 @@ mod tests {
             .unwrap();
         f.write_all(header_bytes).unwrap();
         f.write_all(&vec![0u8; actual_body as usize]).unwrap();
+    }
+
+    #[test]
+    fn a_download_counts_only_what_it_still_has_to_fetch() {
+        let dir = tmpdir("fits");
+        std::fs::write(dir.join("done.safetensors"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("short.safetensors"), vec![0u8; 10]).unwrap();
+        let sizes: std::collections::HashMap<String, u64> = [
+            ("done.safetensors", 100),
+            ("short.safetensors", 300),
+            ("missing.safetensors", 5_000),
+        ]
+        .into_iter()
+        .map(|(f, n)| (f.to_owned(), n))
+        .collect();
+        let files: Vec<String> = [
+            "done.safetensors",
+            "short.safetensors",
+            "missing.safetensors",
+            "unlisted.json",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        // The complete file is skipped, the short one is fetched again in full, the one the
+        // Hub does not size counts nothing.
+        assert_eq!(bytes_to_fetch(&dir, &files, &sizes), 300 + 5_000);
+    }
+
+    #[test]
+    fn a_download_that_does_not_fit_is_refused_with_the_numbers() {
+        let gb = 1_000_000_000u64;
+        assert!(check_fits("org/repo", 100 * gb, Some(103 * gb)).is_ok());
+        let err = check_fits("org/repo", 106 * gb, Some(29 * gb))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs 106.0 GB"), "{err}");
+        assert!(err.contains("29.0 GB is free"), "{err}");
+        assert!(err.contains("free up 79.0 GB"), "{err}");
+        // The headroom is part of the need.
+        assert!(check_fits("org/repo", 100 * gb, Some(101 * gb)).is_err());
+        assert!(check_fits("org/repo", 106 * gb, None).is_ok());
     }
 
     #[test]
