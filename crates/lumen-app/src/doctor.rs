@@ -547,7 +547,7 @@ fn row(id: &'static str, name: &'static str, status: CheckStatus, message: Strin
     }
 }
 
-/// Decimal GB, the unit the model's sizes are quoted in (97 GB, 68 GB).
+/// Decimal GB, the unit the model's sizes are quoted in (104 GB, 68 GB).
 fn gb(bytes: u64) -> f64 {
     bytes as f64 / 1e9
 }

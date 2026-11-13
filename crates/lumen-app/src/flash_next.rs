@@ -2,7 +2,7 @@
 //! speed that buys, and a read-speed probe for the volume that holds its weights.
 //!
 //! The server keeps 3.0 GB (the uniform 4-bit build) or 5.1 GB (the mixed 4/8-bit build) of the
-//! model in memory and serves its routed experts (68 GB of the 97 GB) from the SSD through a pool
+//! model in memory and serves its routed experts (68 GB of the 104 GB) from the SSD through a pool
 //! of memory slots (`docs/flash-next.md`); [`Build`] holds those numbers. The questions that
 //! decide whether it runs well are therefore not "does it fit" but "what does a prefill reserve
 //! out of the GPU's working set, and how much is left for the pool", and "can the disk feed it".

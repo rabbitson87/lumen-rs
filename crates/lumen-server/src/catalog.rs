@@ -143,7 +143,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         notes: "**Newest Qwen MoE, run from the SSD; the more accurate Flash-Next build.** 125B parameters, ~6B active: routed experts at 4 bits, everything else at 8 bits (perplexity 11.5% below the 4-bit build's). Needs ~106 GB of free disk and 16 GB of RAM: the experts and the n-gram table are read from the SSD on demand. Once it is downloaded, build its 3-bit expert copy in Tuning → Flash-Next (54 GB more disk): each expert gets 22% smaller, so the cache holds more of them and decode runs faster than the 4-bit build at the same memory, with replies that differ slightly from this build's own (96% of tokens the same). Reuses a conversation's state across turns and restarts (the disk KV cache, on by default). Reads images too with LUMEN_VISION=1.",
     },
     RecommendedModel {
-        // The same model, uniform 4-bit: the smaller download (97 GB), kept for disks that cannot
+        // The same model, uniform 4-bit: the smaller download (104 GB), kept for disks that cannot
         // hold the mixed build and its copy. Only ~3.0 GB of the 104 GB has to be in memory; the
         // routed experts (68 GB) are read from the SSD through a slot pool sized to the
         // GPU's memory (`LUMEN_MOE_EXPERT_CACHE_GB` overrides it) and the n-gram table
@@ -152,14 +152,14 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         // (Slotstream, a Swift engine for the same model, measures 6.4 / 7.2 at the first
         // two); the SSD is the limit, so a 16 GB Mac with a base-model SSD will see ~1.5.
         // The gs64 build is used because its experts are 10% smaller to read than the
-        // mlx-community group-32 build (97 GB vs 104 GB on disk), which also loads.
+        // mlx-community group-32 build (104 GB vs 112 GB on disk), which also loads.
         id: "pipenetwork/Qwen3.8-Flash-Next-MLX-4bit",
         revision: Some("aa7c790e804bbf9d491ddb109c3d61bc4a555f7c"),
         family: ModelFamily::Qwen4Exp,
         label: "Qwen 3.8 — Flash-Next 125B-A6B 4-bit (SSD-streamed, smaller download)",
-        approx_size_gb: 97,
+        approx_size_gb: 104,
         min_ram_gb: 16,
-        notes: "**The smaller Flash-Next download.** The same model as the mixed 4/8-bit build above, every matrix at 4 bits (group-64): 9 GB less disk, a less accurate model. 125B parameters, ~6B active. Needs ~97 GB of free disk but only 16 GB of RAM: the experts and the n-gram table are read from the SSD on demand, bit-identical to a run with everything in memory. Speed is set by the SSD and by how much RAM the expert cache can use: about 8 tok/s with 15 GB of cache on a 36 GB Mac, ~5-6 tok/s on 24 GB, 1.5-3 on a 16 GB Mac. Reuses a conversation's state across turns and restarts (the disk KV cache, on by default). Reads images too with LUMEN_VISION=1 (its 0.9 GB image tower comes out of the expert cache); no thinking-budget or MTP support yet.",
+        notes: "**The smaller Flash-Next download.** The same model as the mixed 4/8-bit build above, every matrix at 4 bits (group-64): 2 GB less disk, a less accurate model. 125B parameters, ~6B active. Needs ~104 GB of free disk but only 16 GB of RAM: the experts and the n-gram table are read from the SSD on demand, bit-identical to a run with everything in memory. Speed is set by the SSD and by how much RAM the expert cache can use: about 8 tok/s with 15 GB of cache on a 36 GB Mac, ~5-6 tok/s on 24 GB, 1.5-3 on a 16 GB Mac. Reuses a conversation's state across turns and restarts (the disk KV cache, on by default). Reads images too with LUMEN_VISION=1 (its 0.9 GB image tower comes out of the expert cache); no thinking-budget or MTP support yet.",
     },
     RecommendedModel {
         id: "mlx-community/Qwen3.6-35B-A3B-mxfp4",
