@@ -7,22 +7,20 @@ license.workspace = true
 description = "Lumen desktop control plane — Tauri 2.x dashboard for the lumen-server inference engine"
 
 [build-dependencies]
-tauri-build = { version = "2.6.2", features = [] }
+tauri-build = { version = "2.7.4", features = [] }
 
 [lints]
 workspace = true
 
 [dependencies]
-tauri = { version = "2.11.2", features = [] }
-tauri-plugin-dialog = "2.7.1"
-tauri-plugin-fs = "2.5.1"
-tauri-plugin-shell = "2.3.5"
-tauri-plugin-updater = "2.10.1"
-tauri-plugin-process = "2.3.1"
+tauri = { version = "2.12.5", features = [] }
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-fs = "2.7.1"
+tauri-plugin-shell = "2.6.0"
+tauri-plugin-updater = "2.14.1"
+tauri-plugin-process = "2.4.0"
 # Login item (LaunchAgent on macOS) so the app comes back after a reboot.
-# Pinned: 2.7.0 requires tauri 2.12 and re-resolves ~250 lines of Cargo.lock;
-# lift the pin together with a deliberate tauri bump.
-tauri-plugin-autostart = "=2.5.1"
+tauri-plugin-autostart = "2.7.0"
 
 # Async runtime — shared with lumen-server
 tokio = { workspace = true }
