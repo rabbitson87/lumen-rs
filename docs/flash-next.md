@@ -381,6 +381,26 @@ Reference speeds (tokens/s, expert pool set explicitly, direct reads, 300 tokens
 | 15 GB | 10.4 | 11.2 |
 | 19.8 GB | 12.0 | 13.0 |
 
+These are the uniform build's, measured before read-ahead existed (it adds 7–18%, see above). Serving
+the mixed build's 3-bit copy (`3,64,top`) the card uses a model and table of their own, measured on the
+same Mac with read-ahead on: a token streams 6.2 GB (the mixed build's 5.1 GB of resident weights plus
+1.0 GB of copy experts), the fixed part is `6.2 GB ÷ memory bandwidth + 33 ms`, and the reads go at 0.61
+of the SSD's random speed, read-ahead included. Those two constants are a straight-line fit of the
+measured time per token against the measured miss bytes; it lands within 3% of five pools and 6% of
+4.2 GB. Each pool was run on three fresh servers (two at 18 GB, where one grew swap). The speed is the
+second round of three prompts × 160 tokens (code, math, a Korean agent turn), with the pool set
+explicitly and no draft head. The hit rate is the copy's own, read-ahead counted. The first round, while
+the pool fills, ran 1–9% slower:
+
+| Pool | 3-bit copy | First round | Hit rate |
+|---|---|---|---|
+| 2.21 GB (the floor) | 8.4 | 7.6 | 0.735 |
+| 4.2 GB | 8.8 | 8.8 | 0.800 |
+| 6.7 GB | 10.8 | 9.9 | 0.844 |
+| 10 GB | 11.6 | 11.2 | 0.883 |
+| 15 GB | 13.3 | 12.8 | 0.918 |
+| 18 GB | 14.1 | 13.3 | 0.933 |
+
 With `LUMEN_MOE_IO_MODE=auto` on a Mac that has more than 12 GB to spare, the OS page cache holds
 experts too and can make a small pool run faster than these numbers (a 4 GB pool even outran 6.7 GB
 there); a 16 or 24 GB Mac has little to spare, which is why the reference uses direct reads.

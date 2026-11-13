@@ -811,9 +811,11 @@ export function flashNextEstimate(cfg: FlashNextConfig): FlashNextEstimate {
 //   tokens/s          = 1000 / time_per_token_ms
 //
 // The constants mirror `flash_next.rs` (`memory-estimate.test.ts` reads that file), and were
-// calibrated on one machine, the reference below, with the uniform build. Until this Mac is
-// measured the card shows that machine's table as reference material and promises nothing for
-// this Mac. The model is the uniform build's for every build, its floor included.
+// calibrated on one machine, the reference below. Reading the shards or the pack they are the
+// uniform build's, measured before read-ahead, for either build; serving the 3-bit copy they are
+// the mixed build's with its copy, measured with read-ahead on (`FLASH_NEXT_COPY_SPEED_MODEL`).
+// Until this Mac is measured the card shows that machine's table as reference material and
+// promises nothing for this Mac.
 
 export const FLASH_NEXT_SPEED_MODEL = {
   /** GB streamed through memory per token: the 1.325 GB of experts a token routes to + the trunk
@@ -865,9 +867,45 @@ export const FLASH_NEXT_DECODE_TPS: readonly {
   { poolGb: 19.8, shards: 11.96, pack: 12.95 },
 ];
 
-/** Share of a token's experts a pool of `poolGb` already holds. */
-export function flashNextHitRate(poolGb: number): number {
-  const pts = FLASH_NEXT_SPEED_MODEL.hitRatePoints;
+/** Serving the mixed build's 3-bit copy (`copy_decode_tps` in `flash_next.rs`): the mixed trunk
+ *  and 480 copy experts a token, the hit rate with read-ahead counted, and `otherMs` /
+ *  `ssdEfficiency` a straight-line fit of the measured ms per token against the miss bytes. */
+export const FLASH_NEXT_COPY_SPEED_MODEL = {
+  /** The mixed build's 5.132 GB trunk + 48 x 10 experts of 2.1504 MB. */
+  streamGb: 6.164,
+  otherMs: 32.91,
+  expertGbPerToken: 1.0322,
+  /** [pool GB, hit rate] over each server's second round; 2.21 GB is the copy's floor. */
+  hitRatePoints: [
+    [2.21, 0.735],
+    [4.2, 0.8],
+    [6.7, 0.844],
+    [10.0, 0.883],
+    [15.0, 0.918],
+    [18.0, 0.933],
+  ],
+  ssdEfficiency: 0.61,
+} as const;
+
+/** Decode speed (tokens/s) by pool serving the copy on the reference Mac: the second round of three
+ *  prompts x 160 tokens on a fresh server, medians of three servers, the pool set explicitly,
+ *  read-ahead on, no draft head (`DECODE_TPS_COPY`). The first round ran 1-9% slower. */
+export const FLASH_NEXT_DECODE_TPS_COPY: readonly { poolGb: number; tps: number }[] = [
+  { poolGb: 2.21, tps: 8.39 },
+  { poolGb: 4.2, tps: 8.84 },
+  { poolGb: 6.7, tps: 10.77 },
+  { poolGb: 10, tps: 11.63 },
+  { poolGb: 15, tps: 13.3 },
+  { poolGb: 18, tps: 14.08 },
+];
+
+/** Share of a token's experts a pool of `poolGb` already holds, by `points` (the shards and pack
+ *  model's unless given). */
+export function flashNextHitRate(
+  poolGb: number,
+  points: readonly (readonly [number, number])[] = FLASH_NEXT_SPEED_MODEL.hitRatePoints,
+): number {
+  const pts = points;
   const last = pts[pts.length - 1];
   if (poolGb >= last[0]) return last[1];
   let i = pts.findIndex((p, k) => k > 0 && poolGb < p[0]);
@@ -902,6 +940,26 @@ export function flashNextDecodeTps(
   const missGb = (1 - flashNextHitRate(pool)) * M.expertGbPerToken;
   const ms = fixedMs + (missGb / (ssdRandomGbps * efficiency)) * 1000;
   return Number.isFinite(ms) && ms > 0 ? 1000 / ms : null;
+}
+
+/** `flashNextDecodeTps` serving the mixed build's 3-bit copy, from its own constants and floor. */
+export function flashNextCopyDecodeTps(
+  poolGb: number,
+  memoryGbps: number | null | undefined,
+  ssdRandomGbps: number | null | undefined,
+): number | null {
+  if (!positive(poolGb) || !positive(memoryGbps) || !positive(ssdRandomGbps)) return null;
+  const C = FLASH_NEXT_COPY_SPEED_MODEL;
+  const pool = Math.max(poolGb, flashNextPoolFloor(flashNextServingCopy(FLASH_NEXT_BUILDS.mixed)) / 1e9);
+  const fixedMs = (C.streamGb / memoryGbps) * 1000 + C.otherMs;
+  const missGb = (1 - flashNextHitRate(pool, C.hitRatePoints)) * C.expertGbPerToken;
+  const ms = fixedMs + (missGb / (ssdRandomGbps * C.ssdEfficiency)) * 1000;
+  return Number.isFinite(ms) && ms > 0 ? 1000 / ms : null;
+}
+
+/** Whether `build` serves the 3-bit copy (`flashNextServingCopy` of a build). */
+export function flashNextServesCopy(build: FlashNextBuild): boolean {
+  return build.expertBytes === FLASH_NEXT_COPY_EXPERT_BYTES;
 }
 
 /** The two numbers an estimate for this Mac needs. */
@@ -984,16 +1042,20 @@ export function formatPromptShort(tokens: number): string {
   return tokens % 1024 === 0 ? `${tokens / 1024}K` : tokens.toLocaleString("en-US");
 }
 
-/** Estimated decode speed of a pool on this Mac (`null` until both numbers are measured), from the
- *  pack's efficiency when the pack is in use, else the shards'. */
+/** Estimated decode speed of a pool on this Mac (`null` until both numbers are measured): the
+ *  copy's model while the copy is served, else from the pack's efficiency when the pack is in
+ *  use, else the shards'. */
 export function flashNextChipTps(
   poolBytes: number,
   pack: boolean,
   hw: FlashNextHardware | null,
+  copy = false,
 ): { tps: number; withPack: boolean } | null {
   if (hw == null) return null;
-  const tps = flashNextDecodeTps(poolBytes / 1e9, hw.memoryGbps, hw.ssdRandomGbps, pack);
-  return tps == null ? null : { tps, withPack: pack };
+  const tps = copy
+    ? flashNextCopyDecodeTps(poolBytes / 1e9, hw.memoryGbps, hw.ssdRandomGbps)
+    : flashNextDecodeTps(poolBytes / 1e9, hw.memoryGbps, hw.ssdRandomGbps, pack);
+  return tps == null ? null : { tps, withPack: pack && !copy };
 }
 
 export type FlashNextPoolChip = {
@@ -1024,7 +1086,7 @@ export function flashNextPoolChip(a: {
   const poolBytes = Math.max(wanted, flashNextPoolFloor(a.build));
   return {
     poolBytes,
-    tps: flashNextChipTps(poolBytes, a.pack, a.hw),
+    tps: flashNextChipTps(poolBytes, a.pack, a.hw, flashNextServesCopy(a.build)),
     fits: planFits && (a.gb == null || wanted <= plan.poolBytes + 1),
     maxFitGb: Math.floor(plan.poolBytes / 1e8) / 10,
   };
@@ -1142,7 +1204,7 @@ export function flashNextEffective(a: {
     pack,
     copy,
     head,
-    tps: flashNextChipTps(estimate.poolBytes, pack, a.hw ?? null),
+    tps: flashNextChipTps(estimate.poolBytes, pack, a.hw ?? null, copy),
     machineDefaultPrompt: flashNextDefaultContext(a.usableBytes),
     launch,
   };

@@ -599,6 +599,10 @@ export const en: Record<string, string> = {
     "shipped shards (tok/s)",
   "flashnext.speed.col.pack":
     "expert pack (tok/s)",
+  "flashnext.speed.col.copy":
+    "3-bit copy (tok/s)",
+  "flashnext.speed.copyNote":
+    "Serving the 3-bit copy of the mixed 4/8-bit build: from the second reply on, with read-ahead on. The first reply, while the pool fills, runs 1-9% slower.",
   "flashnext.speed.intro":
     "Decode speed depends mostly on this Mac's memory bandwidth and SSD read speed. Measure both to get an estimate for this Mac.",
   "flashnext.speed.missing.both":

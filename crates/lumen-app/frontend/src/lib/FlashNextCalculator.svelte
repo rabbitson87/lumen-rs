@@ -13,6 +13,7 @@
   import {
     FLASH_NEXT,
     FLASH_NEXT_DECODE_TPS,
+    FLASH_NEXT_DECODE_TPS_COPY,
     FLASH_NEXT_SPEED_MODEL,
     type FlashNextBuild,
     flashNextChipTps,
@@ -273,24 +274,45 @@
       })}
     </div>
     <div class="overflow-x-auto">
-      <table class="text-[10.5px] mono border-collapse">
-        <thead>
-          <tr class="text-text-dim">
-            <th class="text-left font-normal pr-3 pb-0.5">{t("flashnext.speed.col.pool")}</th>
-            <th class="text-right font-normal px-2 pb-0.5">{t("flashnext.speed.col.shards")}</th>
-            <th class="text-right font-normal px-2 pb-0.5">{t("flashnext.speed.col.pack")}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each FLASH_NEXT_DECODE_TPS as p}
-            <tr>
-              <td class="text-left pr-3 text-text-dim">{p.poolGb} GB</td>
-              <td class="text-right px-2">{p.shards}</td>
-              <td class="text-right px-2">{p.pack}</td>
+      {#if eff.copy}
+        <!-- Serving the 3-bit copy: its own measured table, not the shards' and pack's -->
+        <table class="text-[10.5px] mono border-collapse">
+          <thead>
+            <tr class="text-text-dim">
+              <th class="text-left font-normal pr-3 pb-0.5">{t("flashnext.speed.col.pool")}</th>
+              <th class="text-right font-normal px-2 pb-0.5">{t("flashnext.speed.col.copy")}</th>
             </tr>
-          {/each}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {#each FLASH_NEXT_DECODE_TPS_COPY as p}
+              <tr>
+                <td class="text-left pr-3 text-text-dim">{p.poolGb} GB</td>
+                <td class="text-right px-2">{p.tps}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+        <div class="dim text-[10px] mt-1 leading-snug">{t("flashnext.speed.copyNote")}</div>
+      {:else}
+        <table class="text-[10.5px] mono border-collapse">
+          <thead>
+            <tr class="text-text-dim">
+              <th class="text-left font-normal pr-3 pb-0.5">{t("flashnext.speed.col.pool")}</th>
+              <th class="text-right font-normal px-2 pb-0.5">{t("flashnext.speed.col.shards")}</th>
+              <th class="text-right font-normal px-2 pb-0.5">{t("flashnext.speed.col.pack")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each FLASH_NEXT_DECODE_TPS as p}
+              <tr>
+                <td class="text-left pr-3 text-text-dim">{p.poolGb} GB</td>
+                <td class="text-right px-2">{p.shards}</td>
+                <td class="text-right px-2">{p.pack}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
     </div>
     <div class="dim text-[10px] mt-1 leading-snug">{t("flashnext.speed.note")}</div>
   {/if}

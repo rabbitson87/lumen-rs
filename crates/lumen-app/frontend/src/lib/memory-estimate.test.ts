@@ -29,11 +29,14 @@ const {
   FLASH_NEXT,
   FLASH_NEXT_BUILDS,
   FLASH_NEXT_COPY_EXPERT_BYTES,
+  FLASH_NEXT_COPY_SPEED_MODEL,
   FLASH_NEXT_DECODE_TPS,
+  FLASH_NEXT_DECODE_TPS_COPY,
   FLASH_NEXT_SPEED_MODEL,
   attnScoreBytes,
   envKeysForFamily,
   estimateAt,
+  flashNextCopyDecodeTps,
   flashNextDecodeTps,
   flashNextHardware,
   flashNextHitRate,
@@ -483,7 +486,93 @@ test("the model's constants, hit-rate points and reference table match src/flash
   near(M.expertGbPerToken, (48 * 10 * Number(expertRead[1].replaceAll("_", ""))) / 1e9, 1e-3);
   near(M.streamGb, M.expertGbPerToken + 3.6, 1e-9);
   // `decode_tps` floors the pool at the uniform build's floor, as `flashNextDecodeTps` does.
-  assert.ok(rs.includes("pool_gb.max(Build::UNIFORM.pool_floor() as f64 / 1e9)"), "decode_tps floor");
+  assert.ok(rs.includes("floor_gb: Build::UNIFORM.pool_floor() as f64 / 1e9"), "decode_tps floor");
+});
+
+// ── Serving the 3-bit copy: its own constants and table ──────────────────────
+
+const C = FLASH_NEXT_COPY_SPEED_MODEL;
+const copyPoints = C.hitRatePoints as readonly (readonly [number, number])[];
+
+/** The copy's model written out from its constants, like `copy_by_hand` in `flash_next.rs`. */
+function copyByHand(
+  c: { streamGb: number; otherMs: number; expertGbPerToken: number; points: readonly (readonly [number, number])[]; eff: number },
+  pool: number,
+  mem: number,
+  ssd: number,
+): number {
+  pool = Math.max(pool, flashNextPoolFloor(MIXED_COPY) / 1e9);
+  const p = c.points;
+  let hit: number;
+  if (pool >= p[p.length - 1][0]) hit = p[p.length - 1][1];
+  else {
+    let i = 1;
+    while (i < p.length - 1 && pool >= p[i][0]) i++;
+    const [a, b] = [p[i - 1], p[i]];
+    hit = Math.max(0, a[1] + ((pool - a[0]) * (b[1] - a[1])) / (b[0] - a[0]));
+  }
+  const ms = (c.streamGb / mem) * 1000 + c.otherMs + (((1 - hit) * c.expertGbPerToken) / (ssd * c.eff)) * 1000;
+  return 1000 / ms;
+}
+
+test("serving the copy, the model is its formula, and its constants and table match src/flash_next.rs", () => {
+  const ts = { streamGb: C.streamGb, otherMs: C.otherMs, expertGbPerToken: C.expertGbPerToken, points: copyPoints, eff: C.ssdEfficiency };
+  for (const pool of [0.5, 2.21, 3, 6.7, 12.5, 18, 40]) {
+    for (const [mem, ssd] of [[100, 0.5], [281, 6.57], [400, 14]]) {
+      near(flashNextCopyDecodeTps(pool, mem, ssd)!, copyByHand(ts, pool, mem, ssd), 1e-9);
+    }
+  }
+  const rs = readFileSync(new URL("../../../src/flash_next.rs", import.meta.url), "utf8");
+  const num = (name: string): number => {
+    const m = rs.match(new RegExp(`const ${name}: f64 = ([^;]+);`));
+    assert.ok(m, `${name} not found in flash_next.rs`);
+    return Number(m[1].replaceAll("_", "").trim());
+  };
+  const pairs = (name: string): number[][] => {
+    const m = rs.match(new RegExp(`${name}: \\[\\(f64, f64\\); \\d\\] =\\s*\\[([^;]+)\\];`));
+    assert.ok(m, `${name} not found`);
+    return [...m[1].matchAll(/\(([0-9.]+), ([0-9.]+)\)/g)].map((x) => [Number(x[1]), Number(x[2])]);
+  };
+  assert.equal(num("COPY_STREAM_GB"), C.streamGb);
+  assert.equal(num("COPY_OTHER_MS"), C.otherMs);
+  assert.equal(num("COPY_EXPERT_GB_PER_TOKEN"), C.expertGbPerToken);
+  assert.equal(num("COPY_SSD_EFFICIENCY"), C.ssdEfficiency);
+  assert.deepEqual(pairs("COPY_HIT_RATE_POINTS"), copyPoints.map((p) => [...p]));
+  assert.deepEqual(pairs("DECODE_TPS_COPY"), FLASH_NEXT_DECODE_TPS_COPY.map((p) => [p.poolGb, p.tps]));
+  // What a token streams: the mixed trunk and 480 experts of the copy's size.
+  near(C.expertGbPerToken, (48 * 10 * FLASH_NEXT_COPY_EXPERT_BYTES) / 1e9, 1e-3);
+  near(C.streamGb, MIXED.trunkBytes / 1e9 + C.expertGbPerToken, 1e-3);
+  assert.ok(rs.includes("floor_gb: Build::MIXED.serving_copy().pool_floor() as f64 / 1e9"), "copy_decode_tps floor");
+});
+
+test("serving the copy, the model lands on each measured point within 7%", () => {
+  for (const p of FLASH_NEXT_DECODE_TPS_COPY) {
+    const got = flashNextCopyDecodeTps(p.poolGb, REF.memoryGbps, REF.ssdRandomGbps)!;
+    assert.ok(Math.abs(got - p.tps) / p.tps <= 0.07, `${p.poolGb} GB: model ${got.toFixed(2)} vs measured ${p.tps}`);
+  }
+});
+
+test("while the copy is served, the chips and the summary estimate with the copy's model", () => {
+  const hw = { memoryGbps: 281, ssdRandomGbps: 6.57 };
+  const want = flashNextCopyDecodeTps(8, hw.memoryGbps, hw.ssdRandomGbps)!;
+  assert.deepEqual(flashNextChipTps(8e9, false, hw, true), { tps: want, withPack: false });
+  // A complete pack is not read while the copy is served.
+  assert.deepEqual(flashNextChipTps(8e9, true, hw, true), { tps: want, withPack: false });
+  assert.notEqual(flashNextChipTps(8e9, false, hw)!.tps, want);
+  const chip = (build: typeof MIXED) =>
+    flashNextPoolChip({ build, usableBytes: 26e9, chunk: 1024, ctxTokens: 16_384, gb: 8, pack: false, hw });
+  near(chip(MIXED_COPY).tps!.tps, want, 1e-12);
+  near(chip(MIXED).tps!.tps, flashNextDecodeTps(8, 281, 6.57, false)!, 1e-12);
+  const env = { [FLASH_NEXT_COPY_ENV_KEY]: FLASH_NEXT_COPY_SPEC, LUMEN_MOE_EXPERT_CACHE_GB: "8" };
+  const eff = flashNextEffective({
+    build: flashNextLaunchBuild("pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit", env),
+    env,
+    usableBytes: 26e9,
+    status: { installed: true, pack: "complete", copy: "complete", mtp_present: false },
+    hw,
+  });
+  assert.equal(eff.copy, true);
+  near(eff.tps!.tps, want, 1e-12);
 });
 
 test("at the reference hardware the model reproduces every measured point (12 cells) within 4%", () => {
