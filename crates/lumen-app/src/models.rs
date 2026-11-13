@@ -744,10 +744,11 @@ pub async fn download(
     for file in &files {
         let _ = std::fs::remove_file(target.join(format!("{file}.part")));
     }
-    if let Some(sizes) = remote_sizes(&client, repo_id, revision).await {
+    let sizes = remote_sizes(&client, repo_id, revision).await;
+    if let Some(sizes) = &sizes {
         check_fits(
             repo_id,
-            bytes_to_fetch(&target, &files, &sizes),
+            bytes_to_fetch(&target, &files, sizes),
             crate::doctor::statvfs_free(&target),
         )?;
     }
@@ -764,12 +765,18 @@ pub async fn download(
         // — mismatched local size triggers re-download.
         if let Ok(meta) = std::fs::metadata(&dest) {
             if meta.len() > 0 {
-                let head = client
-                    .head(&url)
-                    .send()
-                    .await
-                    .with_context(|| format!("HEAD {url}"))?;
-                let expected = head.content_length();
+                // The Hub's listing sizes the file; a HEAD only when it does not.
+                let expected = match sizes.as_ref().and_then(|s| s.get(file)) {
+                    Some(&n) => Some(n),
+                    None => {
+                        let head = client
+                            .head(&url)
+                            .send()
+                            .await
+                            .with_context(|| format!("HEAD {url}"))?;
+                        header_length(head.headers())
+                    }
+                };
                 let local_ok = match expected {
                     Some(n) => meta.len() == n,
                     // HEAD didn't report size (rare on HF) — fall back to
@@ -959,6 +966,17 @@ impl Drop for StayAwake {
             let _ = child.wait();
         }
     }
+}
+
+/// The `Content-Length` header's value. Not `Response::content_length`, which for a HEAD response
+/// reports the empty body instead.
+fn header_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
 }
 
 /// What a download leaves free on the volume, for the system and the app's own files.
@@ -1152,6 +1170,33 @@ mod tests {
         // The headroom is part of the need.
         assert!(check_fits("org/repo", 100 * gb, Some(101 * gb)).is_err());
         assert!(check_fits("org/repo", 106 * gb, None).is_ok());
+    }
+
+    /// A file already on disk is skipped only if its size matches the remote one. reqwest reports
+    /// a HEAD response's `content_length()` from the (empty) body, not the header, so the size
+    /// has to come from the header: otherwise every complete file is fetched again.
+    #[tokio::test]
+    async fn a_head_reports_the_remote_size_from_its_header() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).unwrap();
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10131671103\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let head = client
+            .head(format!("http://{addr}/model-00001.safetensors"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(header_length(head.headers()), Some(10_131_671_103));
+        server.join().unwrap();
     }
 
     #[test]
