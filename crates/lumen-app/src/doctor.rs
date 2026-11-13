@@ -580,11 +580,12 @@ fn flash_next_checks(cfg: &PersistentConfig) -> Vec<CheckResult> {
     let launch_env = flash_next::effective_env(cfg);
     let env = |key: &str| launch_env.get(key).map(|v| v.trim().to_ascii_lowercase());
     let pack = flash_next::pack_state(&dir);
+    let build = flash_next::Build::of_installed(cfg, &dir);
     let mut out = Vec::new();
     if let Some(ram) = sysinfo::total_ram_bytes() {
         out.push(flash_next_ram_check(
             ram,
-            &flash_next::launch_plan(cfg, ram),
+            &flash_next::launch_plan(cfg, ram, build),
         ));
     }
     out.push(flash_next_disk_check(
@@ -614,19 +615,22 @@ fn flash_next_ram_check(ram_bytes: u64, launch: &LaunchPlan) -> CheckResult {
     const NAME: &str = "Flash-Next memory";
     let ram_gb = ram_bytes >> 30;
     let usable = flash_next::usable_bytes(ram_bytes, launch.memory_limit);
-    let plan = flash_next::plan_memory(usable, launch.chunk, launch.ctx_tokens);
+    let plan = flash_next::plan_memory(launch.build, usable, launch.chunk, launch.ctx_tokens);
+    let trunk = gb(launch.build.trunk_bytes);
     if plan.fits() {
-        let mut detail = String::from(
-            "The expert pool is what the GPU's share of RAM leaves after the 3.6 GB of resident \
-             weights and a prefill's reserve: buffers, the chunk's activations, the KV cache of \
-             the longest prompt (30 KB per token) and attention scores. A longer prompt cap \
-             shrinks it; a bigger pool means fewer SSD reads per token.",
+        let mut detail = format!(
+            "The expert pool is what the GPU's share of RAM leaves after the {trunk:.1} GB of \
+             resident weights and a prefill's reserve: buffers, the chunk's activations, the KV \
+             cache of the longest prompt (30 KB per token) and attention scores. A longer prompt \
+             cap shrinks it; a bigger pool means fewer SSD reads per token.",
         );
-        if plan.pool < flash_next::POOL_PREFETCH_BYTES {
-            detail.push_str(
-                " With less than 4.2 GB the pool has room for one staging region only, so \
+        let prefetch = launch.build.pool_prefetch();
+        if plan.pool < prefetch {
+            detail.push_str(&format!(
+                " With less than {:.1} GB the pool has room for one staging region only, so \
                  prefill cannot read the next layer while it computes the current one.",
-            );
+                gb(prefetch)
+            ));
         }
         return CheckResult {
             detail: Some(detail),
@@ -642,7 +646,7 @@ fn flash_next_ram_check(ram_bytes: u64, launch: &LaunchPlan) -> CheckResult {
             )
         };
     }
-    let longest = flash_next::max_fitting_context(usable, launch.chunk);
+    let longest = flash_next::max_fitting_context(launch.build, usable, launch.chunk);
     if longest > 0 {
         return CheckResult {
             fix_hint: Some(
@@ -665,19 +669,20 @@ fn flash_next_ram_check(ram_bytes: u64, launch: &LaunchPlan) -> CheckResult {
         };
     }
     CheckResult {
-        fix_hint: Some(
-            "Flash-Next needs its 3.6 GB of resident weights, an expert pool of at least 2.8 GB \
-             and a prefill reserve inside the GPU's share of RAM (two thirds up to 32 GB, three \
-             quarters above; the memory limit lowers it). Below that the model cannot load."
-                .into(),
-        ),
+        fix_hint: Some(format!(
+            "Flash-Next needs its {trunk:.1} GB of resident weights, an expert pool of at \
+                 least {:.1} GB and a prefill reserve inside the GPU's share of RAM (two thirds up \
+                 to 32 GB, three quarters above; the memory limit lowers it). Below that the model \
+                 cannot load.",
+            gb(launch.build.pool_floor())
+        )),
         ..row(
             "flash_next_ram",
             NAME,
             CheckStatus::Warn,
             format!(
                 "{ram_gb} GB RAM, Flash-Next needs ~{} GB",
-                flash_next::min_ram_gib()
+                flash_next::min_ram_gib(launch.build)
             ),
         )
     }
@@ -954,9 +959,10 @@ pub fn probe_flash_next_ssd(
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     // The pool this Mac's launch would get, and whether the server would read the pack.
     let pool_gb = sysinfo::total_ram_bytes().map_or(FALLBACK_POOL_GB, |ram| {
-        let launch = flash_next::launch_plan(cfg, ram);
+        let launch = flash_next::launch_plan(cfg, ram, flash_next::Build::of_installed(cfg, &dir));
         let usable = flash_next::usable_bytes(ram, launch.memory_limit);
-        gb(flash_next::plan_memory(usable, launch.chunk, launch.ctx_tokens).pool_bytes())
+        let plan = flash_next::plan_memory(launch.build, usable, launch.chunk, launch.ctx_tokens);
+        gb(plan.pool_bytes())
     });
     let pack_off = flash_next::effective_env(cfg)
         .get("LUMEN_MOE_PACK")
@@ -1164,6 +1170,7 @@ mod flash_next_tests {
     /// What a launch with the memory plan's own defaults hands the server.
     fn default_launch() -> LaunchPlan {
         LaunchPlan {
+            build: flash_next::Build::UNIFORM,
             memory_limit: None,
             chunk: None,
             ctx_tokens: None,
@@ -1174,26 +1181,58 @@ mod flash_next_tests {
     fn a_16_gb_mac_is_told_its_pool_and_an_8_gb_one_what_it_needs() {
         let ok = flash_next_ram_check(16 * GIB, &default_launch());
         assert_eq!(ok.status, CheckStatus::Pass);
-        // 16 GB is a tight machine: 8K prompts, 512-token chunks, a ~4.9 GB pool.
-        assert_eq!(ok.message, "16 GB RAM: expert pool ~4.9 GB at 8192 tokens");
-        // 4.9 GB is above the 4.2 GB a second staging region needs.
-        assert!(!ok.detail.unwrap().contains("one staging region only"));
+        // 16 GB is a tight machine: 8K prompts, 512-token chunks, a ~5.4 GB pool.
+        assert_eq!(ok.message, "16 GB RAM: expert pool ~5.4 GB at 8192 tokens");
+        // 5.4 GB is above the 4.2 GB a second staging region needs.
+        let detail = ok.detail.unwrap();
+        assert!(!detail.contains("one staging region only"));
+        assert!(
+            detail.contains("after the 3.0 GB of resident weights"),
+            "{detail}"
+        );
 
         let short = flash_next_ram_check(8 * GIB, &default_launch());
         assert_eq!(short.status, CheckStatus::Warn);
-        assert_eq!(short.message, "8 GB RAM, Flash-Next needs ~13 GB");
+        assert_eq!(short.message, "8 GB RAM, Flash-Next needs ~12 GB");
         assert!(short.fix_hint.is_some());
+    }
+
+    /// The mixed build keeps 5.1 GB in memory: on a 16 GB Mac its pool is ~3.3 GB, under the
+    /// 4.2 GB of a second staging region, and it needs a 16 GB Mac.
+    #[test]
+    fn the_mixed_build_is_planned_with_its_own_resident_weights() {
+        let launch = LaunchPlan {
+            build: flash_next::Build::MIXED,
+            ..default_launch()
+        };
+        let ok = flash_next_ram_check(16 * GIB, &launch);
+        assert_eq!(ok.status, CheckStatus::Pass);
+        assert_eq!(ok.message, "16 GB RAM: expert pool ~3.3 GB at 8192 tokens");
+        let detail = ok.detail.unwrap();
+        assert!(
+            detail.contains("after the 5.1 GB of resident weights"),
+            "{detail}"
+        );
+        assert!(detail.contains("one staging region only"), "{detail}");
+        let short = flash_next_ram_check(12 * GIB, &launch);
+        assert_eq!(short.message, "12 GB RAM, Flash-Next needs ~16 GB");
+        assert!(
+            short
+                .fix_hint
+                .unwrap()
+                .contains("its 5.1 GB of resident weights")
+        );
     }
 
     #[test]
     fn a_pool_under_4_2_gb_gets_the_one_staging_region_note_and_still_passes() {
-        // A 12 GB Mac: pool ~2.1 GB is under the floor, so it does not fit at all ...
+        // An 11 GB Mac: pool ~2.6 GB is under the floor, so it does not fit at all ...
         assert_eq!(
-            flash_next_ram_check(12 * GIB, &default_launch()).status,
+            flash_next_ram_check(11 * GIB, &default_launch()).status,
             CheckStatus::Warn
         );
         // ... and one with a pool between the floor and 4.2 GB (an 8 GiB memory limit on a
-        // big Mac: ~3.1 GB) runs, with the note.
+        // big Mac: ~3.9 GB) runs, with the note.
         let launch = LaunchPlan {
             memory_limit: Some(8 * GIB),
             ..default_launch()
@@ -1205,17 +1244,17 @@ mod flash_next_tests {
 
     #[test]
     fn a_long_prompt_cap_can_leave_no_room_for_the_pool() {
-        // With LUMEN_MAX_PROMPT_TOKENS at 81,920 the KV for it alone is 2.5 GB, so a 16 GB
+        // With LUMEN_MAX_PROMPT_TOKENS at 98,304 the KV for it alone is 2.9 GB, so a 16 GB
         // Mac no longer fits, though a shorter prompt would.
         let launch = LaunchPlan {
-            ctx_tokens: Some(81_920),
+            ctx_tokens: Some(98_304),
             ..default_launch()
         };
         let c = flash_next_ram_check(16 * GIB, &launch);
         assert_eq!(c.status, CheckStatus::Warn);
         assert_eq!(
             c.message,
-            "16 GB RAM: a 81920-token context does not fit, up to 69758 do"
+            "16 GB RAM: a 98304-token context does not fit, up to 88792 do"
         );
         let hint = c.fix_hint.unwrap();
         assert!(hint.contains("LUMEN_MAX_PROMPT_TOKENS"));
@@ -1224,7 +1263,7 @@ mod flash_next_tests {
         let big = flash_next_ram_check(36 * GIB, &launch);
         assert_eq!(
             big.message,
-            "36 GB RAM: expert pool ~16.7 GB at 81920 tokens"
+            "36 GB RAM: expert pool ~16.8 GB at 98304 tokens"
         );
     }
 
@@ -1239,17 +1278,24 @@ mod flash_next_tests {
         cfg.server.memory_limit_gb = Some(64);
         cfg.server.disable_wired_limit = false;
         let ram = 16 * GIB;
-        let c = flash_next_ram_check(ram, &flash_next::launch_plan(&cfg, ram));
+        let c = flash_next_ram_check(
+            ram,
+            &flash_next::launch_plan(&cfg, ram, flash_next::Build::UNIFORM),
+        );
         assert_eq!(c.status, CheckStatus::Pass);
-        assert_eq!(c.message, "16 GB RAM: expert pool ~4.9 GB at 8192 tokens");
-        // A user-set prompt cap wins, and this Mac cannot hold 81,920 tokens.
+        assert_eq!(c.message, "16 GB RAM: expert pool ~5.4 GB at 8192 tokens");
+        // A user-set prompt cap wins, and this Mac cannot hold 98,304 tokens.
+        cfg.context.max = 131_072;
         cfg.env_overrides
-            .insert("LUMEN_MAX_PROMPT_TOKENS".into(), "81920".into());
-        let big = flash_next_ram_check(ram, &flash_next::launch_plan(&cfg, ram));
+            .insert("LUMEN_MAX_PROMPT_TOKENS".into(), "98304".into());
+        let big = flash_next_ram_check(
+            ram,
+            &flash_next::launch_plan(&cfg, ram, flash_next::Build::UNIFORM),
+        );
         assert_eq!(big.status, CheckStatus::Warn);
         assert_eq!(
             big.message,
-            "16 GB RAM: a 81920-token context does not fit, up to 69758 do"
+            "16 GB RAM: a 98304-token context does not fit, up to 88792 do"
         );
         assert!(
             big.fix_hint

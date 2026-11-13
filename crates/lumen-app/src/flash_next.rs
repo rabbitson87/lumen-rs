@@ -1,8 +1,9 @@
 //! Qwen3.8-Flash-Next (`qwen4-exp`) on this Mac: what it needs from the machine, what decode
 //! speed that buys, and a read-speed probe for the volume that holds its weights.
 //!
-//! The server keeps ~3.6 GB of the model in memory and serves its routed experts (68 GB of the
-//! 97 GB) from the SSD through a pool of memory slots (`docs/flash-next.md`). The questions that
+//! The server keeps 3.0 GB (the uniform 4-bit build) or 5.1 GB (the mixed 4/8-bit build) of the
+//! model in memory and serves its routed experts (68 GB of the 97 GB) from the SSD through a pool
+//! of memory slots (`docs/flash-next.md`); [`Build`] holds those numbers. The questions that
 //! decide whether it runs well are therefore not "does it fit" but "what does a prefill reserve
 //! out of the GPU's working set, and how much is left for the pool", and "can the disk feed it".
 //!
@@ -24,17 +25,77 @@ use crate::models;
 
 // ── What the model needs ─────────────────────────────────────────────
 
-/// Resident weights: embeddings, attention, DeltaNet, routers, shared experts.
-pub const TRUNK_BYTES: u64 = 3_600_000_000;
-/// One routed expert, as the server reads it on a miss.
+/// One routed expert of the checkpoint, as the server reads it on a miss (the SSD probe's read).
 pub const EXPERT_BYTES: u64 = 2_760_000;
-/// The smallest expert pool the server runs with: a staging region plus a layer beside it,
-/// 2 x 512 slots.
-pub const POOL_FLOOR_BYTES: u64 = 2_826_240_000;
-/// With room for three layers (1,536 slots) the pool lends a second staging region, and the
-/// server reads the next layer while it computes the current one. Below it prefill is slower,
-/// nothing fails.
-pub const POOL_PREFETCH_BYTES: u64 = 4_239_360_000;
+
+/// What the memory plan needs to know about the Flash-Next being run: the weights that stay in
+/// memory and what one routed expert takes in the pool. The server sizes both from the checkpoint
+/// itself (`resident_weight_bytes` in `qwen4_exp/model.rs`, the copy's record); these are its
+/// numbers for the two builds the catalog lists, with the token embedding read from disk (its
+/// default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Build {
+    /// Embeddings, attention, DeltaNet, routers, shared experts.
+    pub trunk_bytes: u64,
+    pub expert_bytes: u64,
+}
+
+impl Build {
+    /// `pipenetwork/Qwen3.8-Flash-Next-MLX-4bit`, every matrix at 4 bits.
+    pub const UNIFORM: Self = Self {
+        trunk_bytes: 3_025_000_000,
+        expert_bytes: 2_764_800,
+    };
+    /// `pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit`, the dense matrices at 8 bits: measured
+    /// 5.13 GB (MLX's active memory after the load, less the pool).
+    pub const MIXED: Self = Self {
+        trunk_bytes: 5_132_000_000,
+        expert_bytes: 2_764_800,
+    };
+    /// One expert of the 3-bit copy ([`COPY_SPEC`]).
+    pub const COPY_EXPERT_BYTES: u64 = 2_150_400;
+
+    /// The build at `model_id` (a repo id or a folder): the mixed one when its name says so.
+    pub fn of(model_id: &str) -> Self {
+        if model_id.to_lowercase().contains("mixed") {
+            Self::MIXED
+        } else {
+            Self::UNIFORM
+        }
+    }
+
+    /// The same build serving its 3-bit copy of the experts.
+    pub fn serving_copy(self) -> Self {
+        Self {
+            expert_bytes: Self::COPY_EXPERT_BYTES,
+            ..self
+        }
+    }
+
+    /// The build a launch of the installed model at `dir` runs: [`Self::of`] its folder, with
+    /// the copy when the launch would serve it ([`copy_env`]).
+    pub fn of_installed(cfg: &PersistentConfig, dir: &Path) -> Self {
+        let build = Self::of(&dir.to_string_lossy());
+        if copy_env(cfg, dir).is_some() {
+            build.serving_copy()
+        } else {
+            build
+        }
+    }
+
+    /// The smallest expert pool the server runs with: a staging region plus a layer beside it,
+    /// 2 x 512 slots.
+    pub fn pool_floor(self) -> u64 {
+        2 * 512 * self.expert_bytes
+    }
+
+    /// With room for three layers (1,536 slots) the pool lends a second staging region, and the
+    /// server reads the next layer while it computes the current one. Below it prefill is slower,
+    /// nothing fails.
+    pub fn pool_prefetch(self) -> u64 {
+        3 * 512 * self.expert_bytes
+    }
+}
 
 /// Tokens per prefill chunk when `LUMEN_QWEN35_PREFILL_CHUNK` is unset; a tight machine takes half.
 pub const DEFAULT_CHUNK: u64 = 1024;
@@ -118,12 +179,14 @@ pub fn usable_now(usable: u64, ram_bytes: u64, reclaimable: u64, server_footprin
 /// What the memory is spent on, for a GPU that may use `usable` bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryPlan {
+    /// The build the plan is for.
+    pub build: Build,
     pub chunk: u64,
     /// Longest prompt in tokens the plan holds the KV cache and attention scores for.
     pub ctx_tokens: u64,
     /// Memory a prefill needs beyond the trunk and the expert pool.
     pub reserve: u64,
-    /// What `auto` gives the expert pool: the rest. Below [`POOL_FLOOR_BYTES`] the model does
+    /// What `auto` gives the expert pool: the rest. Below [`Build::pool_floor`] the model does
     /// not fit (the server raises the pool to the floor and warns).
     pub pool: u64,
 }
@@ -131,18 +194,18 @@ pub struct MemoryPlan {
 impl MemoryPlan {
     /// The pool the server actually runs with.
     pub fn pool_bytes(&self) -> u64 {
-        self.pool.max(POOL_FLOOR_BYTES)
+        self.pool.max(self.build.pool_floor())
     }
 
     /// The trunk, the smallest pool and the reserve fit the usable memory.
     pub fn fits(&self) -> bool {
-        self.pool >= POOL_FLOOR_BYTES
+        self.pool >= self.build.pool_floor()
     }
 
     /// The pool `auto` gives when the server plans within `usable_now` bytes (see
     /// [`usable_now`]): what is left after the trunk and this plan's reserve.
     pub fn pool_within(&self, usable_now: u64) -> u64 {
-        usable_now.saturating_sub(TRUNK_BYTES + self.reserve)
+        usable_now.saturating_sub(self.build.trunk_bytes + self.reserve)
     }
 }
 
@@ -175,10 +238,15 @@ pub fn default_context(usable: u64) -> u64 {
     }
 }
 
-/// The server's plan for a GPU that may use `usable` bytes: `chunk` and `ctx_tokens` are what
-/// `LUMEN_QWEN35_PREFILL_CHUNK` and `LUMEN_MAX_PROMPT_TOKENS` / `LUMEN_MAX_CTX` set, else the
-/// machine's defaults.
-pub fn plan_memory(usable: u64, chunk: Option<u64>, ctx_tokens: Option<u64>) -> MemoryPlan {
+/// The server's plan for `build` on a GPU that may use `usable` bytes: `chunk` and `ctx_tokens`
+/// are what `LUMEN_QWEN35_PREFILL_CHUNK` and `LUMEN_MAX_PROMPT_TOKENS` / `LUMEN_MAX_CTX` set,
+/// else the machine's defaults.
+pub fn plan_memory(
+    build: Build,
+    usable: u64,
+    chunk: Option<u64>,
+    ctx_tokens: Option<u64>,
+) -> MemoryPlan {
     let tight = usable < TIGHT_BELOW_BYTES;
     let chunk = chunk.unwrap_or_else(|| default_chunk(usable));
     let ctx_tokens = ctx_tokens.unwrap_or_else(|| default_context(usable));
@@ -189,23 +257,24 @@ pub fn plan_memory(usable: u64, chunk: Option<u64>, ctx_tokens: Option<u64>) -> 
     };
     let reserve = prefill_reserve(chunk, ctx_tokens, budget);
     MemoryPlan {
+        build,
         chunk,
         ctx_tokens,
         reserve,
-        pool: usable.saturating_sub(TRUNK_BYTES + reserve),
+        pool: usable.saturating_sub(build.trunk_bytes + reserve),
     }
 }
 
 /// The longest prompt the plan can hold with the pool at its floor, for this chunk (the
 /// machine's default when `None`). 0 when not even an empty prompt fits.
-pub fn max_fitting_context(usable: u64, chunk: Option<u64>) -> u64 {
-    if !plan_memory(usable, chunk, Some(0)).fits() {
+pub fn max_fitting_context(build: Build, usable: u64, chunk: Option<u64>) -> u64 {
+    if !plan_memory(build, usable, chunk, Some(0)).fits() {
         return 0;
     }
     let (mut lo, mut hi) = (0, MAX_CONTEXT);
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
-        if plan_memory(usable, chunk, Some(mid)).fits() {
+        if plan_memory(build, usable, chunk, Some(mid)).fits() {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -214,14 +283,16 @@ pub fn max_fitting_context(usable: u64, chunk: Option<u64>) -> u64 {
     lo
 }
 
-/// Whether a Mac with `ram_bytes` runs the model at its default plan.
-pub fn fits(ram_bytes: u64) -> bool {
-    plan_memory(usable_bytes(ram_bytes, None), None, None).fits()
+/// Whether a Mac with `ram_bytes` runs `build` at its default plan.
+pub fn fits(build: Build, ram_bytes: u64) -> bool {
+    plan_memory(build, usable_bytes(ram_bytes, None), None, None).fits()
 }
 
-/// RAM below which the model cannot run at the default plan, rounded up to whole GiB.
-pub fn min_ram_gib() -> u64 {
-    (1..=1024).find(|gib| fits(gib << 30)).unwrap_or(1024)
+/// RAM below which `build` cannot run at the default plan, rounded up to whole GiB.
+pub fn min_ram_gib(build: Build) -> u64 {
+    (1..=1024)
+        .find(|gib| fits(build, gib << 30))
+        .unwrap_or(1024)
 }
 
 /// The longest prompt the server plans memory for, from the two things it reads (`context_override`
@@ -247,6 +318,8 @@ pub fn planned_context(prompt_cap: Option<u64>, max_ctx: Option<u64>) -> Option<
 /// of the same name wins over the typed setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LaunchPlan {
+    /// The build the launch runs (see [`Build::of_installed`]).
+    pub build: Build,
     pub memory_limit: Option<u64>,
     pub chunk: Option<u64>,
     pub ctx_tokens: Option<u64>,
@@ -302,13 +375,14 @@ pub fn default_prompt_tokens(cfg: &PersistentConfig, ram_bytes: u64) -> u64 {
     default_context(usable_bytes(ram_bytes, memory_limit(cfg)))
 }
 
-pub fn launch_plan(cfg: &PersistentConfig, ram_bytes: u64) -> LaunchPlan {
+pub fn launch_plan(cfg: &PersistentConfig, ram_bytes: u64, build: Build) -> LaunchPlan {
     let memory_limit = memory_limit(cfg);
     let prompt_cap = env_value(cfg, "LUMEN_MAX_PROMPT_TOKENS")
         .unwrap_or_else(|| default_context(usable_bytes(ram_bytes, memory_limit)));
     let max_ctx =
         env_value(cfg, "LUMEN_MAX_CTX").or(Some(cfg.context.max as u64).filter(|&c| c > 0));
     LaunchPlan {
+        build,
         memory_limit,
         chunk: env_value(cfg, "LUMEN_QWEN35_PREFILL_CHUNK"),
         ctx_tokens: planned_context(Some(prompt_cap), max_ctx),
@@ -421,7 +495,7 @@ pub fn decode_tps(pool_gb: f64, memory_gbps: f64, ssd_random_gbps: f64, pack: bo
         return None;
     }
     // The engine runs no pool under its floor (1,024 slots): a smaller one is that floor.
-    let pool_gb = pool_gb.max(POOL_FLOOR_BYTES as f64 / 1e9);
+    let pool_gb = pool_gb.max(Build::UNIFORM.pool_floor() as f64 / 1e9);
     let efficiency = if pack {
         SSD_EFFICIENCY_PACK
     } else {
@@ -979,7 +1053,7 @@ mod tests {
     /// The same number written out step by step from the constants, without `decode_tps`'s
     /// helpers: what the model is, so a change to the constants moves both sides together.
     fn by_hand(pool: f64, memory: f64, ssd: f64, pack: bool) -> f64 {
-        let pool = pool.max(POOL_FLOOR_BYTES as f64 / 1e9);
+        let pool = pool.max(Build::UNIFORM.pool_floor() as f64 / 1e9);
         let p = HIT_RATE_POINTS;
         let hit = if pool >= p[p.len() - 1].0 {
             p[p.len() - 1].1
@@ -1022,7 +1096,9 @@ mod tests {
     #[test]
     fn the_constants_agree_with_the_geometry_and_the_calibration_machine() {
         assert!((EXPERT_GB_PER_TOKEN - 48.0 * 10.0 * EXPERT_BYTES as f64 / 1e9).abs() < 1e-3);
-        assert!((STREAM_GB - (EXPERT_GB_PER_TOKEN + TRUNK_BYTES as f64 / 1e9)).abs() < 1e-9);
+        // Fitted with the 3.6 GB trunk the plan assumed before the server sized it from the
+        // checkpoint: the split between it and `OTHER_MS` is the fit's, not a measurement.
+        assert!((STREAM_GB - (EXPERT_GB_PER_TOKEN + 3.6)).abs() < 1e-9);
         let fixed = STREAM_GB / REFERENCE_MEMORY_GBPS * 1000.0 + OTHER_MS;
         assert!((fixed - 41.2).abs() < 0.1, "{fixed}");
         assert!(
@@ -1075,7 +1151,7 @@ mod tests {
     /// The engine clamps a smaller pool to its 1,024-slot floor, so that is what is estimated.
     #[test]
     fn a_pool_under_the_engines_floor_is_estimated_at_the_floor() {
-        let floor = POOL_FLOOR_BYTES as f64 / 1e9;
+        let floor = Build::UNIFORM.pool_floor() as f64 / 1e9;
         for pack in [false, true] {
             let at_floor = decode_tps(floor, REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS, pack);
             assert!(at_floor.is_some());
@@ -1211,8 +1287,14 @@ mod tests {
 
     #[test]
     fn the_pool_sizes_are_the_slot_counts_of_the_servers_pool() {
-        assert_eq!(POOL_FLOOR_BYTES, 2 * 512 * EXPERT_BYTES);
-        assert_eq!(POOL_PREFETCH_BYTES, 3 * 512 * EXPERT_BYTES);
+        // The server's floor: 2 x 512 experts of the build's own size (`pool_floor_bytes`).
+        assert_eq!(Build::UNIFORM.pool_floor(), 2 * 512 * 2_764_800);
+        assert_eq!(Build::UNIFORM.pool_prefetch(), 3 * 512 * 2_764_800);
+        assert_eq!(Build::MIXED.pool_floor(), Build::UNIFORM.pool_floor());
+        assert_eq!(
+            Build::MIXED.serving_copy().pool_floor(),
+            2 * 512 * 2_150_400
+        );
         // 13 layers (12 full-attention and the draft head's) x (K,V + the indexer key), bf16.
         assert_eq!(KV_BYTES_PER_TOKEN, 13 * (2 * 2 * 256 * 2 + 128 * 2));
     }
@@ -1231,17 +1313,17 @@ mod tests {
     #[test]
     fn the_reserve_adds_buffers_chunk_kv_and_half_the_scores() {
         let usable = usable_bytes(36 * GIB, None);
-        let p = plan_memory(usable, None, None);
+        let p = plan_memory(Build::UNIFORM, usable, None, None);
         assert_eq!((p.chunk, p.ctx_tokens), (1024, 16_384));
         let scores = 24 * 1024 * 16_384 * 4; // 1.61 GB, under the 2 GB budget
         assert_eq!(
             p.reserve,
             600_000_000 + 1024 * 1_100_000 + 16_384 * 29_952 + scores / 2
         );
-        assert_eq!(p.pool, usable - TRUNK_BYTES - p.reserve);
+        assert_eq!(p.pool, usable - Build::UNIFORM.trunk_bytes - p.reserve);
         assert!(p.fits());
         // Past the budget the scores stop growing.
-        let long = plan_memory(usable, None, Some(65_536));
+        let long = plan_memory(Build::UNIFORM, usable, None, Some(65_536));
         assert_eq!(
             long.reserve,
             600_000_000 + 1024 * 1_100_000 + 65_536 * 29_952 + 2_000_000_000 / 2
@@ -1256,18 +1338,21 @@ mod tests {
         assert_eq!(live_headroom(16 * GIB), LIVE_HEADROOM_BYTES);
         assert_eq!(live_headroom(24 * GIB), LIVE_HEADROOM_BYTES);
         let usable = usable_bytes(ram, None);
-        let plan = plan_memory(usable, None, None);
+        let plan = plan_memory(Build::UNIFORM, usable, None, None);
         // Idle: more free than the GPU may use, so the plan is the usual one.
         assert_eq!(usable_now(usable, ram, 30_000_000_000, 0), usable);
         assert_eq!(plan.pool_within(usable), plan.pool);
         // An editor, a browser and chat apps open (the server's own `free now` line on that
-        // Mac): 17.7 GB reclaimable, so 15.7 GB to plan within and a 9.0 GB pool, not 18.8.
+        // Mac): 17.7 GB reclaimable, so 15.7 GB to plan within and a 9.6 GB pool, not 19.4.
         let now = usable_now(usable, ram, 17_707_089_920, 0);
         assert_eq!(now, 15_707_089_920);
-        assert_eq!(plan.pool_within(now), now - TRUNK_BYTES - plan.reserve);
+        assert_eq!(
+            plan.pool_within(now),
+            now - Build::UNIFORM.trunk_bytes - plan.reserve
+        );
         assert_eq!(
             (plan.pool_within(now) / 100_000_000, plan.pool / 100_000_000),
-            (90, 188)
+            (96, 194)
         );
         // A running server's memory is a restarted one's too.
         assert_eq!(
@@ -1281,59 +1366,90 @@ mod tests {
 
     #[test]
     fn a_tight_machine_takes_the_smaller_chunk_context_and_scores_budget() {
-        let p = plan_memory(usable_bytes(16 * GIB, None), None, None);
+        let p = plan_memory(Build::UNIFORM, usable_bytes(16 * GIB, None), None, None);
         assert_eq!((p.chunk, p.ctx_tokens), (512, 8192));
         assert_eq!(p.reserve, 1_609_893_376);
-        assert_eq!(p.pool, 4_868_963_211);
-        // 24 GB is not tight: 1,024-token chunks, 16K prompts, a ~8 GB pool.
-        let p = plan_memory(usable_bytes(24 * GIB, None), None, None);
+        assert_eq!(p.pool, 5_443_963_211);
+        // The mixed build holds 2.1 GB more: that much less pool.
+        let mixed = plan_memory(Build::MIXED, usable_bytes(16 * GIB, None), None, None);
+        assert_eq!(mixed.pool, 3_336_963_211);
+        assert_eq!(mixed.reserve, p.reserve);
+        // 24 GB is not tight: 1,024-token chunks, 16K prompts, a ~9 GB pool.
+        let p = plan_memory(Build::UNIFORM, usable_bytes(24 * GIB, None), None, None);
         assert_eq!((p.chunk, p.ctx_tokens), (1024, 16_384));
-        assert_eq!(p.pool, 8_495_844_945);
+        assert_eq!(p.pool, 9_070_844_945);
     }
 
     #[test]
     fn an_override_replaces_the_default_it_names_and_nothing_else() {
         let usable = usable_bytes(16 * GIB, None);
-        let p = plan_memory(usable, Some(2048), None);
+        let p = plan_memory(Build::UNIFORM, usable, Some(2048), None);
         assert_eq!((p.chunk, p.ctx_tokens), (2048, 8192));
-        let p = plan_memory(usable, None, Some(32_768));
+        let p = plan_memory(Build::UNIFORM, usable, None, Some(32_768));
         assert_eq!((p.chunk, p.ctx_tokens), (512, 32_768));
     }
 
     #[test]
     fn the_context_a_user_picks_comes_out_of_the_pool() {
         let usable = usable_bytes(36 * GIB, None);
-        let small = plan_memory(usable, None, Some(16_384));
-        let big = plan_memory(usable, None, Some(81_920));
+        let small = plan_memory(Build::UNIFORM, usable, None, Some(16_384));
+        let big = plan_memory(Build::UNIFORM, usable, None, Some(81_920));
         assert!(big.pool < small.pool);
-        assert_eq!(big.pool, 16_732_037_898);
-        // On a 16 GB Mac the app's default 81,920-token Max context leaves no room at all.
-        let tight = plan_memory(usable_bytes(16 * GIB, None), None, Some(81_920));
+        assert_eq!(big.pool, 17_307_037_898);
+        // On a 16 GB Mac a 98,304-token context leaves no room at all (88,792 is the most).
+        let tight = plan_memory(
+            Build::UNIFORM,
+            usable_bytes(16 * GIB, None),
+            None,
+            Some(98_304),
+        );
         assert!(!tight.fits());
-        assert_eq!(tight.pool_bytes(), POOL_FLOOR_BYTES);
+        assert_eq!(tight.pool_bytes(), Build::UNIFORM.pool_floor());
     }
 
     #[test]
     fn the_longest_prompt_that_fits_is_found_by_search() {
         let usable = usable_bytes(16 * GIB, None);
-        assert_eq!(max_fitting_context(usable, None), 69_758);
-        let n = max_fitting_context(usable, None);
-        assert!(plan_memory(usable, None, Some(n)).fits());
-        assert!(!plan_memory(usable, None, Some(n + 1)).fits());
+        assert_eq!(max_fitting_context(Build::UNIFORM, usable, None), 88_792);
+        let n = max_fitting_context(Build::UNIFORM, usable, None);
+        assert!(plan_memory(Build::UNIFORM, usable, None, Some(n)).fits());
+        assert!(!plan_memory(Build::UNIFORM, usable, None, Some(n + 1)).fits());
         assert_eq!(
-            max_fitting_context(usable_bytes(36 * GIB, None), None),
+            max_fitting_context(Build::UNIFORM, usable_bytes(36 * GIB, None), None),
             MAX_CONTEXT
         );
-        assert_eq!(max_fitting_context(usable_bytes(8 * GIB, None), None), 0);
+        assert_eq!(
+            max_fitting_context(Build::UNIFORM, usable_bytes(8 * GIB, None), None),
+            0
+        );
     }
 
     #[test]
-    fn a_13_gb_mac_is_the_smallest_that_runs_the_model() {
-        assert!(!fits(12 * GIB));
-        assert!(fits(13 * GIB));
-        assert!(fits(16 * GIB));
-        assert!(!fits(8 * GIB));
-        assert_eq!(min_ram_gib(), 13);
+    fn the_smallest_mac_that_runs_each_build() {
+        assert!(!fits(Build::UNIFORM, 11 * GIB));
+        assert!(fits(Build::UNIFORM, 12 * GIB));
+        assert!(!fits(Build::UNIFORM, 8 * GIB));
+        assert_eq!(min_ram_gib(Build::UNIFORM), 12);
+        // The mixed build's 2.1 GB more stays in memory; its copy's floor is 0.6 GB lower.
+        assert_eq!(min_ram_gib(Build::MIXED), 16);
+        assert!(fits(Build::MIXED, 16 * GIB));
+        assert_eq!(min_ram_gib(Build::MIXED.serving_copy()), 15);
+    }
+
+    #[test]
+    fn a_folder_name_says_which_build_and_the_copy_only_shrinks_the_expert() {
+        assert_eq!(
+            Build::of("pipenetwork/Qwen3.8-Flash-Next-MLX-4bit"),
+            Build::UNIFORM
+        );
+        assert_eq!(
+            Build::of("/m/models--pipenetwork--Qwen3.8-Flash-Next-MLX-mixed-4_8bit/snapshots/b2c4"),
+            Build::MIXED
+        );
+        assert_eq!(Build::of("qwen38-flash-next-MIXED48"), Build::MIXED);
+        let copy = Build::MIXED.serving_copy();
+        assert_eq!(copy.trunk_bytes, Build::MIXED.trunk_bytes);
+        assert_eq!(copy.expert_bytes, Build::COPY_EXPERT_BYTES);
     }
 
     #[test]
@@ -1364,9 +1480,15 @@ mod tests {
         let cfg = app_config();
         assert_eq!(default_prompt_tokens(&cfg, 36 * GIB), 16_384);
         assert_eq!(default_prompt_tokens(&cfg, 16 * GIB), 8_192);
-        assert_eq!(launch_plan(&cfg, 36 * GIB).ctx_tokens, Some(16_384));
-        assert_eq!(launch_plan(&cfg, 16 * GIB).ctx_tokens, Some(8_192));
-        assert_eq!(launch_plan(&cfg, 36 * GIB).chunk, None);
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).ctx_tokens,
+            Some(16_384)
+        );
+        assert_eq!(
+            launch_plan(&cfg, 16 * GIB, Build::UNIFORM).ctx_tokens,
+            Some(8_192)
+        );
+        assert_eq!(launch_plan(&cfg, 36 * GIB, Build::UNIFORM).chunk, None);
     }
 
     #[test]
@@ -1375,14 +1497,17 @@ mod tests {
         // A big Mac held to 8 GiB of MLX memory is a tight machine to the server.
         cfg.server.memory_limit_gb = Some(8);
         assert_eq!(default_prompt_tokens(&cfg, 36 * GIB), 8_192);
-        assert_eq!(launch_plan(&cfg, 36 * GIB).memory_limit, Some(8 << 30));
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).memory_limit,
+            Some(8 << 30)
+        );
     }
 
     #[test]
     fn the_defaults_are_the_ones_the_plan_uses() {
         for gib in [8, 16, 24, 36, 64] {
             let usable = usable_bytes(gib * GIB, None);
-            let p = plan_memory(usable, None, None);
+            let p = plan_memory(Build::UNIFORM, usable, None, None);
             assert_eq!(p.chunk, default_chunk(usable), "{gib}");
             assert_eq!(p.ctx_tokens, default_context(usable), "{gib}");
         }
@@ -1394,30 +1519,45 @@ mod tests {
         // An override of the clear name beats the machine's default ...
         cfg.env_overrides
             .insert("LUMEN_MAX_PROMPT_TOKENS".into(), "32768".into());
-        assert_eq!(launch_plan(&cfg, 36 * GIB).ctx_tokens, Some(32_768));
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).ctx_tokens,
+            Some(32_768)
+        );
         // ... a smaller Max context lowers it; a larger one does not raise it.
         cfg.env_overrides
             .insert("LUMEN_MAX_CTX".into(), "8000".into());
-        assert_eq!(launch_plan(&cfg, 36 * GIB).ctx_tokens, Some(8_000));
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).ctx_tokens,
+            Some(8_000)
+        );
         cfg.env_overrides
             .insert("LUMEN_MAX_CTX".into(), "200000".into());
-        assert_eq!(launch_plan(&cfg, 36 * GIB).ctx_tokens, Some(32_768));
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).ctx_tokens,
+            Some(32_768)
+        );
         // The Max context card alone also only lowers the machine's default.
         cfg.env_overrides.clear();
         cfg.context.max = 4_096;
-        assert_eq!(launch_plan(&cfg, 36 * GIB).ctx_tokens, Some(4_096));
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).ctx_tokens,
+            Some(4_096)
+        );
         cfg.context.max = 81_920;
         cfg.env_overrides
             .insert("LUMEN_QWEN35_PREFILL_CHUNK".into(), "512".into());
         cfg.env_overrides
             .insert("LUMEN_MEMORY_LIMIT_GB".into(), "9".into());
-        let plan = launch_plan(&cfg, 36 * GIB);
+        let plan = launch_plan(&cfg, 36 * GIB, Build::UNIFORM);
         assert_eq!((plan.chunk, plan.memory_limit), (Some(512), Some(9 << 30)));
         // A garbled value is ignored, as the server's parser would: the 9 GiB limit makes
         // this a tight machine, so the default is 8,192.
         cfg.env_overrides
             .insert("LUMEN_MAX_PROMPT_TOKENS".into(), "lots".into());
-        assert_eq!(launch_plan(&cfg, 36 * GIB).ctx_tokens, Some(8_192));
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).ctx_tokens,
+            Some(8_192)
+        );
     }
 
     /// The settings card's typed fields plan the launch exactly as the overrides above do, and
@@ -1427,21 +1567,27 @@ mod tests {
         let mut cfg = app_config();
         cfg.flash_next.max_prompt_tokens = Some(32_768);
         cfg.flash_next.prefill_chunk = Some(512);
-        let plan = launch_plan(&cfg, 36 * GIB);
+        let plan = launch_plan(&cfg, 36 * GIB, Build::UNIFORM);
         assert_eq!((plan.ctx_tokens, plan.chunk), (Some(32_768), Some(512)));
         // Unset again: the machine's default.
         cfg.flash_next.max_prompt_tokens = None;
         cfg.flash_next.prefill_chunk = None;
-        let plan = launch_plan(&cfg, 36 * GIB);
+        let plan = launch_plan(&cfg, 36 * GIB, Build::UNIFORM);
         assert_eq!((plan.ctx_tokens, plan.chunk), (Some(16_384), None));
         // The Max context card still only lowers a typed prompt cap.
         cfg.flash_next.max_prompt_tokens = Some(65_536);
         cfg.context.max = 40_000;
-        assert_eq!(launch_plan(&cfg, 36 * GIB).ctx_tokens, Some(40_000));
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).ctx_tokens,
+            Some(40_000)
+        );
         cfg.context.max = 81_920;
         cfg.env_overrides
             .insert("LUMEN_MAX_PROMPT_TOKENS".into(), "8192".into());
-        assert_eq!(launch_plan(&cfg, 36 * GIB).ctx_tokens, Some(8_192));
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).ctx_tokens,
+            Some(8_192)
+        );
     }
 
     #[test]
@@ -1462,10 +1608,16 @@ mod tests {
         let mut cfg = PersistentConfig::default();
         cfg.server.memory_limit_gb = None;
         cfg.server.disable_wired_limit = false;
-        assert_eq!(launch_plan(&cfg, 36 * GIB).memory_limit, Some(32 << 30));
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).memory_limit,
+            Some(32 << 30)
+        );
         // "Disable caps" leaves MLX's own limit, which the plan does not lower itself to.
         cfg.server.disable_wired_limit = true;
-        assert_eq!(launch_plan(&cfg, 36 * GIB).memory_limit, None);
+        assert_eq!(
+            launch_plan(&cfg, 36 * GIB, Build::UNIFORM).memory_limit,
+            None
+        );
     }
 
     #[test]

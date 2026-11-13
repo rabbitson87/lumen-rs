@@ -11,7 +11,9 @@
   import {
     FLASH_NEXT,
     FLASH_NEXT_PROMPT_PRESETS,
+    flashNextPoolFloor,
     flashNextPromptChip,
+    type FlashNextBuild,
     formatPromptShort,
     parsePromptInput,
   } from "./memory-estimate";
@@ -25,6 +27,8 @@
     machineDefault: number;
     /** Max context as the server reads it, when it is lower than the prompt cap. */
     maxCtxLowers?: number | null;
+    /** The build the launch runs: its trunk and its experts' size set the pool and the floor. */
+    build: FlashNextBuild;
     usableBytes: number;
     chunk: number;
     /** `null` = this Mac's default (removes the override). */
@@ -37,6 +41,7 @@
     explicit,
     machineDefault,
     maxCtxLowers = null,
+    build,
     usableBytes,
     chunk,
     onSelect,
@@ -55,7 +60,7 @@
 
   const chips = $derived.by((): Chip[] => [
     ...presets.map((p) => {
-      const c = flashNextPromptChip({ usableBytes, chunk, tokens: p });
+      const c = flashNextPromptChip({ build, usableBytes, chunk, tokens: p });
       return {
         value: String(p),
         label: formatPromptShort(p) + (p === machineDefault ? " •" : ""),
@@ -67,14 +72,14 @@
             : fill(t("flashnext.prompt.chip.pool"), { n: fmtTok(p), gb: gbText(c.poolBytes) })
           : fill(t("flashnext.prompt.chip.noFit"), {
               n: fmtTok(p),
-              floor: (FLASH_NEXT.poolFloorBytes / 1e9).toFixed(1),
+              floor: (flashNextPoolFloor(build) / 1e9).toFixed(1),
             }),
       };
     }),
     { value: "custom", label: t("flashnext.pool.custom") },
   ]);
 
-  const active = $derived(flashNextPromptChip({ usableBytes, chunk, tokens }));
+  const active = $derived(flashNextPromptChip({ build, usableBytes, chunk, tokens }));
 
   function choose(value: string) {
     invalid = false;

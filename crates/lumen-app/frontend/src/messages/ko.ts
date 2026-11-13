@@ -956,7 +956,7 @@ export const ko: Record<string, string> = {
   "doctor.hint.huggingface.unreachable":
     "HF Hub를 통한 모델 다운로드가 실패합니다. 인터넷 연결, VPN, 프록시를 확인하세요.",
   "doctor.hint.flash_next_ram.short":
-    "Flash-Next는 상주 가중치 3.6 GB, 최소 2.8 GB의 전문가 풀, prefill 예비분을 GPU가 쓸 수 있는 RAM 몫(32 GB까지 2/3, 그 위는 3/4이며 메모리 한도가 더 낮출 수 있음) 안에 둬야 합니다. 그보다 작으면 모델을 로드할 수 없습니다.",
+    "Flash-Next는 상주 가중치 {trunk} GB, 최소 {floor} GB의 전문가 풀, prefill 예비분을 GPU가 쓸 수 있는 RAM 몫(32 GB까지 2/3, 그 위는 3/4이며 메모리 한도가 더 낮출 수 있음) 안에 둬야 합니다. 그보다 작으면 모델을 로드할 수 없습니다.",
   "doctor.hint.flash_next_ram.context":
     "가장 긴 프롬프트의 KV 캐시(토큰당 30 KB)가 GPU가 쓸 수 있는 RAM 몫에서 빠집니다. 앱은 직접 설정하지 않으면 LUMEN_MAX_PROMPT_TOKENS(16,384 토큰, 빠듯한 Mac은 8,192)를 보내며, 이는 최대 컨텍스트로 낮춰집니다. 이를 줄이거나(Flash-Next 메모리 계산기의 적용이 기록합니다) prefill 청크를 줄이고, 메모리 한도가 RAM보다 낮다면 올리세요.",
   "doctor.hint.flash_next_disk.room":
@@ -980,9 +980,9 @@ export const ko: Record<string, string> = {
   "doctor.detail.active_model.incomplete":
     "필수 파일 (config.json + safetensors/gguf 샤드 1개 이상)이 누락되었습니다.",
   "doctor.detail.flash_next_ram":
-    "전문가 풀은 GPU가 쓸 수 있는 RAM 몫에서 상주 가중치 3.6 GB와 prefill 예비분(버퍼, 청크 활성값, 가장 긴 프롬프트의 KV 캐시(토큰당 30 KB), attention score)을 뺀 나머지입니다. 프롬프트 상한이 길수록 줄고, 풀이 클수록 토큰당 SSD 읽기가 줄어듭니다.",
+    "전문가 풀은 GPU가 쓸 수 있는 RAM 몫에서 상주 가중치 {trunk} GB와 prefill 예비분(버퍼, 청크 활성값, 가장 긴 프롬프트의 KV 캐시(토큰당 30 KB), attention score)을 뺀 나머지입니다. 프롬프트 상한이 길수록 줄고, 풀이 클수록 토큰당 SSD 읽기가 줄어듭니다.",
   "doctor.detail.flash_next_ram.oneRegion":
-    "4.2 GB 미만이면 풀이 스테이징 영역을 하나만 둘 수 있어, prefill이 현재 레이어를 계산하는 동안 다음 레이어를 읽지 못합니다.",
+    "{prefetch} GB 미만이면 풀이 스테이징 영역을 하나만 둘 수 있어, prefill이 현재 레이어를 계산하는 동안 다음 레이어를 읽지 못합니다.",
   "doctor.detail.flash_next_pack.absent":
     "팩이 없으면 서버는 전문가 하나를 가중치 샤드의 흩어진 9개 범위로 읽습니다. 팩은 같은 바이트를 전문가당 레코드 하나로 저장합니다.",
   "doctor.detail.flash_next_copy.absent":

@@ -27,6 +27,8 @@ registerHooks({
 
 const {
   FLASH_NEXT,
+  FLASH_NEXT_BUILDS,
+  FLASH_NEXT_COPY_EXPERT_BYTES,
   FLASH_NEXT_DECODE_TPS,
   FLASH_NEXT_SPEED_MODEL,
   attnScoreBytes,
@@ -46,6 +48,7 @@ const {
   FLASH_NEXT_PROMPT_PRESETS,
   envChoice,
   envShadowsTypedKey,
+  flashNextBuildOf,
   flashNextChipTps,
   flashNextDefaultContext,
   flashNextDiskBytes,
@@ -65,13 +68,18 @@ const {
   parsePromptInput,
   flashNextEstimate,
   flashNextFits,
+  flashNextLaunchBuild,
   flashNextLaunchContext,
   flashNextMaxContext,
   flashNextMaxPoolGb,
   flashNextMinRamGb,
   flashNextPlan,
   flashNextPlanFits,
+  flashNextPlanPoolWithin,
   flashNextPlannedContext,
+  flashNextPoolFloor,
+  flashNextPoolPrefetch,
+  flashNextServingCopy,
   flashNextSettingsEnabled,
   flashNextSettingsEnv,
   flashNextShadowedKeys,
@@ -86,6 +94,9 @@ const {
 
 const GIB = 1024 ** 3;
 const near = (a: number, b: number, eps = 1e-6) => assert.ok(Math.abs(a - b) <= eps, `${a} vs ${b}`);
+const UNIFORM = FLASH_NEXT_BUILDS.uniform;
+const MIXED = FLASH_NEXT_BUILDS.mixed;
+const MIXED_COPY = flashNextServingCopy(MIXED);
 
 // ── The families that existed before Flash-Next keep their numbers ──────────
 
@@ -126,9 +137,31 @@ test("KV is 29,952 bytes per token: 13 layers x (K,V of 2 heads x 256 dims + a 1
   assert.equal(FLASH_NEXT.kvBytesPerToken, 13 * (2 * 2 * 256 * 2 + 128 * 2));
 });
 
-test("the pool floor is 2 x 512 slots and the second staging region needs 3 x 512", () => {
-  assert.equal(FLASH_NEXT.poolFloorBytes, 2 * 512 * FLASH_NEXT.expertBytes);
-  assert.equal(FLASH_NEXT.poolPrefetchBytes, 3 * 512 * FLASH_NEXT.expertBytes);
+test("the pool floor is 2 x 512 slots and the second staging region needs 3 x 512, of the build's experts", () => {
+  // Same cases as `the_pool_sizes_are_the_slot_counts_of_the_servers_pool` in flash_next.rs.
+  assert.equal(flashNextPoolFloor(UNIFORM), 2 * 512 * 2_764_800);
+  assert.equal(flashNextPoolPrefetch(UNIFORM), 3 * 512 * 2_764_800);
+  assert.equal(flashNextPoolFloor(MIXED), flashNextPoolFloor(UNIFORM));
+  assert.equal(flashNextPoolFloor(MIXED_COPY), 2 * 512 * 2_150_400);
+  assert.equal(flashNextPoolFloor(MIXED_COPY), 2_202_009_600);
+  assert.equal(flashNextPoolPrefetch(MIXED_COPY), 3 * 512 * 2_150_400);
+});
+
+test("a model's name says which build, and the copy only shrinks the expert", () => {
+  // Same cases as `a_folder_name_says_which_build_and_the_copy_only_shrinks_the_expert`.
+  assert.equal(flashNextBuildOf("pipenetwork/Qwen3.8-Flash-Next-MLX-4bit"), UNIFORM);
+  assert.equal(
+    flashNextBuildOf("/m/models--pipenetwork--Qwen3.8-Flash-Next-MLX-mixed-4_8bit/snapshots/b2c4"),
+    MIXED,
+  );
+  assert.equal(flashNextBuildOf("qwen38-flash-next-MIXED48"), MIXED);
+  // No name says nothing: the uniform build, as `Build::of("")` gives.
+  assert.equal(flashNextBuildOf(null), UNIFORM);
+  assert.equal(flashNextBuildOf(undefined), UNIFORM);
+  assert.equal(MIXED_COPY.trunkBytes, MIXED.trunkBytes);
+  assert.equal(MIXED_COPY.expertBytes, FLASH_NEXT_COPY_EXPERT_BYTES);
+  // The copy is the same checkpoint on disk; its own file is counted where it is known.
+  assert.equal(MIXED_COPY.diskModelBytes, MIXED.diskModelBytes);
 });
 
 test("usable memory is 2/3 of RAM up to 32 GiB and 3/4 above, times 0.88", () => {
@@ -161,46 +194,68 @@ test("a server started now plans within what other apps leave, less 2 GB or 5% o
 
 test("the reserve adds buffers, chunk activations, KV of the longest prompt and half the scores", () => {
   const usable = flashNextUsableBytes(36);
-  const p = flashNextPlan(usable);
+  const p = flashNextPlan(UNIFORM, usable);
   assert.deepEqual([p.chunk, p.ctxTokens, p.tight], [1024, 16_384, false]);
   const scores = 24 * 1024 * 16_384 * 4; // 1.61 GB, under the 2 GB budget
   assert.equal(p.buffersBytes, 600_000_000 + 1024 * 1_100_000);
   assert.equal(p.kvBytes, 16_384 * 29_952);
   assert.equal(p.scoresBytes, scores / 2);
   assert.equal(p.reserveBytes, p.buffersBytes + p.kvBytes + p.scoresBytes);
-  near(p.poolBytes, usable - 3.6e9 - p.reserveBytes, 1);
+  near(p.poolBytes, usable - UNIFORM.trunkBytes - p.reserveBytes, 1);
+  assert.equal(p.build, UNIFORM);
   // Past the 2 GB budget the scores stop growing.
-  assert.equal(flashNextPlan(usable, null, 65_536).scoresBytes, 1_000_000_000);
+  assert.equal(flashNextPlan(UNIFORM, usable, null, 65_536).scoresBytes, 1_000_000_000);
 });
 
 test("a tight machine takes the smaller chunk, context and scores budget", () => {
-  const p = flashNextPlan(flashNextUsableBytes(16));
+  const p = flashNextPlan(UNIFORM, flashNextUsableBytes(16));
   assert.deepEqual([p.chunk, p.ctxTokens, p.tight], [512, 8192, true]);
   assert.equal(p.reserveBytes, 1_609_893_376);
-  near(p.poolBytes, 4_868_963_211, 2);
-  // 24 GB is not tight: 1,024-token chunks, 16K prompts, an ~8 GB pool.
-  const q = flashNextPlan(flashNextUsableBytes(24));
+  near(p.poolBytes, 5_443_963_211, 2);
+  // The mixed build holds 2.1 GB more: that much less pool, the same reserve.
+  const mixed = flashNextPlan(MIXED, flashNextUsableBytes(16));
+  near(mixed.poolBytes, 3_336_963_211, 2);
+  assert.equal(mixed.reserveBytes, p.reserveBytes);
+  // 24 GB is not tight: 1,024-token chunks, 16K prompts, a ~9 GB pool.
+  const q = flashNextPlan(UNIFORM, flashNextUsableBytes(24));
   assert.deepEqual([q.chunk, q.ctxTokens, q.tight], [1024, 16_384, false]);
-  near(q.poolBytes, 8_495_844_945, 2);
+  near(q.poolBytes, 9_070_844_945, 2);
 });
 
 test("an override replaces the default it names and nothing else", () => {
   const usable = flashNextUsableBytes(16);
-  const c = flashNextPlan(usable, 2048);
+  const c = flashNextPlan(UNIFORM, usable, 2048);
   assert.deepEqual([c.chunk, c.ctxTokens], [2048, 8192]);
-  const x = flashNextPlan(usable, null, 32_768);
+  const x = flashNextPlan(UNIFORM, usable, null, 32_768);
   assert.deepEqual([x.chunk, x.ctxTokens], [512, 32_768]);
 });
 
 test("the longest prompt the user allows comes out of the pool", () => {
   const usable = flashNextUsableBytes(36);
-  const small = flashNextPlan(usable, null, 16_384);
-  const big = flashNextPlan(usable, null, 81_920);
+  const small = flashNextPlan(UNIFORM, usable, null, 16_384);
+  const big = flashNextPlan(UNIFORM, usable, null, 81_920);
   assert.ok(big.poolBytes < small.poolBytes);
-  near(big.poolBytes, 16_732_037_898, 2);
-  // The app's default Max context (81,920) leaves a 16 GB Mac no room at all.
-  const tight = flashNextPlan(flashNextUsableBytes(16), null, 81_920);
+  near(big.poolBytes, 17_307_037_898, 2);
+  // On a 16 GB Mac a 98,304-token prompt leaves no room at all (88,792 is the most).
+  const tight = flashNextPlan(UNIFORM, flashNextUsableBytes(16), null, 98_304);
   assert.ok(!flashNextPlanFits(tight));
+});
+
+// Same cases as `a_server_started_now_plans_within_what_other_apps_leave` in flash_next.rs.
+test("a server started now gets the pool left within what other apps leave", () => {
+  const usable = flashNextUsableBytes(36);
+  const plan = flashNextPlan(UNIFORM, usable);
+  assert.equal(flashNextPlanPoolWithin(plan, usable), plan.poolBytes);
+  const now = flashNextUsableNow(usable, 36 * GIB, 17_707_089_920, 0);
+  assert.equal(flashNextPlanPoolWithin(plan, now), now - UNIFORM.trunkBytes - plan.reserveBytes);
+  assert.deepEqual(
+    [Math.floor(flashNextPlanPoolWithin(plan, now) / 1e8), Math.floor(plan.poolBytes / 1e8)],
+    [96, 194],
+  );
+  assert.equal(flashNextPlanPoolWithin(plan, 0), 0);
+  // The mixed build's trunk comes out of the same memory.
+  const mixed = flashNextPlan(MIXED, usable);
+  assert.equal(flashNextPlanPoolWithin(mixed, now), now - MIXED.trunkBytes - mixed.reserveBytes);
 });
 
 test("the planned prompt is the prompt cap, lowered to Max context; Max context alone never raises it", () => {
@@ -251,54 +306,85 @@ test("a LUMEN_MAX_PROMPT_TOKENS the user set wins, and Max context only lowers i
 
 test("the longest prompt that fits is found by search", () => {
   const usable = flashNextUsableBytes(16);
-  assert.equal(flashNextMaxContext(usable), 69_758);
-  assert.ok(flashNextPlanFits(flashNextPlan(usable, null, 69_758)));
-  assert.ok(!flashNextPlanFits(flashNextPlan(usable, null, 69_759)));
-  assert.equal(flashNextMaxContext(flashNextUsableBytes(36)), FLASH_NEXT.maxContext);
-  assert.equal(flashNextMaxContext(flashNextUsableBytes(8)), 0);
+  assert.equal(flashNextMaxContext(UNIFORM, usable), 88_792);
+  assert.ok(flashNextPlanFits(flashNextPlan(UNIFORM, usable, null, 88_792)));
+  assert.ok(!flashNextPlanFits(flashNextPlan(UNIFORM, usable, null, 88_793)));
+  assert.equal(flashNextMaxContext(UNIFORM, flashNextUsableBytes(36)), FLASH_NEXT.maxContext);
+  assert.equal(flashNextMaxContext(UNIFORM, flashNextUsableBytes(8)), 0);
+  // The mixed build's bigger trunk leaves less; its copy's smaller floor gives some back.
+  const mixed = flashNextMaxContext(MIXED, usable);
+  assert.ok(flashNextPlanFits(flashNextPlan(MIXED, usable, null, mixed)));
+  assert.ok(!flashNextPlanFits(flashNextPlan(MIXED, usable, null, mixed + 1)));
+  assert.ok(mixed < flashNextMaxContext(MIXED_COPY, usable));
+  assert.ok(flashNextMaxContext(MIXED_COPY, usable) < 88_792);
   // A bigger pool leaves less.
   const u36 = flashNextUsableBytes(36);
-  assert.ok(flashNextMaxContext(u36, null, 20e9) < flashNextMaxContext(u36, null, 10e9));
+  assert.ok(flashNextMaxContext(UNIFORM, u36, null, 20e9) < flashNextMaxContext(UNIFORM, u36, null, 10e9));
 });
 
-test("a 13 GB Mac is the smallest that runs the model", () => {
-  assert.ok(!flashNextFits(12));
-  assert.ok(flashNextFits(13));
-  assert.ok(flashNextFits(16));
-  assert.ok(!flashNextFits(8));
-  assert.equal(flashNextMinRamGb(), 13);
+test("the smallest Mac that runs each build: 12 GB uniform, 16 GB mixed, 15 GB mixed with its copy", () => {
+  // Same cases as `the_smallest_mac_that_runs_each_build` in flash_next.rs.
+  assert.ok(!flashNextFits(UNIFORM, 11));
+  assert.ok(flashNextFits(UNIFORM, 12));
+  assert.ok(flashNextFits(UNIFORM, 16));
+  assert.ok(!flashNextFits(UNIFORM, 8));
+  assert.equal(flashNextMinRamGb(UNIFORM), 12);
+  // The mixed build's 2.1 GB more stays in memory; its copy's floor is 0.6 GB lower.
+  assert.equal(flashNextMinRamGb(MIXED), 16);
+  assert.ok(flashNextFits(MIXED, 16));
+  assert.ok(!flashNextFits(MIXED, 15));
+  assert.equal(flashNextMinRamGb(MIXED_COPY), 15);
   // A memory limit can take a big Mac below what it needs.
-  assert.ok(flashNextFits(36, 8)); // 8 GiB makes it a tight machine, which still fits
-  assert.ok(!flashNextFits(36, 6));
+  assert.ok(flashNextFits(UNIFORM, 36, 8)); // 8 GiB makes it a tight machine, which still fits
+  assert.ok(!flashNextFits(UNIFORM, 36, 6));
 });
 
 test("the estimate sums trunk, pool and reserve; auto spends exactly the usable memory", () => {
   const usable = flashNextUsableBytes(36);
-  const auto = flashNextEstimate({ usableBytes: usable, poolBytes: null, chunk: 1024, ctxTokens: 16_384 });
+  const at = (build: typeof UNIFORM, poolBytes: number | null) =>
+    flashNextEstimate({ build, usableBytes: usable, poolBytes, chunk: 1024, ctxTokens: 16_384 });
+  const auto = at(UNIFORM, null);
   assert.ok(auto.fits);
   near(auto.residentBytes, usable, 1);
   near(auto.utilization, 1, 1e-9);
-  const manual = flashNextEstimate({ usableBytes: usable, poolBytes: 10e9, chunk: 1024, ctxTokens: 16_384 });
-  near(manual.residentBytes, 3.6e9 + 10e9 + manual.plan.reserveBytes, 1);
+  const manual = at(UNIFORM, 10e9);
+  near(manual.residentBytes, UNIFORM.trunkBytes + 10e9 + manual.plan.reserveBytes, 1);
   assert.ok(manual.fits && manual.utilization < 1);
-  const over = flashNextEstimate({ usableBytes: usable, poolBytes: 30e9, chunk: 1024, ctxTokens: 16_384 });
+  const over = at(UNIFORM, 30e9);
   assert.ok(!over.fits && over.utilization > 1);
+  // The mixed build: its own trunk, and auto still spends exactly the usable memory.
+  near(at(MIXED, 10e9).residentBytes, MIXED.trunkBytes + 10e9 + manual.plan.reserveBytes, 1);
+  near(at(MIXED, null).residentBytes, usable, 1);
 });
 
-test("a pool under the floor is raised to it, and one under 4.2 GB lends a single staging region", () => {
+test("a pool under the floor is raised to it, and one under three layers lends a single staging region", () => {
   const usable = flashNextUsableBytes(36);
-  const e = flashNextEstimate({ usableBytes: usable, poolBytes: 1e9, chunk: 1024, ctxTokens: 16_384 });
-  assert.equal(e.poolBytes, FLASH_NEXT.poolFloorBytes);
+  const at = (build: typeof UNIFORM, poolBytes: number) =>
+    flashNextEstimate({ build, usableBytes: usable, poolBytes, chunk: 1024, ctxTokens: 16_384 });
+  const e = at(UNIFORM, 1e9);
+  assert.equal(e.poolBytes, flashNextPoolFloor(UNIFORM));
   assert.ok(e.poolRaisedToFloor && e.oneStagingRegion);
-  const three = flashNextEstimate({ usableBytes: usable, poolBytes: 3.5e9, chunk: 1024, ctxTokens: 16_384 });
+  const three = at(UNIFORM, 3.5e9);
   assert.ok(!three.poolRaisedToFloor && three.oneStagingRegion);
-  const six = flashNextEstimate({ usableBytes: usable, poolBytes: 6e9, chunk: 1024, ctxTokens: 16_384 });
+  const six = at(UNIFORM, 6e9);
   assert.ok(!six.oneStagingRegion);
+  // The copy's experts are smaller: its floor is 2.2 GB and 3.5 GB already holds three layers.
+  const copy = at(MIXED_COPY, 2.5e9);
+  assert.ok(!copy.poolRaisedToFloor && copy.oneStagingRegion);
+  assert.equal(at(MIXED_COPY, 1e9).poolBytes, 2_202_009_600);
+  assert.ok(!at(MIXED_COPY, 3.5e9).oneStagingRegion);
+  // A 16 GB Mac: the mixed build's ~3.3 GB pool is under its 4.2 GB, the copy's 3.3 GB is not.
+  const at16 = (build: typeof UNIFORM) =>
+    flashNextEstimate({ build, usableBytes: flashNextUsableBytes(16), poolBytes: null, chunk: 512, ctxTokens: 8192 });
+  assert.ok(at16(MIXED).oneStagingRegion);
+  assert.ok(!at16(MIXED_COPY).oneStagingRegion);
 });
 
 test("a hand-typed pool is bounded by RAM, never below the floor", () => {
-  assert.equal(flashNextMaxPoolGb(36), 29);
-  assert.equal(flashNextMaxPoolGb(4), 2.82624);
+  assert.equal(flashNextMaxPoolGb(UNIFORM, 36), 29);
+  assert.equal(flashNextMaxPoolGb(UNIFORM, 4), 2.8311552);
+  assert.equal(flashNextMaxPoolGb(MIXED, 36), 27);
+  assert.equal(flashNextMaxPoolGb(MIXED_COPY, 4), 2.2020096);
 });
 
 // ── Decode speed: the bandwidth/SSD model ───────────────────────────────────
@@ -316,8 +402,8 @@ function byHand(
   ssd: number,
   pack: boolean,
 ): number {
-  // The engine runs no pool under its floor.
-  pool = Math.max(pool, FLASH_NEXT.poolFloorBytes / 1e9);
+  // The engine runs no pool under its floor (the uniform build's: the model is that build's).
+  pool = Math.max(pool, flashNextPoolFloor(UNIFORM) / 1e9);
   const p = c.points;
   let hit: number;
   if (pool >= p[p.length - 1][0]) hit = p[p.length - 1][1];
@@ -389,9 +475,15 @@ test("the model's constants, hit-rate points and reference table match src/flash
       }
     }
   }
-  // The constants describe what a token streams, as the Rust test checks too.
-  near(M.expertGbPerToken, (48 * 10 * FLASH_NEXT.expertBytes) / 1e9, 1e-3);
-  near(M.streamGb, M.expertGbPerToken + FLASH_NEXT.trunkBytes / 1e9, 1e-9);
+  // The constants describe what a token streams, as the Rust test checks too: 48 layers x 10
+  // experts of the checkpoint's read size (`EXPERT_BYTES`), plus the 3.6 GB trunk the model was
+  // fitted with before the server sized the trunk from the checkpoint.
+  const expertRead = rs.match(/pub const EXPERT_BYTES: u64 = ([0-9_]+);/);
+  assert.ok(expertRead, "EXPERT_BYTES not found in flash_next.rs");
+  near(M.expertGbPerToken, (48 * 10 * Number(expertRead[1].replaceAll("_", ""))) / 1e9, 1e-3);
+  near(M.streamGb, M.expertGbPerToken + 3.6, 1e-9);
+  // `decode_tps` floors the pool at the uniform build's floor, as `flashNextDecodeTps` does.
+  assert.ok(rs.includes("pool_gb.max(Build::UNIFORM.pool_floor() as f64 / 1e9)"), "decode_tps floor");
 });
 
 test("at the reference hardware the model reproduces every measured point (12 cells) within 4%", () => {
@@ -469,7 +561,9 @@ test("the reference table is the measured one, with no emulated points", () => {
 });
 
 test("a pool under the engine's floor is estimated at the floor", () => {
-  const floorGb = FLASH_NEXT.poolFloorBytes / 1e9;
+  // The uniform build's floor (2,831,155,200 B), whatever build is run: the model is that build's.
+  const floorGb = flashNextPoolFloor(UNIFORM) / 1e9;
+  assert.equal(floorGb, 2.8311552);
   for (const pack of [false, true]) {
     const at = flashNextDecodeTps(floorGb, REF.memoryGbps, REF.ssdRandomGbps, pack)!;
     for (const pool of [0.1, 1, 2.5, floorGb - 1e-6]) {
@@ -530,9 +624,13 @@ test("the slow-disk warning follows the measured random speed", () => {
   assert.ok(!flashNextSlowSsd(null), "no warning without a measurement");
 });
 
-test("the disk the model needs adds the optional pack and draft head", () => {
-  assert.equal(flashNextDiskBytes({ pack: false, mtp: false }), 97e9);
-  assert.equal(flashNextDiskBytes({ pack: true, mtp: true }), 97e9 + 68e9 + 1.5e9);
+test("the disk the model needs is its build's weights plus the optional pack and draft head", () => {
+  assert.equal(flashNextDiskBytes(UNIFORM, { pack: false, mtp: false }), 97e9);
+  assert.equal(flashNextDiskBytes(UNIFORM, { pack: true, mtp: true }), 97e9 + 68e9 + 1.5e9);
+  assert.equal(flashNextDiskBytes(MIXED, { pack: false, mtp: false }), 106e9);
+  assert.equal(flashNextDiskBytes(MIXED, { pack: true, mtp: false }), 106e9 + 68e9);
+  // Serving the copy does not remove the checkpoint.
+  assert.equal(flashNextDiskBytes(MIXED_COPY, { pack: false, mtp: false }), 106e9);
 });
 
 // ── The constants mirror the Rust side (src/flash_next.rs) ──────────────────
@@ -554,10 +652,23 @@ test("the sizes, plan constants and speed tables match src/flash_next.rs", () =>
     return value(m[1]);
   };
   const F = FLASH_NEXT;
-  assert.equal(num("TRUNK_BYTES"), F.trunkBytes);
-  assert.equal(num("EXPERT_BYTES"), F.expertBytes);
-  assert.equal(num("POOL_FLOOR_BYTES"), F.poolFloorBytes);
-  assert.equal(num("POOL_PREFETCH_BYTES"), F.poolPrefetchBytes);
+  // `Build::UNIFORM` / `Build::MIXED`: the trunk and the expert of each build, field by field.
+  const build = (name: "UNIFORM" | "MIXED") => {
+    const m = rs.match(
+      new RegExp(`pub const ${name}: Self = Self \\{\\s*trunk_bytes: ([0-9_]+),\\s*expert_bytes: ([0-9_]+),\\s*\\};`),
+    );
+    assert.ok(m, `Build::${name} not found in flash_next.rs`);
+    return { trunkBytes: value(m[1]), expertBytes: value(m[2]) };
+  };
+  const fields = (b: typeof UNIFORM) => ({ trunkBytes: b.trunkBytes, expertBytes: b.expertBytes });
+  assert.deepEqual(build("UNIFORM"), fields(UNIFORM));
+  assert.deepEqual(build("MIXED"), fields(MIXED));
+  assert.equal(num("COPY_EXPERT_BYTES"), FLASH_NEXT_COPY_EXPERT_BYTES);
+  // The pool's slot counts, and the rule that names the build.
+  const slots = (fn: string) => rs.match(new RegExp(`pub fn ${fn}\\(self\\) -> u64 \\{\\s*(\\d+) \\* (\\d+) \\* self\\.expert_bytes`));
+  assert.deepEqual(slots("pool_floor")?.slice(1).map(Number), [2, 512], "pool_floor");
+  assert.deepEqual(slots("pool_prefetch")?.slice(1).map(Number), [3, 512], "pool_prefetch");
+  assert.ok(rs.includes(`model_id.to_lowercase().contains("mixed")`), "Build::of");
   assert.equal(num("DEFAULT_CHUNK"), F.defaultChunk);
   assert.equal(num("TIGHT_CHUNK"), F.tightChunk);
   assert.equal(num("DEFAULT_CONTEXT"), F.defaultContext);
@@ -668,6 +779,24 @@ test("the 3-bit copy is served once it is complete, unless it is switched off", 
   // Switching it off is a choice the card can reset, though it sends nothing.
   assert.ok(flashNextIsDefault(FLASH_NEXT_DEFAULTS));
   assert.ok(!flashNextIsDefault(settings({ expert_copy: "off" })));
+});
+
+test("a launch runs the model's build, with the copy's experts while the copy is served", () => {
+  const mixed = "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit";
+  const complete = { installed: true, pack: "absent", copy: "complete", mtp_present: false };
+  assert.deepEqual(flashNextLaunchBuild(mixed, flashNextEnv(FLASH_NEXT_DEFAULTS, {}, complete)), MIXED_COPY);
+  // Not built, or switched off: the checkpoint's own experts.
+  assert.equal(flashNextLaunchBuild(mixed, flashNextEnv(FLASH_NEXT_DEFAULTS, {}, { ...complete, copy: "incomplete" })), MIXED);
+  assert.equal(flashNextLaunchBuild(mixed, flashNextEnv(settings({ expert_copy: "off" }), {}, complete)), MIXED);
+  // An override of the copy's variable decides, as the server reads it.
+  assert.equal(
+    flashNextLaunchBuild(mixed, flashNextEnv(FLASH_NEXT_DEFAULTS, { [FLASH_NEXT_COPY_ENV_KEY]: "off" }, complete)),
+    MIXED,
+  );
+  assert.deepEqual(
+    flashNextLaunchBuild("pipenetwork/Qwen3.8-Flash-Next-MLX-4bit", { [FLASH_NEXT_COPY_ENV_KEY]: FLASH_NEXT_COPY_SPEC }),
+    flashNextServingCopy(UNIFORM),
+  );
 });
 
 test("every chosen option maps to its variable as a plain value (as FlashNextConfig::env does)", () => {
@@ -813,35 +942,42 @@ test("the presets are the ones the pickers promise, none under the floor", () =>
   assert.deepEqual([...FLASH_NEXT_PROMPT_PRESETS], [8192, 16384, 32768, 65536, 131072]);
   assert.deepEqual([...FLASH_NEXT_LANE_PRESETS], [8, 16, 32, 64]);
   assert.equal(FLASH_NEXT_LANES_DEFAULT, 32);
-  assert.ok(FLASH_NEXT_POOL_PRESETS_GB.every((g) => g * 1e9 > FLASH_NEXT.poolFloorBytes));
+  for (const b of [UNIFORM, MIXED, MIXED_COPY]) {
+    assert.ok(FLASH_NEXT_POOL_PRESETS_GB.every((g) => g * 1e9 > flashNextPoolFloor(b)));
+  }
   assert.ok(FLASH_NEXT_PROMPT_PRESETS.includes(FLASH_NEXT.defaultContext as never));
   assert.ok(FLASH_NEXT_PROMPT_PRESETS.includes(FLASH_NEXT.tightContext as never));
 });
 
 test("a pool chip is disabled when the pool does not fit beside the current longest prompt", () => {
   const usable = flashNextUsableBytes(36);
-  const at = (gb: number | null, ctxTokens: number) =>
-    flashNextPoolChip({ usableBytes: usable, chunk: 1024, ctxTokens, gb, pack: false, hw: null });
-  // At 16K a 36 GB Mac leaves an ~18.9 GB pool: 16 GB fits, 20 GB does not.
+  const at = (gb: number | null, ctxTokens: number, build = UNIFORM) =>
+    flashNextPoolChip({ build, usableBytes: usable, chunk: 1024, ctxTokens, gb, pack: false, hw: null });
+  // At 16K a 36 GB Mac leaves a ~19.5 GB pool: 16 GB fits, 20 GB does not.
   assert.ok(at(16, 16_384).fits);
   assert.ok(!at(20, 16_384).fits);
   // The largest pool that fits is told to 0.1 GB, rounded down.
-  assert.equal(at(20, 16_384).maxFitGb, 18.8);
-  // At 128K the reserve takes ~6.7 GB: ~15.3 GB is left, so 16 GB goes and 12 GB stays.
+  assert.equal(at(20, 16_384).maxFitGb, 19.4);
+  // The mixed build's 2.1 GB more trunk is that much less pool.
+  assert.equal(at(20, 16_384, MIXED).maxFitGb, 17.3);
+  // At 128K the reserve takes ~6.7 GB: ~15.8 GB is left, so 16 GB goes and 12 GB stays.
   assert.ok(at(12, 131_072).fits);
   assert.ok(!at(16, 131_072).fits);
   assert.ok(at(null, 131_072).fits);
   // Auto is what the plan leaves.
-  near(at(null, 16_384).poolBytes, flashNextPlan(usable, 1024, 16_384).poolBytes, 1);
+  near(at(null, 16_384).poolBytes, flashNextPlan(UNIFORM, usable, 1024, 16_384).poolBytes, 1);
+  // A pool typed under the floor counts as the floor of the build that runs.
+  assert.equal(at(1, 16_384).poolBytes, flashNextPoolFloor(UNIFORM));
+  assert.equal(at(1, 16_384, MIXED_COPY).poolBytes, flashNextPoolFloor(MIXED_COPY));
   // Nothing fits when the model does not run at this prompt at all.
-  const none = flashNextPoolChip({ usableBytes: flashNextUsableBytes(16), chunk: 512, ctxTokens: 131_072, gb: null, pack: false, hw: null });
+  const none = flashNextPoolChip({ build: UNIFORM, usableBytes: flashNextUsableBytes(16), chunk: 512, ctxTokens: 131_072, gb: null, pack: false, hw: null });
   assert.ok(!none.fits);
 });
 
 test("a pool chip shows no speed until this Mac is measured, then the model's", () => {
   const usable = flashNextUsableBytes(36);
   const chip = (gb: number | null, pack: boolean, hw: typeof REF | null) =>
-    flashNextPoolChip({ usableBytes: usable, chunk: 1024, ctxTokens: 16_384, gb, pack, hw });
+    flashNextPoolChip({ build: UNIFORM, usableBytes: usable, chunk: 1024, ctxTokens: 16_384, gb, pack, hw });
   // Not measured: no speed on any chip, and none from the reference table.
   assert.equal(chip(8, false, null).tps, null);
   assert.equal(chip(null, true, null).tps, null);
@@ -860,13 +996,17 @@ test("a pool chip shows no speed until this Mac is measured, then the model's", 
 test("a prompt chip shows the pool auto would leave, and is disabled under the floor", () => {
   const u36 = flashNextUsableBytes(36);
   const u16 = flashNextUsableBytes(16);
-  const chip = (usableBytes: number, chunk: number, tokens: number) =>
-    flashNextPromptChip({ usableBytes, chunk, tokens });
-  near(chip(u36, 1024, 16_384).poolBytes, flashNextPlan(u36, 1024, 16_384).poolBytes, 1);
+  const chip = (usableBytes: number, chunk: number, tokens: number, build = UNIFORM) =>
+    flashNextPromptChip({ build, usableBytes, chunk, tokens });
+  near(chip(u36, 1024, 16_384).poolBytes, flashNextPlan(UNIFORM, u36, 1024, 16_384).poolBytes, 1);
   assert.ok(chip(u36, 1024, 131_072).fits);
   // A 16 GB Mac: 8K and 16K fit, 128K does not.
   assert.ok(chip(u16, 512, 8_192).fits && chip(u16, 512, 16_384).fits);
   assert.ok(!chip(u16, 512, 131_072).fits);
+  // The mixed build on a 16 GB Mac: 8K and 16K fit, 32K does not; its copy's smaller floor fits 32K.
+  assert.ok(chip(u16, 512, 8_192, MIXED).fits && chip(u16, 512, 16_384, MIXED).fits);
+  assert.ok(!chip(u16, 512, 32_768, MIXED).fits);
+  assert.ok(chip(u16, 512, 32_768, MIXED_COPY).fits);
   // The pool shrinks as the prompt grows.
   assert.ok(chip(u36, 1024, 65_536).poolBytes < chip(u36, 1024, 32_768).poolBytes);
 });
@@ -912,17 +1052,18 @@ test("the pack is in use when it is complete (auto), asked for (build) or not sw
 test("the summary follows the saved settings", () => {
   const usable = flashNextUsableBytes(36);
   const status = { installed: true, pack: "absent", mtp_present: true };
-  const dflt = flashNextEffective({ env: {}, contextMax: 81_920, usableBytes: usable, status });
+  const dflt = flashNextEffective({ build: UNIFORM, env: {}, contextMax: 81_920, usableBytes: usable, status });
   assert.deepEqual(
     [dflt.poolExplicit, dflt.promptTokens, dflt.promptExplicit, dflt.pack, dflt.head],
     [false, 16_384, false, false, false],
   );
   // The head is off by default even with the file installed; choosing auto uses it.
   assert.ok(
-    flashNextEffective({ env: { LUMEN_QWEN4_MTP: "auto" }, contextMax: 81_920, usableBytes: usable, status }).head,
+    flashNextEffective({ build: UNIFORM, env: { LUMEN_QWEN4_MTP: "auto" }, contextMax: 81_920, usableBytes: usable, status }).head,
   );
-  near(dflt.estimate.poolBytes, flashNextPlan(usable, 1024, 16_384).poolBytes, 1);
+  near(dflt.estimate.poolBytes, flashNextPlan(UNIFORM, usable, 1024, 16_384).poolBytes, 1);
   const set = flashNextEffective({
+    build: UNIFORM,
     env: {
       LUMEN_MOE_EXPERT_CACHE_GB: "8",
       LUMEN_MAX_PROMPT_TOKENS: "32768",
@@ -942,6 +1083,7 @@ test("the summary follows the saved settings", () => {
   assert.equal(set.tps, null);
   assert.equal(dflt.tps, null);
   const measured = flashNextEffective({
+    build: UNIFORM,
     env: { LUMEN_MOE_EXPERT_CACHE_GB: "8", LUMEN_MOE_PACK: "build" },
     usableBytes: usable,
     status,
@@ -951,18 +1093,27 @@ test("the summary follows the saved settings", () => {
   near(measured.tps!.tps, flashNextDecodeTps(8, 231, 3.1, true)!, 1e-12);
   // The server reads 8g as 8 GB too.
   assert.equal(
-    flashNextEffective({ env: { LUMEN_MOE_EXPERT_CACHE_GB: "8g" }, usableBytes: usable, status }).estimate.poolBytes,
+    flashNextEffective({ build: UNIFORM, env: { LUMEN_MOE_EXPERT_CACHE_GB: "8g" }, usableBytes: usable, status }).estimate.poolBytes,
     8e9,
   );
   // The copy, once served, is what decode reads instead of the pack.
   const both = { installed: true, pack: "complete", copy: "complete", mtp_present: false };
   const copyEnv = flashNextEnv(FLASH_NEXT_DEFAULTS, {}, both);
-  const withCopy = flashNextEffective({ env: copyEnv, usableBytes: usable, status: both });
+  const mixedId = "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit";
+  const withCopy = flashNextEffective({
+    build: flashNextLaunchBuild(mixedId, copyEnv),
+    env: copyEnv,
+    usableBytes: usable,
+    status: both,
+  });
   assert.deepEqual([withCopy.copy, withCopy.pack], [true, false]);
-  const copyOff = flashNextEffective({ env: flashNextEnv(settings({ expert_copy: "off" }), {}, both), usableBytes: usable, status: both });
+  // Its plan is the mixed build's trunk with the copy's experts: the same auto pool, a lower floor.
+  assert.deepEqual(withCopy.estimate.plan.build, MIXED_COPY);
+  near(withCopy.estimate.poolBytes, flashNextPlan(MIXED, usable, 1024, 16_384).poolBytes, 1);
+  const copyOff = flashNextEffective({ build: UNIFORM, env: flashNextEnv(settings({ expert_copy: "off" }), {}, both), usableBytes: usable, status: both });
   assert.deepEqual([copyOff.copy, copyOff.pack], [false, true]);
   // `auto` written by hand is not an explicit pool.
-  assert.ok(!flashNextEffective({ env: { LUMEN_MOE_EXPERT_CACHE_GB: "auto" }, usableBytes: usable, status }).poolExplicit);
+  assert.ok(!flashNextEffective({ build: UNIFORM, env: { LUMEN_MOE_EXPERT_CACHE_GB: "auto" }, usableBytes: usable, status }).poolExplicit);
 });
 
 test("reset puts every option back to the default, and the defaults send nothing", () => {

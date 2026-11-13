@@ -445,10 +445,11 @@ export const bytesToGB = (b: number): number => b / GB;
 
 // ── Flash-Next (qwen4-exp): routed experts streamed from the SSD ─────────────
 //
-// A different shape from the families above. The 97 GB checkpoint is NOT resident: ~3.6 GB of
-// trunk stays in memory, the 68 GB of routed experts are served from the SSD through a pool of
-// memory slots, and the server sizes that pool from what the GPU's working set leaves after a
-// prefill's reserve (`plan_memory` in `qwen4_exp/runner.rs`):
+// A different shape from the families above. The 97 GB (uniform 4-bit) or 106 GB (mixed 4/8-bit)
+// checkpoint is NOT resident: its trunk (3.0 or 5.1 GB, see `FLASH_NEXT_BUILDS`) stays in memory,
+// the 68 GB of routed experts are served from the SSD through a pool of memory slots, and the
+// server sizes that pool from what the GPU's working set leaves after a prefill's reserve
+// (`plan_memory` in `qwen4_exp/runner.rs`):
 //
 //   reserve = 0.6 GB + 1.1 MB x chunk + KV(longest prompt) + half the attention scores
 //   pool    = usable - trunk - reserve                      (`auto`; never below the floor)
@@ -465,14 +466,63 @@ export const bytesToGB = (b: number): number => b / GB;
 // RAM comes from `SystemInfo.ram_gb`, which is GiB. The constants mirror `src/flash_next.rs`
 // (the test in `memory-estimate.test.ts` reads that file) — change them together.
 
+/** What the memory plan needs to know about the Flash-Next being run (`Build` in `flash_next.rs`):
+ *  the weights that stay in memory and what one routed expert takes in the pool, plus what the
+ *  checkpoint takes on disk. */
+export type FlashNextBuild = {
+  /** Embeddings, attention, DeltaNet, routers, shared experts. */
+  readonly trunkBytes: number;
+  readonly expertBytes: number;
+  /** The checkpoint's own files (the pack, the 3-bit copy and the draft head come on top). */
+  readonly diskModelBytes: number;
+};
+
+/** The two builds the catalog lists (`Build::UNIFORM` / `Build::MIXED`): the server's numbers,
+ *  with the token embedding read from disk (its default). */
+export const FLASH_NEXT_BUILDS = {
+  /** `pipenetwork/Qwen3.8-Flash-Next-MLX-4bit`, every matrix at 4 bits. */
+  uniform: { trunkBytes: 3_025_000_000, expertBytes: 2_764_800, diskModelBytes: 97e9 },
+  /** `pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit`, the dense matrices at 8 bits. */
+  mixed: { trunkBytes: 5_132_000_000, expertBytes: 2_764_800, diskModelBytes: 106e9 },
+} as const satisfies Record<string, FlashNextBuild>;
+
+/** One expert of the 3-bit copy (`Build::COPY_EXPERT_BYTES`). */
+export const FLASH_NEXT_COPY_EXPERT_BYTES = 2_150_400;
+
+/** The build at `modelId` (a repo id or a folder; `Build::of`): the mixed one when its name says
+ *  so, else the uniform one, which is also what a missing id gets. */
+export function flashNextBuildOf(modelId: string | null | undefined): FlashNextBuild {
+  return (modelId ?? "").toLowerCase().includes("mixed") ? FLASH_NEXT_BUILDS.mixed : FLASH_NEXT_BUILDS.uniform;
+}
+
+/** The same build serving its 3-bit copy of the experts (`Build::serving_copy`). */
+export function flashNextServingCopy(build: FlashNextBuild): FlashNextBuild {
+  return { ...build, expertBytes: FLASH_NEXT_COPY_EXPERT_BYTES };
+}
+
+/** The build a launch of `modelId` runs with `env` (what it carries, see `flashNextEnv`): its
+ *  checkpoint's, with the copy's experts when the launch serves the copy (`Build::of_installed`;
+ *  here an override of the copy's variable counts too, as the server reads it). */
+export function flashNextLaunchBuild(
+  modelId: string | null | undefined,
+  env: Record<string, string>,
+): FlashNextBuild {
+  const build = flashNextBuildOf(modelId);
+  return copyInUse(env) ? flashNextServingCopy(build) : build;
+}
+
+/** The smallest pool the server runs with: a staging region plus a layer, 2 x 512 slots. */
+export function flashNextPoolFloor(build: FlashNextBuild): number {
+  return 2 * 512 * build.expertBytes;
+}
+
+/** Room for three layers (1,536 slots): the pool lends a second staging region and prefill reads
+ *  the next layer while it computes the current one. Below it prefill is slower, nothing fails. */
+export function flashNextPoolPrefetch(build: FlashNextBuild): number {
+  return 3 * 512 * build.expertBytes;
+}
+
 export const FLASH_NEXT = {
-  trunkBytes: 3.6e9,
-  expertBytes: 2.76e6,
-  /** The smallest pool the server runs with: a staging region plus a layer, 2 x 512 slots. */
-  poolFloorBytes: 2_826_240_000,
-  /** Room for three layers (1,536 slots): the pool lends a second staging region and prefill
-   *  reads the next layer while it computes the current one. Below it prefill is slower. */
-  poolPrefetchBytes: 4_239_360_000,
   /** A "tight" machine (the GPU may use less than `tightBelowBytes`) takes the smaller values. */
   defaultChunk: 1024,
   tightChunk: 512,
@@ -498,8 +548,7 @@ export const FLASH_NEXT = {
    *  load (`LUMEN_MEMORY_PLAN_RECLAIMABLE`, on by default): 2 GB, or 5% of RAM if more. */
   liveHeadroomBytes: 2e9,
   liveHeadroomRamShare: 0.05,
-  /** What it takes on disk. */
-  diskModelBytes: 97e9,
+  /** What the options take on disk (the checkpoint's own size is its build's). */
   diskPackBytes: 68e9,
   diskMtpBytes: 1.5e9,
 } as const;
@@ -544,6 +593,8 @@ export function flashNextUsableNow(
 
 /** What the memory is spent on for a GPU that may use `usableBytes`. */
 export type FlashNextPlan = {
+  /** The build the plan is for. */
+  build: FlashNextBuild;
   chunk: number;
   /** The longest prompt the plan holds KV and attention scores for. */
   ctxTokens: number;
@@ -558,23 +609,41 @@ export type FlashNextPlan = {
   poolBytes: number;
 };
 
-/** The server's plan. `chunk` and `ctxTokens` are what `LUMEN_QWEN35_PREFILL_CHUNK` and
- *  `LUMEN_MAX_PROMPT_TOKENS` / `LUMEN_MAX_CTX` set; null/undefined take the machine's default. */
+/** The prefill chunk the server takes on a GPU that may use `usableBytes` when nothing sets it
+ *  (`default_chunk`): 1,024 tokens, 512 on a tight machine. The same for every build. */
+function flashNextDefaultChunk(usableBytes: number): number {
+  const F = FLASH_NEXT;
+  return usableBytes < F.tightBelowBytes ? F.tightChunk : F.defaultChunk;
+}
+
+/** The prompt length the server plans for on a GPU that may use `usableBytes` when nothing sets
+ *  it (`default_context`: 16,384 tokens, 8,192 on a tight machine); the value the app sends
+ *  Flash-Next as `LUMEN_MAX_PROMPT_TOKENS`. The same for every build. */
+export function flashNextDefaultContext(usableBytes: number): number {
+  const F = FLASH_NEXT;
+  return usableBytes < F.tightBelowBytes ? F.tightContext : F.defaultContext;
+}
+
+/** The server's plan for `build`. `chunk` and `ctxTokens` are what `LUMEN_QWEN35_PREFILL_CHUNK`
+ *  and `LUMEN_MAX_PROMPT_TOKENS` / `LUMEN_MAX_CTX` set; null/undefined take the machine's
+ *  default. */
 export function flashNextPlan(
+  build: FlashNextBuild,
   usableBytes: number,
   chunk?: number | null,
   ctxTokens?: number | null,
 ): FlashNextPlan {
   const F = FLASH_NEXT;
   const tight = usableBytes < F.tightBelowBytes;
-  const c = chunk ?? (tight ? F.tightChunk : F.defaultChunk);
-  const x = ctxTokens ?? (tight ? F.tightContext : F.defaultContext);
+  const c = chunk ?? flashNextDefaultChunk(usableBytes);
+  const x = ctxTokens ?? flashNextDefaultContext(usableBytes);
   const budget = tight ? F.tightScoresBudgetBytes : F.scoresBudgetBytes;
   const scores = Math.min(F.attentionHeads * c * x * 4, budget);
   const buffers = F.reserveBaseBytes + c * F.reservePerTokenBytes;
   const kv = x * F.kvBytesPerToken;
   const reserve = buffers + kv + Math.floor(scores / 2);
   return {
+    build,
     chunk: c,
     ctxTokens: x,
     tight,
@@ -582,13 +651,19 @@ export function flashNextPlan(
     kvBytes: kv,
     scoresBytes: Math.floor(scores / 2),
     reserveBytes: reserve,
-    poolBytes: Math.max(0, usableBytes - F.trunkBytes - reserve),
+    poolBytes: Math.max(0, usableBytes - build.trunkBytes - reserve),
   };
+}
+
+/** The pool `auto` gives when the server plans within `usableNowBytes` (see `flashNextUsableNow`):
+ *  what is left after the plan's trunk and reserve (`MemoryPlan::pool_within`). */
+export function flashNextPlanPoolWithin(plan: FlashNextPlan, usableNowBytes: number): number {
+  return Math.max(0, usableNowBytes - plan.build.trunkBytes - plan.reserveBytes);
 }
 
 /** The trunk, the smallest pool and the reserve fit the usable memory. */
 export function flashNextPlanFits(plan: FlashNextPlan): boolean {
-  return plan.poolBytes >= FLASH_NEXT.poolFloorBytes;
+  return plan.poolBytes >= flashNextPoolFloor(plan.build);
 }
 
 /** The longest prompt the server plans memory for, from its prompt cap and `LUMEN_MAX_CTX`
@@ -606,13 +681,6 @@ const positiveInt = (v: string | undefined): number | null => {
   const t = v?.trim();
   return t && /^\+?\d+$/.test(t) && Number(t) > 0 ? Number(t) : null;
 };
-
-/** The prompt length the server plans for on a GPU that may use `usableBytes` when nothing sets
- *  it (16,384 tokens, 8,192 on a tight machine); the value the app sends Flash-Next as
- *  `LUMEN_MAX_PROMPT_TOKENS`. */
-export function flashNextDefaultContext(usableBytes: number): number {
-  return flashNextPlan(usableBytes).ctxTokens;
-}
 
 /** What a launch plans for, from the settings the app holds. `LUMEN_MAX_PROMPT_TOKENS` is the
  *  user's override when there is one, else the machine's default (what the app sends); the Max
@@ -643,28 +711,30 @@ export function flashNextLaunchContext(
   };
 }
 
-/** Whether a Mac with `ramGb` GiB runs the model at its default plan. */
-export function flashNextFits(ramGb: number, memoryLimitGb?: number | null): boolean {
-  return flashNextPlanFits(flashNextPlan(flashNextUsableBytes(ramGb, memoryLimitGb)));
+/** Whether a Mac with `ramGb` GiB runs `build` at its default plan. */
+export function flashNextFits(build: FlashNextBuild, ramGb: number, memoryLimitGb?: number | null): boolean {
+  return flashNextPlanFits(flashNextPlan(build, flashNextUsableBytes(ramGb, memoryLimitGb)));
 }
 
-/** RAM (GiB) below which the model cannot run at its default plan. */
-export function flashNextMinRamGb(): number {
-  for (let gib = 1; gib <= 1024; gib++) if (flashNextFits(gib)) return gib;
+/** RAM (GiB) below which `build` cannot run at its default plan. */
+export function flashNextMinRamGb(build: FlashNextBuild): number {
+  for (let gib = 1; gib <= 1024; gib++) if (flashNextFits(build, gib)) return gib;
   return 1024;
 }
 
-/** The longest prompt (tokens) the plan can hold beside `poolBytes` (`null` = the smallest
- *  pool, i.e. the most this Mac can hold at all). 0 when not even an empty prompt fits. */
+/** The longest prompt (tokens) the plan for `build` can hold beside `poolBytes` (`null` = the
+ *  smallest pool, i.e. the most this Mac can hold at all). 0 when not even an empty prompt fits. */
 export function flashNextMaxContext(
+  build: FlashNextBuild,
   usableBytes: number,
   chunk?: number | null,
   poolBytes?: number | null,
 ): number {
   const F = FLASH_NEXT;
-  const pool = Math.max(poolBytes ?? F.poolFloorBytes, F.poolFloorBytes);
+  const floor = flashNextPoolFloor(build);
+  const pool = Math.max(poolBytes ?? floor, floor);
   const fits = (ctx: number) =>
-    F.trunkBytes + pool + flashNextPlan(usableBytes, chunk, ctx).reserveBytes <= usableBytes;
+    build.trunkBytes + pool + flashNextPlan(build, usableBytes, chunk, ctx).reserveBytes <= usableBytes;
   if (!fits(0)) return 0;
   let lo = 0;
   let hi = F.maxContext;
@@ -677,12 +747,13 @@ export function flashNextMaxContext(
 }
 
 /** Upper bound for a pool typed by hand: RAM at the app's usual 85% share, less the trunk. */
-export function flashNextMaxPoolGb(ramGb: number): number {
-  const gb = Math.floor((ramGb * GB * 0.85 - FLASH_NEXT.trunkBytes) / 1e9);
-  return Math.max(gb, FLASH_NEXT.poolFloorBytes / 1e9);
+export function flashNextMaxPoolGb(build: FlashNextBuild, ramGb: number): number {
+  const gb = Math.floor((ramGb * GB * 0.85 - build.trunkBytes) / 1e9);
+  return Math.max(gb, flashNextPoolFloor(build) / 1e9);
 }
 
 export type FlashNextConfig = {
+  build: FlashNextBuild;
   usableBytes: number;
   /** Expert pool in bytes; `null` = `auto` (the plan's). Raised to the floor if smaller. */
   poolBytes: number | null;
@@ -707,21 +778,22 @@ export type FlashNextEstimate = {
 };
 
 export function flashNextEstimate(cfg: FlashNextConfig): FlashNextEstimate {
-  const F = FLASH_NEXT;
-  const plan = flashNextPlan(cfg.usableBytes, cfg.chunk, cfg.ctxTokens);
+  const b = cfg.build;
+  const plan = flashNextPlan(b, cfg.usableBytes, cfg.chunk, cfg.ctxTokens);
   const wanted = cfg.poolBytes ?? plan.poolBytes;
-  const pool = Math.max(wanted, F.poolFloorBytes);
-  const resident = F.trunkBytes + pool + plan.reserveBytes;
+  const floor = flashNextPoolFloor(b);
+  const pool = Math.max(wanted, floor);
+  const resident = b.trunkBytes + pool + plan.reserveBytes;
   return {
     usableBytes: cfg.usableBytes,
     plan,
     poolBytes: pool,
-    poolRaisedToFloor: wanted < F.poolFloorBytes,
+    poolRaisedToFloor: wanted < floor,
     residentBytes: resident,
     utilization: resident / cfg.usableBytes,
     // A byte of float slack: with `auto` the sum is `usable` by construction.
     fits: resident <= cfg.usableBytes + 1,
-    oneStagingRegion: pool < F.poolPrefetchBytes,
+    oneStagingRegion: pool < flashNextPoolPrefetch(b),
   };
 }
 
@@ -739,11 +811,14 @@ export function flashNextEstimate(cfg: FlashNextConfig): FlashNextEstimate {
 //   tokens/s          = 1000 / time_per_token_ms
 //
 // The constants mirror `flash_next.rs` (`memory-estimate.test.ts` reads that file), and were
-// calibrated on one machine, the reference below. Until this Mac is measured the card shows that
-// machine's table as reference material and promises nothing for this Mac.
+// calibrated on one machine, the reference below, with the uniform build. Until this Mac is
+// measured the card shows that machine's table as reference material and promises nothing for
+// this Mac. The model is the uniform build's for every build, its floor included.
 
 export const FLASH_NEXT_SPEED_MODEL = {
-  /** GB streamed through memory per token: the 1.325 GB of experts a token routes to + the trunk. */
+  /** GB streamed through memory per token: the 1.325 GB of experts a token routes to + the trunk
+   *  (fitted with the 3.6 GB the plan assumed before the server sized the trunk itself: the split
+   *  between it and `otherMs` is the fit's, not a measurement). */
   streamGb: 4.925,
   /** Per-token ms that do not scale with memory bandwidth (dispatch, synchronisation). */
   otherMs: 23.7,
@@ -821,7 +896,7 @@ export function flashNextDecodeTps(
   if (!positive(poolGb) || !positive(memoryGbps) || !positive(ssdRandomGbps)) return null;
   const M = FLASH_NEXT_SPEED_MODEL;
   // The engine runs no pool under its floor (1,024 slots): a smaller one is that floor.
-  const pool = Math.max(poolGb, FLASH_NEXT.poolFloorBytes / 1e9);
+  const pool = Math.max(poolGb, flashNextPoolFloor(FLASH_NEXT_BUILDS.uniform) / 1e9);
   const efficiency = pack ? M.ssdEfficiencyPack : M.ssdEfficiencyShards;
   const fixedMs = (M.streamGb / memoryGbps) * 1000 + M.otherMs;
   const missGb = (1 - flashNextHitRate(pool)) * M.expertGbPerToken;
@@ -863,10 +938,10 @@ export function flashNextSlowSsd(hw: FlashNextHardware | null): boolean {
   return hw != null && hw.ssdRandomGbps < FLASH_NEXT_SPEED_MODEL.slowSsdGbps;
 }
 
-/** Disk the model needs, bytes: the shipped weights plus the optional pack and draft head. */
-export function flashNextDiskBytes(opts: { pack: boolean; mtp: boolean }): number {
+/** Disk `build` needs, bytes: its shipped weights plus the optional pack and draft head. */
+export function flashNextDiskBytes(build: FlashNextBuild, opts: { pack: boolean; mtp: boolean }): number {
   return (
-    FLASH_NEXT.diskModelBytes +
+    build.diskModelBytes +
     (opts.pack ? FLASH_NEXT.diskPackBytes : 0) +
     (opts.mtp ? FLASH_NEXT.diskMtpBytes : 0)
   );
@@ -881,8 +956,6 @@ export const FLASH_NEXT_POOL_PRESETS_GB = [4, 6, 8, 12, 16, 20] as const;
 export const FLASH_NEXT_PROMPT_PRESETS = [8_192, 16_384, 32_768, 65_536, 131_072] as const;
 export const FLASH_NEXT_LANE_PRESETS = [8, 16, 32, 64] as const;
 export const FLASH_NEXT_LANES_DEFAULT = 32;
-/** The smallest pool a hand-typed value may name: just above the server's floor. */
-export const FLASH_NEXT_POOL_MIN_GB = 2.9;
 
 /** A pool size in GB as typed: `8`, `8g`, `8GB`, `12.5g` (any case, spaces allowed). `null` when
  *  it is not a positive number. The server reads the same forms. */
@@ -936,6 +1009,7 @@ export type FlashNextPoolChip = {
 /** What a pool chip shows: `gb` null is `auto`. A preset larger than the pool that fits at the
  *  current prompt is not offered (the server would lower it and log it). */
 export function flashNextPoolChip(a: {
+  build: FlashNextBuild;
   usableBytes: number;
   chunk: number;
   ctxTokens: number;
@@ -944,10 +1018,10 @@ export function flashNextPoolChip(a: {
   /** This Mac's measured numbers; without them a chip shows no speed. */
   hw: FlashNextHardware | null;
 }): FlashNextPoolChip {
-  const plan = flashNextPlan(a.usableBytes, a.chunk, a.ctxTokens);
+  const plan = flashNextPlan(a.build, a.usableBytes, a.chunk, a.ctxTokens);
   const planFits = flashNextPlanFits(plan);
   const wanted = a.gb == null ? plan.poolBytes : a.gb * 1e9;
-  const poolBytes = Math.max(wanted, FLASH_NEXT.poolFloorBytes);
+  const poolBytes = Math.max(wanted, flashNextPoolFloor(a.build));
   return {
     poolBytes,
     tps: flashNextChipTps(poolBytes, a.pack, a.hw),
@@ -958,11 +1032,16 @@ export function flashNextPoolChip(a: {
 
 /** What a prompt chip shows: the pool `auto` leaves with that longest prompt. Under the floor the
  *  model does not fit with it. */
-export function flashNextPromptChip(a: { usableBytes: number; chunk: number; tokens: number }): {
+export function flashNextPromptChip(a: {
+  build: FlashNextBuild;
+  usableBytes: number;
+  chunk: number;
+  tokens: number;
+}): {
   poolBytes: number;
   fits: boolean;
 } {
-  const plan = flashNextPlan(a.usableBytes, a.chunk, a.tokens);
+  const plan = flashNextPlan(a.build, a.usableBytes, a.chunk, a.tokens);
   return { poolBytes: plan.poolBytes, fits: flashNextPlanFits(plan) };
 }
 
@@ -1030,6 +1109,8 @@ export function mtpInUse(mode: "off" | "auto" | "on", status: FlashNextModelStat
 /** What the settings run with, for the summary line: the plan's pool and prompt, whether the
  *  pack, the 3-bit copy and the draft head are in use, and the decode speed that estimates. */
 export function flashNextEffective(a: {
+  /** What the launch runs: `flashNextLaunchBuild` of the model and this `env`. */
+  build: FlashNextBuild;
   env: Record<string, string>;
   contextMax?: number;
   usableBytes: number;
@@ -1040,13 +1121,13 @@ export function flashNextEffective(a: {
   const poolGb = parseGbInput(a.env.LUMEN_MOE_EXPERT_CACHE_GB ?? "");
   const poolExplicit = poolGb != null && a.env.LUMEN_MOE_EXPERT_CACHE_GB?.trim().toLowerCase() !== "auto";
   const chunkEnv = positiveInt(a.env.LUMEN_QWEN35_PREFILL_CHUNK);
-  const defaults = flashNextPlan(a.usableBytes);
-  const chunk = chunkEnv ?? defaults.chunk;
+  const chunk = chunkEnv ?? flashNextDefaultChunk(a.usableBytes);
   const launch = flashNextLaunchContext(a.env, a.contextMax, a.usableBytes);
   const copy = copyInUse(a.env);
   const pack = packInUse(envChoice(a.env.LUMEN_MOE_PACK, ["auto", "off", "build"] as const, "auto"), a.status, copy);
   const head = mtpInUse(mtpMode(a.env.LUMEN_QWEN4_MTP), a.status);
   const estimate = flashNextEstimate({
+    build: a.build,
     usableBytes: a.usableBytes,
     poolBytes: poolExplicit ? poolGb! * 1e9 : null,
     chunk,
@@ -1062,7 +1143,7 @@ export function flashNextEffective(a: {
     copy,
     head,
     tps: flashNextChipTps(estimate.poolBytes, pack, a.hw ?? null),
-    machineDefaultPrompt: defaults.ctxTokens,
+    machineDefaultPrompt: flashNextDefaultContext(a.usableBytes),
     launch,
   };
 }

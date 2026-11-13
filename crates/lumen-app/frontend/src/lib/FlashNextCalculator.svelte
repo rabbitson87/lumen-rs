@@ -14,6 +14,7 @@
     FLASH_NEXT,
     FLASH_NEXT_DECODE_TPS,
     FLASH_NEXT_SPEED_MODEL,
+    type FlashNextBuild,
     flashNextChipTps,
     flashNextDiskBytes,
     flashNextEffective,
@@ -22,6 +23,9 @@
     flashNextMinRamGb,
     flashNextPlan,
     flashNextPlanFits,
+    flashNextPlanPoolWithin,
+    flashNextPoolFloor,
+    flashNextPoolPrefetch,
     flashNextSlowSsd,
     flashNextUsableBytes,
     flashNextUsableNow,
@@ -32,6 +36,8 @@
     ramGb?: number;
     /** The cap on MLX memory in GiB the launch will carry (`LUMEN_MEMORY_LIMIT_GB`); `null` = none. */
     memoryLimitGb?: number | null;
+    /** The build that launch runs (`flashNextLaunchBuild` of the model shown and `env`). */
+    build: FlashNextBuild;
     /** What a launch carries: the Flash-Next settings, replaced by env overrides of the same name. */
     env: Record<string, string>;
     /** Current structured `context.max` (reaches the server as `LUMEN_MAX_CTX`). */
@@ -49,6 +55,7 @@
   let {
     ramGb,
     memoryLimitGb = null,
+    build,
     env,
     contextMax,
     memoryNow = null,
@@ -63,24 +70,23 @@
   const ram = $derived(ramGb && ramGb > 0 ? ramGb : 16);
   const usable = $derived(flashNextUsableBytes(ram, memoryLimitGb));
   // What the server does on this Mac when nothing is overridden.
-  const defaults = $derived(flashNextPlan(usable));
+  const defaults = $derived(flashNextPlan(build, usable));
   // This Mac's measured memory and SSD speeds; without both there is no estimate for it.
   const measured = $derived(flashNextHardware(status?.hardware));
   const hw = $derived(measured.hw);
-  const eff = $derived(flashNextEffective({ env, contextMax, usableBytes: usable, status, hw }));
+  const eff = $derived(flashNextEffective({ build, env, contextMax, usableBytes: usable, status, hw }));
 
   const chunk = $derived(eff.chunk);
 
   const est = $derived(eff.estimate);
   // Whether the model runs at this chunk and prompt at all (the smallest pool fits).
   const loads = $derived(flashNextPlanFits(est.plan));
-  const loadNeed = $derived(
-    FLASH_NEXT.trunkBytes + FLASH_NEXT.poolFloorBytes + est.plan.reserveBytes,
-  );
-  const longestAtFloor = $derived(flashNextMaxContext(usable, chunk, null));
+  const floor = $derived(flashNextPoolFloor(build));
+  const loadNeed = $derived(build.trunkBytes + floor + est.plan.reserveBytes);
+  const longestAtFloor = $derived(flashNextMaxContext(build, usable, chunk, null));
   // Longest prompt: beside the chosen pool, or with `auto` before the pool is squeezed to its floor.
-  const maxCtx = $derived(flashNextMaxContext(usable, chunk, eff.poolExplicit ? est.poolBytes : null));
-  const minRam = $derived(flashNextMinRamGb());
+  const maxCtx = $derived(flashNextMaxContext(build, usable, chunk, eff.poolExplicit ? est.poolBytes : null));
+  const minRam = $derived(flashNextMinRamGb(build));
   // What the pool decodes at here, and with the expert pack when it is not what is read now (nor
   // the 3-bit copy, which replaces it).
   const tpsPack = $derived(eff.pack || eff.copy ? null : flashNextChipTps(est.poolBytes, true, hw));
@@ -93,7 +99,7 @@
   // The 3-bit copy is served only once it is on disk, so its own size is what it takes.
   const copyBytes = $derived(eff.copy && status?.copy === "complete" ? status.copy_bytes : 0);
   const disk = $derived(
-    flashNextDiskBytes({
+    flashNextDiskBytes(build, {
       pack: eff.pack || buildsPack,
       mtp: status?.mtp_present === true,
     }) + copyBytes,
@@ -116,8 +122,8 @@
       memoryNow.server_footprint_bytes ?? 0,
     );
     if (usable - within < 0.05e9) return null;
-    const pool = Math.max(0, within - FLASH_NEXT.trunkBytes - est.plan.reserveBytes);
-    return { within, below: usable - within, pool, floor: pool < FLASH_NEXT.poolFloorBytes };
+    const pool = flashNextPlanPoolWithin(est.plan, within);
+    return { within, below: usable - within, pool, floor: pool < floor };
   });
 
   const gb = (b: number, d = 1) => (b / 1e9).toFixed(d);
@@ -145,7 +151,7 @@
         {fill(t("flashnext.freeNow.floor"), {
           now: gb(freeNow.within),
           below: gb(freeNow.below),
-          floor: gb(FLASH_NEXT.poolFloorBytes, 2),
+          floor: gb(floor, 2),
         })}
       {:else}
         {fill(t("flashnext.freeNow"), {
@@ -175,9 +181,9 @@
   <div class="dim text-[10px] mb-2.5 leading-snug">
     {t("flashnext.pool.hint")}
     {#if est.poolRaisedToFloor}
-      <span class="text-warn">{fill(t("flashnext.pool.floor"), { floor: gb(FLASH_NEXT.poolFloorBytes, 2) })}</span>
+      <span class="text-warn">{fill(t("flashnext.pool.floor"), { floor: gb(floor, 2) })}</span>
     {:else if est.oneStagingRegion}
-      <span>{fill(t("flashnext.pool.oneRegion"), { gb: gb(FLASH_NEXT.poolPrefetchBytes) })}</span>
+      <span>{fill(t("flashnext.pool.oneRegion"), { gb: gb(flashNextPoolPrefetch(build)) })}</span>
     {/if}
   </div>
 
@@ -195,7 +201,7 @@
     </span>
   </div>
   <div class="grid grid-cols-[1fr_auto] gap-x-3 gap-y-0.5 text-[10.5px] mono mb-2">
-    <span class="dim">{t("flashnext.row.trunk")}</span><span class="text-right">{gb(FLASH_NEXT.trunkBytes, 2)} GB</span>
+    <span class="dim">{t("flashnext.row.trunk")}</span><span class="text-right">{gb(build.trunkBytes, 2)} GB</span>
     <span class="dim">{t("flashnext.row.pool")}</span><span class="text-right">{gb(est.poolBytes, 2)} GB</span>
     <span class="dim">{t("flashnext.row.buffers")}</span><span class="text-right">{gb(est.plan.buffersBytes, 2)} GB</span>
     <span class="dim">{t("flashnext.row.kv")}</span><span class="text-right">{gb(est.plan.kvBytes, 2)} GB</span>
@@ -214,7 +220,7 @@
   <div class="flex items-baseline justify-between gap-2 mb-2">
     <span class="text-[11px] shrink-0">
       {!eff.poolExplicit
-        ? fill(t("flashnext.maxCtx.auto"), { floor: gb(FLASH_NEXT.poolFloorBytes, 1) })
+        ? fill(t("flashnext.maxCtx.auto"), { floor: gb(floor, 1) })
         : t("flashnext.maxCtx.manual")}
     </span>
     <span class="mono font-semibold whitespace-nowrap {maxCtx > 0 ? 'text-ok' : 'text-err'}">{fmtTok(maxCtx)} tok</span>
@@ -305,7 +311,7 @@
     <span class="mono whitespace-nowrap">{gb(disk, 1)} GB</span>
   </div>
   <div class="dim text-[10px] mb-1 leading-snug">
-    {fill(t("flashnext.disk.detail"), { model: gb(FLASH_NEXT.diskModelBytes, 0) })}{eff.pack || buildsPack
+    {fill(t("flashnext.disk.detail"), { model: gb(build.diskModelBytes, 0) })}{eff.pack || buildsPack
       ? ` + ${gb(FLASH_NEXT.diskPackBytes, 0)} ${t("flashnext.disk.pack")}`
       : ""}{copyBytes > 0 ? ` + ${gb(copyBytes, 0)} ${t("flashnext.disk.copy")}` : ""}{status?.mtp_present
       ? ` + ${gb(FLASH_NEXT.diskMtpBytes, 1)} ${t("flashnext.disk.mtp")}`

@@ -25,7 +25,6 @@
   import type { Chip } from "./chips";
   import { fill } from "./format";
   import {
-    FLASH_NEXT,
     FLASH_NEXT_COPY_ENV_KEY,
     FLASH_NEXT_LANE_PRESETS,
     FLASH_NEXT_LANES_DEFAULT,
@@ -35,7 +34,10 @@
     flashNextEnv,
     flashNextHardware,
     flashNextIsDefault,
+    flashNextLaunchBuild,
     flashNextPlan,
+    flashNextPlanPoolWithin,
+    flashNextPoolFloor,
     flashNextShadowedKeys,
     flashNextUsableBytes,
     flashNextUsableNow,
@@ -49,6 +51,8 @@
     settings: FlashNextSettings;
     /** The env overrides: the escape hatch, applied after the settings, so they win. */
     overrides: Record<string, string>;
+    /** The Flash-Next model the card plans for (its id or folder names its build); `null` = none. */
+    modelId: string | null;
     /** The Flash-Next model is the selected one: the controls work. */
     enabled: boolean;
     ramGb?: number;
@@ -77,6 +81,7 @@
   let {
     settings,
     overrides,
+    modelId,
     enabled,
     ramGb,
     memoryLimitGb = null,
@@ -99,10 +104,12 @@
   // What a launch carries: the settings (and the 3-bit copy once it is built), replaced by
   // overrides of the same name.
   const env = $derived(flashNextEnv(settings, overrides, status));
+  // The build that launch runs: the model's, with the copy's experts while the copy is served.
+  const build = $derived(flashNextLaunchBuild(modelId, env));
   // This Mac's measured memory and SSD speeds; the card shows no speed for it until both exist.
   const hw = $derived(flashNextHardware(status?.hardware).hw);
-  const eff = $derived(flashNextEffective({ env, contextMax, usableBytes: usable, status, hw }));
-  const defaults = $derived(flashNextPlan(usable));
+  const eff = $derived(flashNextEffective({ build, env, contextMax, usableBytes: usable, status, hw }));
+  const defaults = $derived(flashNextPlan(build, usable));
   const shadowed = $derived(flashNextShadowedKeys(overrides));
   const off = $derived(!enabled);
 
@@ -172,8 +179,8 @@
       memoryNow.server_footprint_bytes ?? 0,
     );
     if (usable - within < 0.05e9) return null;
-    const pool = within - FLASH_NEXT.trunkBytes - eff.estimate.plan.reserveBytes;
-    return Math.max(FLASH_NEXT.poolFloorBytes, Math.min(pool, eff.estimate.poolBytes));
+    const pool = flashNextPlanPoolWithin(eff.estimate.plan, within);
+    return Math.max(flashNextPoolFloor(build), Math.min(pool, eff.estimate.poolBytes));
   });
 
   const summary = $derived(
@@ -241,6 +248,7 @@
           <div class="mono text-[9.5px] text-text-dim">LUMEN_MOE_EXPERT_CACHE_GB</div>
         </div>
         <PoolPicker
+          {build}
           gb={poolGb}
           usableBytes={usable}
           chunk={eff.chunk}
@@ -264,6 +272,7 @@
             explicit={eff.promptExplicit}
             machineDefault={defaults.ctxTokens}
             {maxCtxLowers}
+            {build}
             usableBytes={usable}
             chunk={eff.chunk}
             disabled={off}
@@ -484,6 +493,7 @@
       <FlashNextCalculator
         {ramGb}
         {memoryLimitGb}
+        {build}
         {env}
         {contextMax}
         {memoryNow}
