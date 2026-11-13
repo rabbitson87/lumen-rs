@@ -102,9 +102,18 @@ jobs:
           xcrun metal --version || true
 
       # ── Toolchains ────────────────────────────────────────────────
+      # Pinned to 1.99.1, the last toolchain the release built with. Cargo 1.100 lays
+      # build scripts out as `build/<pkg>/<hash>/out`, one level deeper, and
+      # tauri-build 2.6.2 finds the target dir by walking three levels up from
+      # OUT_DIR. On 1.100 that lands on `release/build`, takes the
+      # `build/lumen-server` directory for the sidecar, and its `remove_file` fails
+      # with "Operation not permitted" (the v0.15.0 tag's first run). tauri-build
+      # 2.7.4 finds the `build` dir by name instead; return to `@stable` once the app
+      # is on it.
       - name: Install Rust toolchain (with matrix target)
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry + git + target/
