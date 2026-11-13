@@ -5,6 +5,7 @@
     type CheckResult,
     type OverallHealth,
     type FlashNextStatus,
+    type BuildKind,
     type PackProgress,
   } from "./api";
   import PackBuildControl from "./PackBuildControl.svelte";
@@ -128,6 +129,17 @@
         if (cut) return fill("doctor.msg.flash_next_pack.incomplete", { gb: cut[1], full: cut[2] });
         return m;
       }
+      case "flash_next_copy": {
+        if (m === "no 3-bit copy (optional)") return t("doctor.msg.flash_next_copy.absent");
+        const present = m.match(/^experts\.3b64\.top\.lpack present \((\d+) GB\), (served|not served \(the copy setting is off\))$/);
+        if (present)
+          return fill(present[2] === "served" ? "doctor.msg.flash_next_copy.served" : "doctor.msg.flash_next_copy.off", {
+            gb: present[1],
+          });
+        const cut = m.match(/^experts\.3b64\.top\.lpack incomplete \((\d+) GB of (\d+) GB\)$/);
+        if (cut) return fill("doctor.msg.flash_next_copy.incomplete", { gb: cut[1], full: cut[2] });
+        return m;
+      }
       case "flash_next_mtp":
         if (m === "draft head present (mtp.safetensors)") return t("doctor.msg.flash_next_mtp.present");
         if (m.startsWith("draft head installed, not used")) return t("doctor.msg.flash_next_mtp.off");
@@ -197,6 +209,7 @@
     if (h.includes("An expert pack makes decode")) return t("doctor.hint.flash_next_disk.room");
     if (h.includes("The expert pack is optional")) return t("doctor.hint.flash_next_disk.noRoom");
     if (h.includes("ignores an unfinished pack")) return t("doctor.hint.flash_next_pack.incomplete");
+    if (h.includes("An unfinished copy is not served")) return t("doctor.hint.flash_next_copy.incomplete");
     if (h.includes("refuses to start with")) return t("doctor.hint.flash_next_mtp.required");
     if (h.includes("The draft head (1.5 GB")) return t("doctor.hint.flash_next_mtp.absent");
     if (h.includes("Decode speed is set by how fast")) return t("doctor.hint.flash_next_ssd.slow");
@@ -217,6 +230,8 @@
       );
     if (d.includes("Without the pack the server reads each expert"))
       return t("doctor.detail.flash_next_pack.absent");
+    if (d.includes("The copy keeps the top 3 bits of every routed expert"))
+      return t("doctor.detail.flash_next_copy.absent");
     if (c.id === "flash_next_ssd") {
       // "Read 1074 MB of model-00006.safetensors with the page cache bypassed: 537 MB front to
       // back, then 537 MB as 194 random 2.8 MB reads on 4 threads, the way the server fetches
@@ -256,11 +271,12 @@
   interface Props {
     report: DoctorReport | null;
     onReport: (r: DoctorReport) => void;
-    /** Flash-Next's pack state and build, for the pack row's Build button. */
+    /** Flash-Next's files and builds, for the Build buttons of the pack and copy rows. */
     flashStatus?: FlashNextStatus | null;
-    packBuild?: PackProgress | null;
-    onBuildPack?: () => Promise<void>;
-    onCancelPackBuild?: () => Promise<void>;
+    builds?: Record<BuildKind, PackProgress | null>;
+    onBuild?: (kind: BuildKind) => Promise<void>;
+    /** Stops whichever build runs. */
+    onCancelBuild?: () => Promise<void>;
     /** The SSD test finished and its numbers were stored: the card's estimate may have changed. */
     onProbed?: () => void;
   }
@@ -268,11 +284,14 @@
     report,
     onReport,
     flashStatus = null,
-    packBuild = null,
-    onBuildPack,
-    onCancelPackBuild,
+    builds = { pack: null, copy: null },
+    onBuild,
+    onCancelBuild,
     onProbed,
   }: Props = $props();
+
+  // The doctor rows that carry a Build button, and what each builds.
+  const BUILD_ROWS: Record<string, BuildKind> = { flash_next_pack: "pack", flash_next_copy: "copy" };
 
   let running = $state(false);
   let busyAction = $state<string | null>(null);
@@ -419,13 +438,15 @@
               {#if c.fix_command}
                 <div class="mono px-2 py-1 bg-bg rounded text-accent mb-2 select-text overflow-x-auto">$ {c.fix_command}</div>
               {/if}
-              {#if c.id === "flash_next_pack" && onBuildPack && onCancelPackBuild}
+              {#if BUILD_ROWS[c.id] && onBuild && onCancelBuild}
+                {@const kind = BUILD_ROWS[c.id]}
                 <div class="mb-2">
                   <PackBuildControl
+                    {kind}
                     status={flashStatus}
-                    build={packBuild}
-                    onBuild={onBuildPack}
-                    onCancel={onCancelPackBuild}
+                    build={builds[kind]}
+                    onBuild={() => onBuild(kind)}
+                    onCancel={onCancelBuild}
                   />
                 </div>
               {/if}

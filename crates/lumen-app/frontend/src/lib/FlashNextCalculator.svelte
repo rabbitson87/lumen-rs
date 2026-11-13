@@ -81,19 +81,22 @@
   // Longest prompt: beside the chosen pool, or with `auto` before the pool is squeezed to its floor.
   const maxCtx = $derived(flashNextMaxContext(usable, chunk, eff.poolExplicit ? est.poolBytes : null));
   const minRam = $derived(flashNextMinRamGb());
-  // What the pool decodes at here, and with the expert pack when it is not what is read now.
-  const tpsPack = $derived(eff.pack ? null : flashNextChipTps(est.poolBytes, true, hw));
+  // What the pool decodes at here, and with the expert pack when it is not what is read now (nor
+  // the 3-bit copy, which replaces it).
+  const tpsPack = $derived(eff.pack || eff.copy ? null : flashNextChipTps(est.poolBytes, true, hw));
   const measuredDate = $derived(
     measured.measuredAt == null ? "" : new Date(measured.measuredAt * 1000).toLocaleDateString(),
   );
   const buildsPack = $derived(
     env.LUMEN_MOE_PACK?.trim().toLowerCase() === "build" && status?.pack !== "complete",
   );
+  // The 3-bit copy is served only once it is on disk, so its own size is what it takes.
+  const copyBytes = $derived(eff.copy && status?.copy === "complete" ? status.copy_bytes : 0);
   const disk = $derived(
     flashNextDiskBytes({
       pack: eff.pack || buildsPack,
       mtp: status?.mtp_present === true,
-    }),
+    }) + copyBytes,
   );
   const overBy = $derived(Math.max(0, est.residentBytes - est.usableBytes));
   const capped = $derived(
@@ -304,7 +307,9 @@
   <div class="dim text-[10px] mb-1 leading-snug">
     {fill(t("flashnext.disk.detail"), { model: gb(FLASH_NEXT.diskModelBytes, 0) })}{eff.pack || buildsPack
       ? ` + ${gb(FLASH_NEXT.diskPackBytes, 0)} ${t("flashnext.disk.pack")}`
-      : ""}{status?.mtp_present ? ` + ${gb(FLASH_NEXT.diskMtpBytes, 1)} ${t("flashnext.disk.mtp")}` : ""}
+      : ""}{copyBytes > 0 ? ` + ${gb(copyBytes, 0)} ${t("flashnext.disk.copy")}` : ""}{status?.mtp_present
+      ? ` + ${gb(FLASH_NEXT.diskMtpBytes, 1)} ${t("flashnext.disk.mtp")}`
+      : ""}
   </div>
   <div class="dim text-[10px] leading-snug">{t("flashnext.settings.hint")}</div>
 </div>

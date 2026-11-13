@@ -21,6 +21,7 @@
     type SystemInfo,
     type FlashNextSettings,
     type FlashNextStatus,
+    type BuildKind,
     type PackProgress,
     type MemoryUsage,
     type CorsMode,
@@ -160,9 +161,10 @@
   let systemInfo = $state<SystemInfo | null>(null);
   // Whether the OS opens the app at login (a login item, read from the OS, not config.toml).
   let launchAtLogin = $state(false);
-  // The Flash-Next model on disk (pack, draft head, free space) and the latest pack build report.
+  // The Flash-Next model on disk (pack, 3-bit copy, draft head, free space) and the latest report
+  // of each kind of build (one runs at a time, but each keeps how its last run ended).
   let flashStatus = $state<FlashNextStatus | null>(null);
-  let packBuild = $state<PackProgress | null>(null);
+  let builds = $state<Record<BuildKind, PackProgress | null>>({ pack: null, copy: null });
   // The latest Measure (memory bandwidth + SSD read speed) report of this session.
   let measureReport = $state<MeasureProgress | null>(null);
   const MEASURE_STARTING: MeasureProgress = {
@@ -584,15 +586,17 @@
       }
     });
 
-    // The expert-pack build reports per layer. Its end changes what is on disk, so the status
-    // and the Doctor's rows are read again.
+    // A build (the pack's or the copy's) reports per layer. Its end changes what is on disk, so
+    // the status and the Doctor's rows are read again. A build the status does not know of yet is
+    // shown running at once, and the status read again for what it now refuses.
     unlistenPack = await onPack((p) => {
-      packBuild = p;
+      builds = { ...builds, [p.kind]: p };
       if (p.state !== "running") {
         refreshFlashStatus();
         api.doctorRun().then((r) => (doctorReport = r)).catch(() => {});
-      } else if (flashStatus && !flashStatus.building) {
-        flashStatus = { ...flashStatus, building: true };
+      } else if (flashStatus && flashStatus.building_kind !== p.kind) {
+        flashStatus = { ...flashStatus, building: true, building_kind: p.kind };
+        refreshFlashStatus();
       }
     });
 
@@ -928,13 +932,14 @@
     refreshFlashStatus();
   });
 
-  async function startPackBuild() {
-    packBuild = null;
-    await api.startPackBuild();
+  async function startBuild(kind: BuildKind) {
+    builds = { ...builds, [kind]: null };
+    await (kind === "copy" ? api.startCopyBuild() : api.startPackBuild());
     await refreshFlashStatus();
   }
 
-  async function cancelPackBuild() {
+  // Stops whichever build runs: only one does.
+  async function cancelBuild() {
     await api.cancelPackBuild();
   }
 
@@ -1417,13 +1422,13 @@
       contextMax={config.context.max}
       memoryNow={memoryUsage}
       status={flashStatus}
-      build={packBuild}
+      {builds}
       measure={measureReport}
       onChange={setFlashNext}
       onReset={resetFlashNext}
       onClearOverrides={clearFlashNextOverrides}
-      onBuild={startPackBuild}
-      onCancelBuild={cancelPackBuild}
+      onBuild={startBuild}
+      onCancelBuild={cancelBuild}
       onMeasure={startMeasure}
       onCancelMeasure={cancelMeasure}
     />
@@ -2301,9 +2306,9 @@
         report={doctorReport}
         onReport={(r) => (doctorReport = r)}
         flashStatus={flashStatus}
-        packBuild={packBuild}
-        onBuildPack={startPackBuild}
-        onCancelPackBuild={cancelPackBuild}
+        {builds}
+        onBuild={startBuild}
+        onCancelBuild={cancelBuild}
         onProbed={refreshFlashStatus}
       />
     </div>

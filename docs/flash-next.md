@@ -503,6 +503,11 @@ The copy goes next to the weights as `experts.3b64.top.lpack` (54 GB, a few minu
 memory plan reads the copy's size, and persisted state is kept apart from the checkpoint's. A copy that holds no
 draft head serves without drafts. Delete the file to get the disk back.
 
+The desktop app builds it on request (Tuning → Flash-Next → *Build the 3-bit copy*; 56 GB free, the server
+stopped) and from then on serves it, unless the card's copy setting is *Off*. It never names a copy that is
+not complete, which the server would refuse to load. The Doctor's *Flash-Next 3-bit expert copy* row says
+whether one is there and served.
+
 `--recipe lsq` fits each group again by least squares. It gives a better signal-to-noise ratio and a worse copy:
 it clips the tails, and agreement does not follow that ratio. At 3 bits it agrees 95.81% with a natural-text KL
 of 0.148, against 96.21% and 0.096 for `top`.
