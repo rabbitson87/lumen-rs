@@ -683,8 +683,10 @@ pub async fn download(
     let _awake = StayAwake::hold();
 
     let target = local_path_for(models_dir, repo_id);
-    std::fs::create_dir_all(&target)
-        .with_context(|| format!("create_dir_all {}", target.display()))?;
+    // The model's own folder is made only once the download fits: an empty one left by a refusal
+    // would list as an incomplete model.
+    std::fs::create_dir_all(models_dir)
+        .with_context(|| format!("create_dir_all {}", models_dir.display()))?;
 
     let url_of = |file: &str| resolve_url(repo_id, revision, file);
 
@@ -749,9 +751,11 @@ pub async fn download(
         check_fits(
             repo_id,
             bytes_to_fetch(&target, &files, sizes),
-            crate::doctor::statvfs_free(&target),
+            crate::doctor::statvfs_free(models_dir),
         )?;
     }
+    std::fs::create_dir_all(&target)
+        .with_context(|| format!("create_dir_all {}", target.display()))?;
 
     for file in &files {
         let url = url_of(file);
