@@ -539,15 +539,8 @@ mod imp {
             let raw = std::mem::take(&mut self.tensors);
             let mut out: HashMap<String, Array> = HashMap::with_capacity(raw.len());
             for (key, value) in raw {
-                if key.starts_with("vision_tower") || key.starts_with("model.visual") {
+                let Some(new_key) = Self::sanitized_key(&key) else {
                     continue;
-                }
-                let new_key = if let Some(rest) = key.strip_prefix("model.language_model") {
-                    format!("language_model.model{rest}")
-                } else if key.starts_with("language_model.") {
-                    key
-                } else {
-                    format!("language_model.{key}")
                 };
                 if out.insert(new_key.clone(), value).is_some() {
                     return Err(anyhow!("sanitize: duplicate normalized key `{new_key}`"));
@@ -565,6 +558,22 @@ mod imp {
             }
             self.tensors = out;
             Ok(())
+        }
+
+        /// The key [`Self::sanitize`] files a checkpoint key under; `None` for a key it drops.
+        pub fn sanitized_key(key: &str) -> Option<String> {
+            if key.starts_with("vision_tower") || key.starts_with("model.visual") {
+                return None;
+            }
+            Some(
+                if let Some(rest) = key.strip_prefix("model.language_model") {
+                    format!("language_model.model{rest}")
+                } else if key.starts_with("language_model.") {
+                    key.to_string()
+                } else {
+                    format!("language_model.{key}")
+                },
+            )
         }
 
         /// A bag over already-loaded tensors.

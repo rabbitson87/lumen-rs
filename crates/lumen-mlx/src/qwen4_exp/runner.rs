@@ -329,10 +329,6 @@ const TIGHT_CONTEXT_TOKENS: usize = 8_192;
 /// Mac (~14 GB) is not.
 const TIGHT_BELOW: u64 = 11_000_000_000;
 
-/// What the resident trunk (embeddings, attention, DeltaNet, hyper-connections,
-/// routers, shared experts) occupies.
-const TRUNK_BYTES: u64 = 3_600_000_000;
-
 /// Memory MLX's buffer cache needs beside the live buffers for decode to run at full speed.
 /// Past the memory limit MLX gives the cache back on every allocation, and each of the thousands
 /// of buffers a decode step makes becomes a new Metal buffer. Measured with a 14 GB budget and
@@ -383,8 +379,9 @@ struct MemoryPlan {
     scores_budget: u64,
     /// Memory a prefill needs beyond the trunk and the expert pool.
     reserve: u64,
-    /// The resident weights: [`TRUNK_BYTES`], less the token embedding when it is read from disk
-    /// (`LUMEN_QWEN4_EMBED_DISK`), and the image tower under `LUMEN_VISION`.
+    /// The resident weights (embeddings, attention, DeltaNet, hyper-connections, routers, shared
+    /// experts; [`super::model::resident_weight_bytes`]), less the token embedding when it is read
+    /// from disk (`LUMEN_QWEN4_EMBED_DISK`), and the image tower under `LUMEN_VISION`.
     trunk: u64,
     /// What is left for the expert pool.
     pool: u64,
@@ -399,10 +396,12 @@ fn prefill_reserve(chunk: usize, ctx_tokens: usize, kv_per_token: u64, scores: u
 }
 
 /// The chunk, the context and the expert pool for a Mac whose GPU may use `usable` bytes: what
-/// the working set leaves after the trunk and a prefill's reserve.
+/// the working set leaves after the trunk (`resident` bytes of weights, the token embedding
+/// included) and a prefill's reserve.
 fn plan_memory(
     usable: u64,
     cfg: &Qwen4ExpConfig,
+    resident: u64,
     chunk_override: Option<usize>,
     ctx_override: Option<usize>,
 ) -> MemoryPlan {
@@ -427,7 +426,7 @@ fn plan_memory(
     } else {
         0
     };
-    let trunk = TRUNK_BYTES.saturating_sub(embedding_on_disk)
+    let trunk = resident.saturating_sub(embedding_on_disk)
         + if crate::vision_splice::tower::vision_enabled() {
             cfg.vision_tower_bytes()
         } else {
@@ -807,7 +806,13 @@ impl Qwen4ExpRunner {
                 cfg.routed_expert_bytes() as f64 / 1e6
             );
         }
-        let plan = plan_memory(device, &cfg, chunk_override(), context_override());
+        let resident = super::model::resident_weight_bytes(dir).with_context(|| {
+            format!(
+                "qwen4_exp: size the resident weights of `{}`",
+                dir.display()
+            )
+        })?;
+        let plan = plan_memory(device, &cfg, resident, chunk_override(), context_override());
         let (chunk, ctx_tokens) = (plan.chunk, plan.ctx_tokens);
         let host = host_for_plan(device);
         if let Some(h) = &host {
@@ -2133,6 +2138,10 @@ impl Runner for Qwen4ExpRunner {
 mod tests {
     use super::*;
 
+    /// Resident weights for the plan tests: 3.6 GB, what the plan assumed for every build before
+    /// it read them from the checkpoint.
+    const TRUNK: u64 = 3_600_000_000;
+
     #[test]
     fn a_copy_changes_the_identity_of_persisted_state_and_no_copy_leaves_it_alone() {
         use crate::offload::lowbit::Recipe;
@@ -2196,7 +2205,7 @@ mod tests {
             choose_pool(usable, None, plan, Some(requested), floor).pool
         };
         // The 24 GB-class plan: ~6.9 GB left after the trunk and the reserve.
-        let plan = plan_memory(usable, &cfg, None, None);
+        let plan = plan_memory(usable, &cfg, TRUNK, None, None);
         let fits = plan.pool;
         assert_eq!(pool(4_000_000_000, &plan), 4_000_000_000);
         assert_eq!(pool(fits, &plan), fits);
@@ -2214,7 +2223,7 @@ mod tests {
         );
         assert!(line.contains("this GPU may use"), "{line}");
         // A shorter longest prompt leaves more room for the same request.
-        let short = plan_memory(usable, &cfg, None, Some(4_096));
+        let short = plan_memory(usable, &cfg, TRUNK, None, Some(4_096));
         assert!(pool(12_000_000_000, &short) > fits);
     }
 
@@ -2297,7 +2306,7 @@ mod tests {
     #[test]
     fn an_idle_machine_plans_from_the_working_set_as_before() {
         let cfg = real_config();
-        let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+        let plan = plan_memory(DEVICE_36GB, &cfg, TRUNK, None, None);
         let idle = HostMemory {
             free: 25_000_000_000,
             ..after_36gb()
@@ -2333,10 +2342,10 @@ mod tests {
             let table = cfg.token_embedding_bytes();
             assert!(table > 0);
             let held = super::super::model::embed_from_disk::with(false, || {
-                plan_memory(DEVICE_36GB, &cfg, None, None)
+                plan_memory(DEVICE_36GB, &cfg, TRUNK, None, None)
             });
             let on_disk = super::super::model::embed_from_disk::with(true, || {
-                plan_memory(DEVICE_36GB, &cfg, None, None)
+                plan_memory(DEVICE_36GB, &cfg, TRUNK, None, None)
             });
             assert_eq!(on_disk.trunk + table, held.trunk);
             assert_eq!(on_disk.pool, held.pool + table);
@@ -2348,7 +2357,7 @@ mod tests {
     fn what_other_apps_hold_comes_out_of_the_pool_and_the_line_says_how_much() {
         f32_kv(|| {
             let cfg = real_config();
-            let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+            let plan = plan_memory(DEVICE_36GB, &cfg, TRUNK, None, None);
             let free = free_now(&after_36gb());
             let choice = choose_pool(DEVICE_36GB, Some(free), &plan, None, pool_floor_bytes(&cfg));
             assert_eq!(choice.usable, free);
@@ -2381,7 +2390,7 @@ mod tests {
     #[test]
     fn an_explicit_pool_is_lowered_to_what_is_free_now() {
         let cfg = real_config();
-        let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+        let plan = plan_memory(DEVICE_36GB, &cfg, TRUNK, None, None);
         let free = free_now(&after_36gb());
         let floor = pool_floor_bytes(&cfg);
         // 15 GB fits the working set, not what other apps leave.
@@ -2408,7 +2417,7 @@ mod tests {
         plan_reclaimable::with(true, || assert!(host_for_plan(1).is_some()));
         // `None` is what the opt-out hands the plan: today's pool, with or without a request.
         let cfg = real_config();
-        let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+        let plan = plan_memory(DEVICE_36GB, &cfg, TRUNK, None, None);
         let floor = pool_floor_bytes(&cfg);
         let off = choose_pool(DEVICE_36GB, None, &plan, None, floor);
         assert_eq!(
@@ -2456,7 +2465,7 @@ mod tests {
         let cfg = real_config();
         let floor = pool_floor_bytes(&cfg);
         assert_eq!(floor, 2 * 512 * 2_764_800, "1,024 slots of 2.76 MB");
-        let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+        let plan = plan_memory(DEVICE_36GB, &cfg, TRUNK, None, None);
         // The busy machine: 6.3 GB free now, less than the trunk and the reserve alone.
         let free = free_now(&busy_36gb());
         let choice = choose_pool(DEVICE_36GB, Some(free), &plan, None, floor);
@@ -2474,7 +2483,7 @@ mod tests {
         assert!(line.contains("expect swapping"), "{line}");
         // A Mac too small for the floor even when idle: the floor, and the plan stays the
         // device's (as before).
-        let tiny = plan_memory(4_000_000_000, &cfg, None, None);
+        let tiny = plan_memory(4_000_000_000, &cfg, TRUNK, None, None);
         let tight = choose_pool(4_000_000_000, None, &tiny, None, floor);
         assert_eq!(
             (tight.pool, tight.usable, tight.at_floor),
@@ -2537,26 +2546,26 @@ mod tests {
                 13 * (2 * 2 * 256 * 4 + 128 * 4) as u64
             );
             // 36 GB Mac: 30.2 GB working set x 0.88.
-            let plan = plan_memory(26_600_000_000, &cfg, None, None);
+            let plan = plan_memory(26_600_000_000, &cfg, TRUNK, None, None);
             assert_eq!((plan.chunk, plan.ctx_tokens), (1024, 16_384));
             assert!(
                 (19_000_000_000..20_100_000_000).contains(&plan.pool),
                 "{plan:?}"
             );
             // 24 GB Mac: ~16 GB working set x 0.88.
-            let plan = plan_memory(14_100_000_000, &cfg, None, None);
+            let plan = plan_memory(14_100_000_000, &cfg, TRUNK, None, None);
             assert_eq!(plan.chunk, 1024);
             assert!(plan.pool > 6_500_000_000, "{plan:?}");
             // A 16 GB Mac takes the tight settings and still has a pool that holds a staging region
             // and a layer (2 x 512 experts x 2.76 MB).
-            let plan = plan_memory(9_400_000_000, &cfg, None, None);
+            let plan = plan_memory(9_400_000_000, &cfg, TRUNK, None, None);
             assert_eq!(
                 (plan.chunk, plan.ctx_tokens, plan.scores_budget),
                 (512, 8_192, 800_000_000)
             );
             assert!(plan.pool > 2_850_000_000, "{plan:?}");
             // Too little memory: the pool is zero and the slot floor takes over.
-            assert_eq!(plan_memory(4_000_000_000, &cfg, None, None).pool, 0);
+            assert_eq!(plan_memory(4_000_000_000, &cfg, TRUNK, None, None).pool, 0);
         })
     }
 
@@ -2564,15 +2573,15 @@ mod tests {
     fn a_longer_context_or_a_bigger_chunk_takes_its_memory_out_of_the_pool() {
         f32_kv(|| {
             let cfg = real_config();
-            let base = plan_memory(26_600_000_000, &cfg, None, None);
-            let longer = plan_memory(26_600_000_000, &cfg, None, Some(65_536));
+            let base = plan_memory(26_600_000_000, &cfg, TRUNK, None, None);
+            let longer = plan_memory(26_600_000_000, &cfg, TRUNK, None, Some(65_536));
             // 48K more tokens of 60 KB each: ~2.9 GB of KV, and the scores stay at their budget.
             assert!(
                 base.pool - longer.pool > 2_800_000_000,
                 "{base:?} {longer:?}"
             );
             assert!(base.pool - longer.pool < 4_200_000_000);
-            let bigger = plan_memory(26_600_000_000, &cfg, Some(4096), None);
+            let bigger = plan_memory(26_600_000_000, &cfg, TRUNK, Some(4096), None);
             assert!(bigger.pool < base.pool);
         })
     }

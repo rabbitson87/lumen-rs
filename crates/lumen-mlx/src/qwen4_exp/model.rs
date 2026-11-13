@@ -107,21 +107,63 @@ fn materialize_trunk(
     with_experts: bool,
     with_embedding: bool,
 ) -> Result<()> {
-    let embedding = format!("{TOKEN_EMBEDDING}.");
     let resident: Vec<&Array> = weights
         .tensors()
         .iter()
-        .filter(|(name, _)| {
-            (with_experts || !name.contains(".switch_mlp."))
-                && !name.contains(".ngram_embedding.")
-                && (with_embedding || !name.starts_with(&embedding))
-        })
+        .filter(|(name, _)| stays_resident(name, with_experts, with_embedding))
         .map(|(_, a)| a)
         .collect();
     for batch in resident.chunks(256) {
         mlx_rs::transforms::eval(batch.iter().copied())?;
     }
     Ok(())
+}
+
+/// Whether [`materialize_trunk`] reads the tensor at the sanitized key `name` into memory.
+fn stays_resident(name: &str, with_experts: bool, with_embedding: bool) -> bool {
+    (with_experts || !name.contains(".switch_mlp."))
+        && !name.contains(".ngram_embedding.")
+        && (with_embedding || !in_token_embedding(name))
+}
+
+fn in_token_embedding(name: &str) -> bool {
+    name.strip_prefix(TOKEN_EMBEDDING)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Bytes the weights that stay in memory take once loaded with the experts offloaded, read from
+/// the shards' headers: every tensor [`materialize_trunk`] keeps, the token embedding included
+/// (the memory plan takes it off when it is read from disk). Neither the draft head nor the image
+/// tower is counted: the plan adds the tower under `LUMEN_VISION`, and the head's resident part
+/// is a few MB beside its experts in the pool. Packed weights count as stored and float tensors
+/// in f32, since the loader widens the float projections ([`Proj::Dense`]) and, under
+/// [`widen_scales`], the quantized projections' scales and biases once at load. The token
+/// embedding's scales stay as stored; the few MB of norms and convolution weights the loader
+/// also keeps as stored are counted wide.
+pub(crate) fn resident_weight_bytes(model_dir: &Path) -> Result<u64> {
+    let shards: Vec<std::path::PathBuf> = std::fs::read_dir(model_dir)
+        .with_context(|| format!("read_dir({})", model_dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "safetensors"))
+        .collect();
+    let widen = widen_scales::get();
+    let mut total = 0;
+    for shard in &shards {
+        for t in crate::offload::expert_store::read_header(shard)? {
+            let Some(name) = NativeWeights::sanitized_key(&t.name) else {
+                continue;
+            };
+            if name.starts_with("language_model.mtp.") || !stays_resident(&name, false, true) {
+                continue;
+            }
+            let stored = t.end - t.begin;
+            let half = matches!(t.dtype.as_str(), "BF16" | "F16");
+            let scale_or_bias = name.ends_with(".scales") || name.ends_with(".biases");
+            let widened = half && !in_token_embedding(&name) && (widen || !scale_or_bias);
+            total += if widened { 2 * stored } else { stored };
+        }
+    }
+    Ok(total)
 }
 
 fn require(weights: &NativeWeights, name: &str) -> Result<Array> {
@@ -3033,6 +3075,78 @@ mod convention_tests {
         assert!(norms_are_centered(0.2833), "HF-centered build");
         assert!(!norms_are_centered(1.2833), "folded build");
         assert!(!norms_are_centered(1.0), "random replica around one");
+    }
+}
+
+#[cfg(test)]
+mod resident_bytes_tests {
+    use super::{resident_weight_bytes, widen_scales};
+    use crate::offload::expert_store::test_files::{T, write};
+
+    fn t<'a>(name: &'a str, dtype: &'a str, bytes: usize) -> T<'a> {
+        T {
+            name,
+            dtype,
+            shape: vec![bytes as i64],
+            data: vec![0; bytes],
+        }
+    }
+
+    /// A packed projection with bf16 scales and biases, a bf16 router, an f32 vector and the
+    /// token embedding stay; the routed experts, the n-gram table, the image tower and the draft
+    /// head do not. Float tensors count in f32, except the embedding's scales.
+    #[test]
+    fn the_resident_weights_are_what_the_loader_keeps_with_floats_held_in_f32() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("model-00001.safetensors"),
+            &[
+                t(
+                    "language_model.model.layers.0.self_attn.q_proj.weight",
+                    "U32",
+                    1_000,
+                ),
+                t(
+                    "language_model.model.layers.0.self_attn.q_proj.scales",
+                    "BF16",
+                    100,
+                ),
+                t(
+                    "language_model.model.layers.0.self_attn.q_proj.biases",
+                    "BF16",
+                    100,
+                ),
+                t("language_model.model.layers.0.mlp.gate.weight", "BF16", 300),
+                t("language_model.model.layers.0.linear_attn.A_log", "F32", 7),
+                t("language_model.model.embed_tokens.weight", "U32", 2_000),
+                t("language_model.model.embed_tokens.scales", "BF16", 50),
+                t(
+                    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
+                    "U32",
+                    100_000,
+                ),
+                t(
+                    "language_model.model.ngram.ngram_embedding.shards.0.weight",
+                    "U32",
+                    90_000,
+                ),
+                t("vision_tower.blocks.0.attn.qkv.weight", "BF16", 70_000),
+            ],
+        );
+        write(
+            &dir.path().join("mtp.safetensors"),
+            &[t(
+                "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+                "U32",
+                30_000,
+            )],
+        );
+        std::fs::write(dir.path().join("experts.lpack"), vec![0u8; 50_000]).unwrap();
+
+        let kept = 1_000 + 2 * (100 + 100 + 300) + 7 + 2_000 + 50;
+        assert_eq!(resident_weight_bytes(dir.path()).unwrap(), kept);
+        let unwidened = widen_scales::with(false, || resident_weight_bytes(dir.path()).unwrap());
+        assert_eq!(unwidened, kept - 200, "scales and biases as stored");
     }
 }
 
