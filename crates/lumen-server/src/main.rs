@@ -162,6 +162,34 @@ async fn main() -> Result<(), SendableError> {
             )));
         }
     }
+    // `--build-expert-copy <model dir> <bits,group,recipe>`: build the low-bit copy of a
+    // Flash-Next checkpoint's routed experts that `LUMEN_QWEN4_EXPERT_COPY=<the same spec>`
+    // serves (`3,64,top`: 2.15 MB an expert instead of 2.76, and replies that differ from the
+    // checkpoint's), from the shards. A copy already there that reads back is kept.
+    if let Some(i) = args.iter().position(|a| a == "--build-expert-copy") {
+        let (Some(dir), Some(spec)) = (args.get(i + 1), args.get(i + 2)) else {
+            return Err(SendableError::from(
+                "--build-expert-copy needs a model directory and a spec like 3,64,top",
+            ));
+        };
+        #[cfg(feature = "mlx-native")]
+        {
+            let built = lumen_mlx::LowbitSpec::parse(spec).and_then(|spec| {
+                lumen_mlx::qwen4_exp::build_expert_copy(std::path::Path::new(dir), spec)
+            });
+            let path = built.map_err(|e| {
+                SendableError::from(format!("--build-expert-copy {dir} {spec}: {e:#}"))
+            })?;
+            println!("{}", path.display());
+            return Ok(());
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            return Err(SendableError::from(format!(
+                "--build-expert-copy {dir} {spec}: built without mlx-native"
+            )));
+        }
+    }
     // `--measure-memory-bandwidth`: print one JSON line with how fast this GPU streams memory
     // (about a second). The app combines it with the SSD speed to estimate Flash-Next decode.
     if args.iter().any(|a| a == "--measure-memory-bandwidth") {

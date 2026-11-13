@@ -1717,6 +1717,25 @@ fn a_multi_token_feed_reads_the_copy_too() {
     assert_ne!(low, full);
 }
 
+/// `lumen-server --build-expert-copy`: built from the checkpoint's own width, kept when it reads
+/// back, built again when it does not.
+#[test]
+fn an_expert_copy_is_built_once_and_again_when_it_does_not_read_back() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = replica_with_head();
+    let spec = LowbitSpec::new(2, 32, Recipe::Top).unwrap();
+    let path = super::build_expert_copy(tmp.path(), spec).unwrap();
+    assert_eq!(path, crate::offload::pack::lowbit_path(tmp.path(), spec));
+    let built = std::fs::metadata(&path).unwrap().ino();
+    assert_eq!(super::build_expert_copy(tmp.path(), spec).unwrap(), path);
+    assert_eq!(std::fs::metadata(&path).unwrap().ino(), built, "kept");
+    assert!(Qwen4ExpModel::load_with(tmp.path(), copy_options(spec, Some(400 << 20))).is_ok());
+
+    std::fs::write(&path, b"not a pack").unwrap();
+    assert_eq!(super::build_expert_copy(tmp.path(), spec).unwrap(), path);
+    assert!(Qwen4ExpModel::load_with(tmp.path(), copy_options(spec, Some(400 << 20))).is_ok());
+}
+
 #[test]
 fn a_copy_needs_a_pool_and_its_pack() {
     let tmp = replica_copy();
