@@ -969,7 +969,7 @@ export const en: Record<string, string> = {
   "doctor.hint.huggingface.unreachable":
     "Model downloads via HF Hub will fail. Check your internet connection, VPN, or proxy.",
   "doctor.hint.flash_next_ram.short":
-    "Flash-Next needs its 3.6 GB of resident weights, an expert pool of at least 2.8 GB and a prefill reserve inside the GPU's share of RAM (two thirds up to 32 GB, three quarters above; the memory limit lowers it). Below that the model cannot load.",
+    "Flash-Next needs its {trunk} GB of resident weights, an expert pool of at least {floor} GB and a prefill reserve inside the GPU's share of RAM (two thirds up to 32 GB, three quarters above; the memory limit lowers it). Below that the model cannot load.",
   "doctor.hint.flash_next_ram.context":
     "The KV cache of the longest prompt (30 KB per token) comes out of the GPU's share of RAM. The app sends LUMEN_MAX_PROMPT_TOKENS (16,384 tokens, 8,192 on a tight Mac) unless you set it, lowered to Max context. Lower it (the Flash-Next memory calculator's Apply writes it) or the prefill chunk, or raise the memory limit if it is below your RAM.",
   "doctor.hint.flash_next_disk.room":
@@ -993,9 +993,9 @@ export const en: Record<string, string> = {
   "doctor.detail.active_model.incomplete":
     "Required files (config.json + at least one safetensors/gguf shard) are missing.",
   "doctor.detail.flash_next_ram":
-    "The expert pool is what the GPU's share of RAM leaves after the 3.6 GB of resident weights and a prefill's reserve: buffers, the chunk's activations, the KV cache of the longest prompt (30 KB per token) and attention scores. A longer prompt cap shrinks it; a bigger pool means fewer SSD reads per token.",
+    "The expert pool is what the GPU's share of RAM leaves after the {trunk} GB of resident weights and a prefill's reserve: buffers, the chunk's activations, the KV cache of the longest prompt (30 KB per token) and attention scores. A longer prompt cap shrinks it; a bigger pool means fewer SSD reads per token.",
   "doctor.detail.flash_next_ram.oneRegion":
-    "With less than 4.2 GB the pool has room for one staging region only, so prefill cannot read the next layer while it computes the current one.",
+    "With less than {prefetch} GB the pool has room for one staging region only, so prefill cannot read the next layer while it computes the current one.",
   "doctor.detail.flash_next_pack.absent":
     "Without the pack the server reads each expert as nine scattered ranges of the weight shards. The pack stores the same bytes as one record per expert.",
   "doctor.detail.flash_next_copy.absent":

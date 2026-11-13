@@ -31,8 +31,10 @@
   import MemoryCalculator from "./lib/MemoryCalculator.svelte";
   import {
     FLASH_NEXT_DEFAULTS,
+    flashNextBuildOf,
     flashNextEnv,
     flashNextFits,
+    flashNextLaunchBuild,
     flashNextMaxContext,
     flashNextSettingsEnabled,
     flashNextUsableBytes,
@@ -274,6 +276,17 @@
   // kept either way.
   let flashNextEnabled = $derived(flashNextSettingsEnabled(config?.active_model));
 
+  // The Flash-Next the card plans for, which names its build: the selected model when it is one
+  // (as the launch would run it), else the one being served, else the installed one the status
+  // describes. `null` when there is none: the card then plans the uniform build, the rule for a
+  // name that does not say "mixed".
+  let flashNextModelId = $derived.by(() => {
+    if (isFlashNextModelId(config?.active_model)) return config!.active_model;
+    const serving = status.state === "running" || status.state === "starting";
+    if (serving && isFlashNextModelId(status.model_id)) return status.model_id;
+    return flashStatus?.dir ?? null;
+  });
+
   // Active model + derived hints (bits, recommended memory caps).
   let activeModel = $derived.by(() => {
     if (!config?.active_model) return null;
@@ -378,12 +391,18 @@
   let realisticMaxCtxK = $derived.by(() => {
     if (!systemInfo || !activeModel) return null;
     if (isFlashNextModelId(activeModel.id)) {
-      // The 97 GB on disk is not what has to fit — the experts stream from the SSD. The longest
-      // prompt this Mac can hold is what the smallest expert pool leaves (f32 KV, no quant).
-      const launchEnv = flashNextEnv(config?.flash_next ?? FLASH_NEXT_DEFAULTS, config?.env_overrides ?? {});
+      // The 97 or 106 GB on disk is not what has to fit — the experts stream from the SSD. The
+      // longest prompt this Mac can hold is what the smallest expert pool of the build the launch
+      // runs leaves (f32 KV, no quant).
+      const launchEnv = flashNextEnv(
+        config?.flash_next ?? FLASH_NEXT_DEFAULTS,
+        config?.env_overrides ?? {},
+        flashStatus,
+      );
       const chunk = Number(launchEnv.LUMEN_QWEN35_PREFILL_CHUNK) || null;
       const usable = flashNextUsableBytes(systemInfo.ram_gb, flashNextMemoryLimitGb);
-      return Math.round(flashNextMaxContext(usable, chunk) / 1024);
+      const build = flashNextLaunchBuild(activeModel.id, launchEnv);
+      return Math.round(flashNextMaxContext(build, usable, chunk) / 1024);
     }
     const modelGb = activeModel.size_bytes / 1024 ** 3;
     const overheadGb = 3; // server + tokenizer + activations
@@ -421,13 +440,14 @@
   // Apple Silicon machine we've measured.
   let recommendedCacheGb = $derived.by(() => (recommendedMemoryGb ? 2 : null));
 
-  // Whether this Mac can run a catalog entry. Flash-Next's 97 GB is mostly streamed from the
-  // SSD, so it is the trunk + smallest pool + one prefill chunk that must fit the GPU's share
-  // of RAM, not the file size (the catalog's `min_ram_gb` stays the other families' rule).
+  // Whether this Mac can run a catalog entry. Flash-Next's 97 or 106 GB is mostly streamed from
+  // the SSD, so it is the trunk of its build + smallest pool + one prefill chunk that must fit the
+  // GPU's share of RAM, not the file size (the catalog's `min_ram_gb` stays the other families'
+  // rule). An entry listed here is not downloaded yet, so its first launch serves no 3-bit copy.
   function recFits(r: RecommendedModel): boolean {
     if (!systemInfo) return true;
     return r.family === "qwen4-exp"
-      ? flashNextFits(systemInfo.ram_gb)
+      ? flashNextFits(flashNextBuildOf(r.id), systemInfo.ram_gb)
       : r.min_ram_gb <= systemInfo.ram_gb;
   }
 
@@ -1416,6 +1436,7 @@
     <FlashNextCard
       settings={config.flash_next ?? FLASH_NEXT_DEFAULTS}
       overrides={config.env_overrides}
+      modelId={flashNextModelId}
       enabled={flashNextEnabled}
       ramGb={systemInfo?.ram_gb}
       memoryLimitGb={flashNextMemoryLimitGb}

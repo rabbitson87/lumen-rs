@@ -9,10 +9,10 @@
   import type { Chip } from "./chips";
   import { fill, fmtTps } from "./format";
   import {
-    FLASH_NEXT,
-    FLASH_NEXT_POOL_MIN_GB,
     FLASH_NEXT_POOL_PRESETS_GB,
     flashNextPoolChip,
+    flashNextPoolFloor,
+    type FlashNextBuild,
     type FlashNextHardware,
     formatGbValue,
     parseGbInput,
@@ -21,6 +21,8 @@
   interface Props {
     /** The pool the user set, in GB; `null` = auto. */
     gb: number | null;
+    /** The build the launch runs: its trunk and its experts' size set the pool and the floor. */
+    build: FlashNextBuild;
     usableBytes: number;
     chunk: number;
     /** The longest prompt the plan holds KV for. */
@@ -33,7 +35,7 @@
     /** Read-only: the chips and the custom box cannot be used. */
     disabled?: boolean;
   }
-  let { gb, usableBytes, chunk, ctxTokens, pack, hw, onSelect, disabled = false }: Props = $props();
+  let { gb, build, usableBytes, chunk, ctxTokens, pack, hw, onSelect, disabled = false }: Props = $props();
 
   const presets: readonly number[] = FLASH_NEXT_POOL_PRESETS_GB;
   const fmtTok = (n: number) => n.toLocaleString("en-US");
@@ -46,7 +48,8 @@
   const selected = $derived(
     gb == null ? "auto" : customOpen || !presets.includes(gb) ? "custom" : String(gb),
   );
-  const auto = $derived(flashNextPoolChip({ usableBytes, chunk, ctxTokens, gb: null, pack, hw }));
+  const floor = $derived(flashNextPoolFloor(build));
+  const auto = $derived(flashNextPoolChip({ build, usableBytes, chunk, ctxTokens, gb: null, pack, hw }));
 
   const speed = (c: ReturnType<typeof flashNextPoolChip>) =>
     c.tps ? `~${fmtTps(c.tps.tps)}` : undefined;
@@ -60,7 +63,7 @@
       warn: !auto.fits,
     },
     ...presets.map((p) => {
-      const c = flashNextPoolChip({ usableBytes, chunk, ctxTokens, gb: p, pack, hw });
+      const c = flashNextPoolChip({ build, usableBytes, chunk, ctxTokens, gb: p, pack, hw });
       return {
         value: String(p),
         label: `${p} GB`,
@@ -78,7 +81,7 @@
     { value: "custom", label: t("flashnext.pool.custom") },
   ]);
 
-  const active = $derived(flashNextPoolChip({ usableBytes, chunk, ctxTokens, gb, pack, hw }));
+  const active = $derived(flashNextPoolChip({ build, usableBytes, chunk, ctxTokens, gb, pack, hw }));
   function choose(value: string) {
     invalid = false;
     if (value === "auto") {
@@ -136,8 +139,8 @@
     {#if active.tps}
       <span class="dim">· ≈ {fmtTps(active.tps.tps)} tok/s</span>
     {/if}
-    {#if gb != null && gb < FLASH_NEXT_POOL_MIN_GB}
-      <span class="text-warn">{fill(t("flashnext.pool.floor"), { floor: (FLASH_NEXT.poolFloorBytes / 1e9).toFixed(2) })}</span>
+    {#if gb != null && gb * 1e9 < floor}
+      <span class="text-warn">{fill(t("flashnext.pool.floor"), { floor: (floor / 1e9).toFixed(2) })}</span>
     {:else if gb != null && !active.fits}
       <span class="text-warn">
         {fill(t("flashnext.pool.lowered"), {

@@ -101,8 +101,9 @@
         return m;
       }
       case "flash_next_ram": {
-        // "16 GB RAM: expert pool ~4.9 GB at 8192 tokens" / "16 GB RAM: a 81920-token context does
-        // not fit, up to 69758 do" / "8 GB RAM, Flash-Next needs ~13 GB"
+        // "16 GB RAM: expert pool ~5.4 GB at 8192 tokens" / "16 GB RAM: a 98304-token context does
+        // not fit, up to 88792 do" / "8 GB RAM, Flash-Next needs ~12 GB" (the numbers are the
+        // build's: its resident weights and its experts' size)
         const ok = m.match(/^(\d+) GB RAM: expert pool ~([\d.]+) GB at (\d+) tokens$/);
         if (ok) return fill("doctor.msg.flash_next_ram.ok", { ram: ok[1], pool: ok[2], ctx: ok[3] });
         const ctx = m.match(/^(\d+) GB RAM: a (\d+)-token context does not fit, up to (\d+) do$/);
@@ -204,7 +205,10 @@
     if (h.includes("Download the model from the MODELS")) return t("doctor.hint.active_model.missing");
     if (h.includes("not with 2xx/3xx")) return t("doctor.hint.huggingface.unexpected");
     if (h.includes("Check your internet connection")) return t("doctor.hint.huggingface.unreachable");
-    if (h.includes("Flash-Next needs its 3.6 GB")) return t("doctor.hint.flash_next_ram.short");
+    // "Flash-Next needs its 3.0 GB of resident weights, an expert pool of at least 2.8 GB and ...":
+    // the build's numbers.
+    const ramShort = h.match(/^Flash-Next needs its ([\d.]+) GB of resident weights, an expert pool of at least ([\d.]+) GB/);
+    if (ramShort) return fill("doctor.hint.flash_next_ram.short", { trunk: ramShort[1], floor: ramShort[2] });
     if (h.includes("comes out of the GPU's share of RAM")) return t("doctor.hint.flash_next_ram.context");
     if (h.includes("An expert pack makes decode")) return t("doctor.hint.flash_next_disk.room");
     if (h.includes("The expert pack is optional")) return t("doctor.hint.flash_next_disk.noRoom");
@@ -223,11 +227,16 @@
       return t("doctor.detail.active_model.incomplete");
     }
     const d = c.detail;
-    if (d.includes("The expert pool is what the GPU's share of RAM leaves"))
+    // "... leaves after the 3.0 GB of resident weights and ..." (+ " With less than 4.2 GB the pool
+    // has room for one staging region only, ..."): the build's trunk and prefetch size.
+    const ramPool = d.match(/^The expert pool is what the GPU's share of RAM leaves after the ([\d.]+) GB of resident weights/);
+    if (ramPool) {
+      const oneRegion = d.match(/With less than ([\d.]+) GB the pool has room for one staging region only/);
       return (
-        t("doctor.detail.flash_next_ram") +
-        (d.includes("one staging region only") ? " " + t("doctor.detail.flash_next_ram.oneRegion") : "")
+        fill("doctor.detail.flash_next_ram", { trunk: ramPool[1] }) +
+        (oneRegion ? " " + fill("doctor.detail.flash_next_ram.oneRegion", { prefetch: oneRegion[1] }) : "")
       );
+    }
     if (d.includes("Without the pack the server reads each expert"))
       return t("doctor.detail.flash_next_pack.absent");
     if (d.includes("The copy keeps the top 3 bits of every routed expert"))
