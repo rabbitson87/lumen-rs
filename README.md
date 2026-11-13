@@ -73,7 +73,7 @@ commit on this repo.
 |---|---|
 | Hardware | Apple Silicon (M1 / M2 / M3 / M4) |
 | OS | macOS 14+ |
-| Toolchain | Rust 1.85+ (edition 2024). Install via `rustup`. |
+| Toolchain | Rust 1.87+ (edition 2024), 1.90+ for the desktop app. Install via `rustup`. |
 | Disk | ~50 GB free for a full Gemma 4 26B MoE checkpoint + workspace target/ |
 | Memory | Embedding alone: ~1 GB. Gemma 4 26B-A4B lumen Standard (12 GB on disk): runs on 16 GB+ unified memory; ~15 GB peak at 4K context. Quality (14 GB): 24 GB+. Flagship-KR (15 GB): 32 GB+. |
 

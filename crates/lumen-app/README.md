@@ -6,7 +6,7 @@ live metrics — no chat UI in v1 (chat lives in third-party clients via `/v1/*`
 
 ## Prerequisites
 
-- Rust 1.87+ (workspace toolchain)
+- Rust 1.90+ (Tauri 2.12's minimum; the server alone builds with 1.87+)
 - Node.js 22+ and npm
 - macOS 14+ on Apple Silicon, for source builds and the release bundle alike
   (the bundle's Metal kernels are compiled for macOS 14 — see
