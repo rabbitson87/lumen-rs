@@ -680,6 +680,7 @@ pub async fn download(
     tx: tokio::sync::mpsc::Sender<DownloadProgress>,
 ) -> Result<PathBuf> {
     let client = hf_client(None).context("init hf http client for download")?;
+    let _awake = StayAwake::hold();
 
     let target = local_path_for(models_dir, repo_id);
     std::fs::create_dir_all(&target)
@@ -932,6 +933,34 @@ pub async fn download(
     Ok(target)
 }
 
+/// Keeps the Mac from idle-sleeping while it lives: a sleep drops the connection, and the file
+/// in flight (a 10 GB shard for Flash-Next) starts over. `caffeinate -w` also lets go when the
+/// app exits first. Where there is no `caffeinate` it holds nothing.
+struct StayAwake(Option<std::process::Child>);
+
+impl StayAwake {
+    fn hold() -> Self {
+        use std::process::{Command, Stdio};
+        let child = Command::new("/usr/bin/caffeinate")
+            .args(["-i", "-w", &std::process::id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok();
+        Self(child)
+    }
+}
+
+impl Drop for StayAwake {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// What a download leaves free on the volume, for the system and the app's own files.
 const DOWNLOAD_HEADROOM_BYTES: u64 = 2_000_000_000;
 
@@ -1066,6 +1095,21 @@ mod tests {
             .unwrap();
         f.write_all(header_bytes).unwrap();
         f.write_all(&vec![0u8; actual_body as usize]).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_download_keeps_the_mac_awake_until_it_ends() {
+        let mut awake = StayAwake::hold();
+        let child = awake.0.as_mut().expect("caffeinate starts");
+        let pid = child.id();
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "caffeinate exited early"
+        );
+        drop(awake);
+        // Reaped by the drop: the pid no longer names a process of ours.
+        assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
     }
 
     #[test]
