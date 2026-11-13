@@ -350,9 +350,7 @@ pub fn build_lowbit_pack(
     let source = expert_store::ExpertStore::open(dir)?;
     let started = std::time::Instant::now();
     let (path, fidelity) = pack::build_lowbit(dir, &source, src_bits, spec, |done, total| {
-        if done % 6 == 0 || done == total {
-            eprintln!("[offload] low-bit pack: layer {done} of {total}");
-        }
+        eprintln!("[offload] low-bit pack: layer {done} of {total}");
     })?;
     eprintln!(
         "[offload] low-bit pack ready in {:.0} s: {}",
@@ -372,6 +370,27 @@ pub fn build_lowbit_pack(
         copy.expert_bytes() as f64 / source.expert_bytes() as f64,
     );
     Ok(path)
+}
+
+/// [`build_lowbit_pack`], unless the copy is there and reads back for these shards (and for the
+/// draft head, when the checkpoint has one). A copy that does not is built again.
+pub(crate) fn ensure_lowbit_pack(
+    dir: &Path,
+    src_bits: u32,
+    spec: lowbit::LowbitSpec,
+) -> Result<std::path::PathBuf> {
+    let source = expert_store::ExpertStore::open(dir)?;
+    let head = dir.join("mtp.safetensors").is_file();
+    match pack::open_lowbit(dir, &source, spec, head) {
+        Ok(Some(_)) => {
+            let path = pack::lowbit_path(dir, spec);
+            eprintln!("[offload] low-bit pack already built: {}", path.display());
+            return Ok(path);
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("[offload] building the low-bit pack again: {e:#}"),
+    }
+    build_lowbit_pack(dir, src_bits, spec)
 }
 
 /// Fewest slots a bank is built with: enough for a decode step of a few

@@ -492,10 +492,12 @@ bits of every routed expert's codes, and the draft head's. **It is a different m
 ask for it:** replies differ from the checkpoint's.
 
 ```sh
-cargo run --release -p lumen-mlx --features mlx-native --example qwen4_exp_lowbit_pack -- \
-    ~/.slotstream/models/qwen38-flash-next-gs64 --bits 3 --group 64 --recipe top
+lumen-server --build-expert-copy path/to/checkpoint 3,64,top
 LUMEN_QWEN4_EXPERT_COPY=3,64,top LUMEN_QWEN4_MTP=auto lumen-server
 ```
+
+`--build-expert-copy` keeps a copy that is already there and reads back, and builds it again when it does
+not. The `qwen4_exp_lowbit_pack` example builds the other recipes (`lsq`, `minmax`, `topfit`, `pick4`) too.
 
 The copy goes next to the weights as `experts.3b64.top.lpack` (54 GB, a few minutes; 39 GB at 2 bits). The
 memory plan reads the copy's size, and persisted state is kept apart from the checkpoint's. A copy that holds no
@@ -563,12 +565,11 @@ files (`mtp.safetensors`, `mtp.json`) can be copied or linked across.
 
 ```sh
 lumen-server --pack-experts path/to/mixed-4_8bit
-cargo run --release -p lumen-mlx --features mlx-native --example qwen4_exp_lowbit_pack -- \
-    path/to/mixed-4_8bit --bits 2 --group 64 --recipe top
+lumen-server --build-expert-copy path/to/mixed-4_8bit 2,64,top
 LUMEN_QWEN4_EXPERT_COPY=2,64,top MODEL_ID=path/to/mixed-4_8bit lumen-server
 ```
 
-For the 3-bit copy, `--bits 3` and `3,64,top`.
+For the 3-bit copy, `3,64,top` in both places.
 
 Measured on a 36 GB M3 Max, load about 2, reading ahead on. Perplexity is over 40,178 positions of five long
 texts (Rust code, English documentation, Korean). Agreement is how often a build picks the mixed build's token at
