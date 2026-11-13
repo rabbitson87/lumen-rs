@@ -589,6 +589,10 @@ export const ko: Record<string, string> = {
     "배포 샤드 (tok/s)",
   "flashnext.speed.col.pack":
     "전문가 팩 (tok/s)",
+  "flashnext.speed.col.copy":
+    "3비트 사본 (tok/s)",
+  "flashnext.speed.copyNote":
+    "mixed 4/8비트 빌드의 3비트 사본을 쓸 때의 값입니다. 두 번째 답변부터, 미리 읽기를 켠 상태로 측정했습니다. 풀이 채워지는 첫 답변은 1~9% 느립니다.",
   "flashnext.speed.intro":
     "디코드 속도는 주로 이 Mac의 메모리 대역폭과 SSD 읽기 속도로 정해집니다. 둘을 측정하면 이 Mac의 추정치를 볼 수 있습니다.",
   "flashnext.speed.missing.both":

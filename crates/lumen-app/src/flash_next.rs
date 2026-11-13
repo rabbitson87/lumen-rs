@@ -404,7 +404,9 @@ pub fn launch_plan(cfg: &PersistentConfig, ram_bytes: u64, build: Build) -> Laun
 //
 // `memory_gbps` and `ssd_random_gbps` are what this Mac measured (`hardware.rs`; the SSD one by
 // [`probe_read_speed`]). The constants were calibrated on one machine, the reference below, and
-// `frontend/src/lib/memory-estimate.ts` mirrors them (its test reads this file).
+// `frontend/src/lib/memory-estimate.ts` mirrors them (its test reads this file). Reading the
+// shards or the pack, they are the uniform build's, measured before read-ahead; serving the 3-bit
+// copy, they are the mixed build's with its copy, measured with read-ahead on ([`copy_decode_tps`]).
 
 /// Bytes the GPU streams per token: the 1.325 GB of experts a token routes to (48 layers x 10
 /// experts x 2.76 MB) plus the 3.6 GB trunk.
@@ -460,6 +462,46 @@ pub const DECODE_TPS_PACK: [(f64, f64); 6] = [
     (15.0, 11.15),
     (19.8, 12.95),
 ];
+
+// Serving the 3-bit copy (`3,64,top`, the catalog's recommendation on the mixed build): a token
+// streams the mixed trunk and 480 copy experts, and the hit rate counts the experts read ahead
+// (read-ahead is on by default, and the shards and pack numbers above predate it).
+// `COPY_OTHER_MS` and `COPY_SSD_EFFICIENCY` are a straight-line fit of the measured ms per token
+// against the measured miss bytes; the fit lands within 3.1% of five points and 6.3% of the
+// sixth (4.2 GB, whose three servers spread 8.62-9.32 tok/s).
+
+/// Bytes the GPU streams per token serving the copy: the mixed build's 5.132 GB trunk plus 48
+/// layers x 10 experts x 2.1504 MB.
+pub const COPY_STREAM_GB: f64 = 6.164;
+/// Per-token time that does not scale with memory bandwidth, serving the copy.
+pub const COPY_OTHER_MS: f64 = 32.91;
+/// Copy expert bytes one token touches (GB).
+pub const COPY_EXPERT_GB_PER_TOKEN: f64 = 1.0322;
+/// Share of the measured random-read speed decode gets reading the copy, read-ahead included.
+pub const COPY_SSD_EFFICIENCY: f64 = 0.61;
+/// Hit rate by pool (GB, then share) serving the copy, over each server's second round of three
+/// prompts; the same at every server, the prompts being the same and greedy. 2.21 GB is that
+/// build's floor (1,024 slots).
+pub const COPY_HIT_RATE_POINTS: [(f64, f64); 6] = [
+    (2.21, 0.735),
+    (4.2, 0.800),
+    (6.7, 0.844),
+    (10.0, 0.883),
+    (15.0, 0.918),
+    (18.0, 0.933),
+];
+/// Decode speed (tokens/s) by pool (GB) serving the copy on the reference Mac: the second round
+/// of three prompts x 160 tokens (code, math, a Korean agent turn) on a fresh server, medians of
+/// three servers (two at 18 GB, where one grew swap), the pool set explicitly, read-ahead on, no
+/// draft head. The first round, with the pool still filling, ran 1-9% slower.
+pub const DECODE_TPS_COPY: [(f64, f64); 6] = [
+    (2.21, 8.39),
+    (4.2, 8.84),
+    (6.7, 10.77),
+    (10.0, 11.63),
+    (15.0, 13.30),
+    (18.0, 14.08),
+];
 /// Below this the SSD, not the GPU, sets a decode speed worth warning about.
 pub const SLOW_READ_GBPS: f64 = 2.0;
 
@@ -484,27 +526,65 @@ pub fn hit_rate(pool_gb: f64) -> f64 {
     interpolate(&HIT_RATE_POINTS, pool_gb).min(1.0)
 }
 
+/// One way of reading the experts, in the model's terms.
+struct SpeedModel {
+    stream_gb: f64,
+    other_ms: f64,
+    expert_gb_per_token: f64,
+    hit_points: &'static [(f64, f64)],
+    ssd_efficiency: f64,
+    /// The engine runs no pool under its floor (1,024 slots): a smaller one is that floor.
+    floor_gb: f64,
+}
+
+impl SpeedModel {
+    fn tps(&self, pool_gb: f64, memory_gbps: f64, ssd_random_gbps: f64) -> Option<f64> {
+        let positive = |x: f64| x.is_finite() && x > 0.0;
+        if !(positive(pool_gb) && positive(memory_gbps) && positive(ssd_random_gbps)) {
+            return None;
+        }
+        let pool_gb = pool_gb.max(self.floor_gb);
+        let fixed_ms = self.stream_gb / memory_gbps * 1000.0 + self.other_ms;
+        let hit = interpolate(self.hit_points, pool_gb).min(1.0);
+        let miss_gb = (1.0 - hit) * self.expert_gb_per_token;
+        let ms = fixed_ms + miss_gb / (ssd_random_gbps * self.ssd_efficiency) * 1000.0;
+        (ms.is_finite() && ms > 0.0).then(|| 1000.0 / ms)
+    }
+}
+
 /// Decode speed (tokens/s) for a pool of `pool_gb` on a Mac whose memory streams at `memory_gbps`
 /// and whose SSD serves random expert-sized reads at `ssd_random_gbps`; `pack` reads the expert
 /// pack instead of the shipped shards. A pool under the engine's floor counts as the floor. A
 /// faster Mac is not clamped to the reference one. `None`
 /// when an input is missing, zero or negative, never a 0 or an infinity.
 pub fn decode_tps(pool_gb: f64, memory_gbps: f64, ssd_random_gbps: f64, pack: bool) -> Option<f64> {
-    let positive = |x: f64| x.is_finite() && x > 0.0;
-    if !(positive(pool_gb) && positive(memory_gbps) && positive(ssd_random_gbps)) {
-        return None;
+    SpeedModel {
+        stream_gb: STREAM_GB,
+        other_ms: OTHER_MS,
+        expert_gb_per_token: EXPERT_GB_PER_TOKEN,
+        hit_points: &HIT_RATE_POINTS,
+        ssd_efficiency: if pack {
+            SSD_EFFICIENCY_PACK
+        } else {
+            SSD_EFFICIENCY_SHARDS
+        },
+        floor_gb: Build::UNIFORM.pool_floor() as f64 / 1e9,
     }
-    // The engine runs no pool under its floor (1,024 slots): a smaller one is that floor.
-    let pool_gb = pool_gb.max(Build::UNIFORM.pool_floor() as f64 / 1e9);
-    let efficiency = if pack {
-        SSD_EFFICIENCY_PACK
-    } else {
-        SSD_EFFICIENCY_SHARDS
-    };
-    let fixed_ms = STREAM_GB / memory_gbps * 1000.0 + OTHER_MS;
-    let miss_gb = (1.0 - hit_rate(pool_gb)) * EXPERT_GB_PER_TOKEN;
-    let ms = fixed_ms + miss_gb / (ssd_random_gbps * efficiency) * 1000.0;
-    (ms.is_finite() && ms > 0.0).then(|| 1000.0 / ms)
+    .tps(pool_gb, memory_gbps, ssd_random_gbps)
+}
+
+/// [`decode_tps`] serving the mixed build's 3-bit copy, from its own constants
+/// ([`COPY_HIT_RATE_POINTS`] and the rest) and its floor.
+pub fn copy_decode_tps(pool_gb: f64, memory_gbps: f64, ssd_random_gbps: f64) -> Option<f64> {
+    SpeedModel {
+        stream_gb: COPY_STREAM_GB,
+        other_ms: COPY_OTHER_MS,
+        expert_gb_per_token: COPY_EXPERT_GB_PER_TOKEN,
+        hit_points: &COPY_HIT_RATE_POINTS,
+        ssd_efficiency: COPY_SSD_EFFICIENCY,
+        floor_gb: Build::MIXED.serving_copy().pool_floor() as f64 / 1e9,
+    }
+    .tps(pool_gb, memory_gbps, ssd_random_gbps)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,6 +1208,92 @@ mod tests {
                     off * 100.0
                 );
             }
+        }
+    }
+
+    /// The copy's model written out from its constants, like [`by_hand`].
+    fn copy_by_hand(pool: f64, memory: f64, ssd: f64) -> f64 {
+        let pool = pool.max(Build::MIXED.serving_copy().pool_floor() as f64 / 1e9);
+        let p = COPY_HIT_RATE_POINTS;
+        let hit = if pool >= p[p.len() - 1].0 {
+            p[p.len() - 1].1
+        } else {
+            let i = (1..p.len()).find(|&i| pool < p[i].0).unwrap_or(1);
+            let (a, b) = (p[i - 1], p[i]);
+            (a.1 + (pool - a.0) * (b.1 - a.1) / (b.0 - a.0)).max(0.0)
+        };
+        let ms = COPY_STREAM_GB / memory * 1000.0
+            + COPY_OTHER_MS
+            + (1.0 - hit) * COPY_EXPERT_GB_PER_TOKEN / (ssd * COPY_SSD_EFFICIENCY) * 1000.0;
+        1000.0 / ms
+    }
+
+    #[test]
+    fn the_copy_model_is_the_formula_over_its_constants() {
+        for pool in [0.5, 2.21, 3.0, 6.7, 12.5, 18.0, 40.0] {
+            for memory in [100.0, REFERENCE_MEMORY_GBPS, 400.0] {
+                for ssd in [0.5, 3.1, REFERENCE_READ_GBPS, 14.0] {
+                    let got = copy_decode_tps(pool, memory, ssd).expect("an estimate");
+                    let want = copy_by_hand(pool, memory, ssd);
+                    assert!(
+                        (got - want).abs() < 1e-9,
+                        "{pool} {memory} {ssd}: {got} vs {want}"
+                    );
+                }
+            }
+        }
+        assert_eq!(copy_decode_tps(0.0, REFERENCE_MEMORY_GBPS, 6.0), None);
+        assert_eq!(copy_decode_tps(8.0, f64::NAN, 6.0), None);
+        assert_eq!(copy_decode_tps(8.0, REFERENCE_MEMORY_GBPS, -1.0), None);
+    }
+
+    /// What a token streams serving the copy: the mixed trunk and 480 experts of the copy's size.
+    #[test]
+    fn the_copy_constants_agree_with_its_geometry() {
+        let experts = 48.0 * 10.0 * Build::COPY_EXPERT_BYTES as f64 / 1e9;
+        assert!((COPY_EXPERT_GB_PER_TOKEN - experts).abs() < 1e-3);
+        let trunk = Build::MIXED.trunk_bytes as f64 / 1e9;
+        assert!((COPY_STREAM_GB - (trunk + COPY_EXPERT_GB_PER_TOKEN)).abs() < 1e-3);
+        assert!(
+            COPY_HIT_RATE_POINTS
+                .windows(2)
+                .all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1)
+        );
+        let pools = |t: &[(f64, f64)]| t.iter().map(|p| p.0).collect::<Vec<_>>();
+        assert_eq!(pools(&COPY_HIT_RATE_POINTS), pools(&DECODE_TPS_COPY));
+        // The first point is the copy build's floor.
+        let floor = Build::MIXED.serving_copy().pool_floor() as f64 / 1e9;
+        assert!((COPY_HIT_RATE_POINTS[0].0 - floor).abs() < 0.01, "{floor}");
+    }
+
+    /// The copy's fit lands on each of its measured points within 7% (6.3% at 4.2 GB, the
+    /// noisiest; the others within 3.1%).
+    #[test]
+    fn at_the_reference_hardware_the_copy_model_reproduces_its_measured_points() {
+        for (pool, measured) in DECODE_TPS_COPY {
+            let got = copy_decode_tps(pool, REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS).unwrap();
+            let off = (got - measured).abs() / measured;
+            assert!(
+                off <= 0.07,
+                "{pool} GB: model {got:.2} vs measured {measured}"
+            );
+        }
+    }
+
+    #[test]
+    fn serving_the_copy_a_bigger_pool_faster_memory_or_a_faster_disk_is_never_slower() {
+        let tps = |pool: f64, mem: f64, ssd: f64| copy_decode_tps(pool, mem, ssd).unwrap();
+        let (m, d) = (REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS);
+        for w in [2.21, 3.0, 4.2, 6.7, 10.0, 15.0, 18.0].windows(2) {
+            assert!(tps(w[1], m, d) > tps(w[0], m, d), "{w:?}");
+        }
+        assert_eq!(tps(30.0, m, d), tps(18.0, m, d));
+        assert_eq!(tps(1.0, m, d), tps(2.0, m, d), "under the floor");
+        for w in [100.0, 200.0, m, 400.0].windows(2) {
+            assert!(tps(8.0, w[1], d) > tps(8.0, w[0], d), "{w:?}");
+        }
+        for w in [0.5, 1.0, 3.1, d, 12.0].windows(2) {
+            assert!(tps(8.0, m, w[1]) > tps(8.0, m, w[0]), "{w:?}");
         }
     }
 
