@@ -445,7 +445,7 @@ export const bytesToGB = (b: number): number => b / GB;
 
 // ── Flash-Next (qwen4-exp): routed experts streamed from the SSD ─────────────
 //
-// A different shape from the families above. The 97 GB (uniform 4-bit) or 106 GB (mixed 4/8-bit)
+// A different shape from the families above. The 104 GB (uniform 4-bit) or 106 GB (mixed 4/8-bit)
 // checkpoint is NOT resident: its trunk (3.0 or 5.1 GB, see `FLASH_NEXT_BUILDS`) stays in memory,
 // the 68 GB of routed experts are served from the SSD through a pool of memory slots, and the
 // server sizes that pool from what the GPU's working set leaves after a prefill's reserve
@@ -481,9 +481,9 @@ export type FlashNextBuild = {
  *  with the token embedding read from disk (its default). */
 export const FLASH_NEXT_BUILDS = {
   /** `pipenetwork/Qwen3.8-Flash-Next-MLX-4bit`, every matrix at 4 bits. */
-  uniform: { trunkBytes: 3_025_000_000, expertBytes: 2_764_800, diskModelBytes: 97e9 },
+  uniform: { trunkBytes: 3_025_000_000, expertBytes: 2_764_800, diskModelBytes: 103.8e9 },
   /** `pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit`, the dense matrices at 8 bits. */
-  mixed: { trunkBytes: 5_132_000_000, expertBytes: 2_764_800, diskModelBytes: 106e9 },
+  mixed: { trunkBytes: 5_132_000_000, expertBytes: 2_764_800, diskModelBytes: 106.2e9 },
 } as const satisfies Record<string, FlashNextBuild>;
 
 /** One expert of the 3-bit copy (`Build::COPY_EXPERT_BYTES`). */

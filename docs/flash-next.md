@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next on a Mac with 16–36 GB
 
 Flash-Next (`pipenetwork/Qwen3.8-Flash-Next-MLX-4bit`, 125B parameters, 6B active) is a
-mixture-of-experts model whose routed experts are 68 GB of its 97 GB. lumen keeps the rest (about 3.6 GB
+mixture-of-experts model whose routed experts are 68 GB of its 104 GB. lumen keeps the rest (about 3 GB
 of attention, DeltaNet and shared weights) in memory and serves the routed experts from the SSD through
 a pool of memory slots, so the model runs on a Mac whose RAM is a fraction of its size. The output is
 the model's own: an expert's bytes are the checkpoint's bytes, read from disk instead of memory. The same

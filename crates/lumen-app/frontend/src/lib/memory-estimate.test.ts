@@ -625,12 +625,12 @@ test("the slow-disk warning follows the measured random speed", () => {
 });
 
 test("the disk the model needs is its build's weights plus the optional pack and draft head", () => {
-  assert.equal(flashNextDiskBytes(UNIFORM, { pack: false, mtp: false }), 97e9);
-  assert.equal(flashNextDiskBytes(UNIFORM, { pack: true, mtp: true }), 97e9 + 68e9 + 1.5e9);
-  assert.equal(flashNextDiskBytes(MIXED, { pack: false, mtp: false }), 106e9);
-  assert.equal(flashNextDiskBytes(MIXED, { pack: true, mtp: false }), 106e9 + 68e9);
+  assert.equal(flashNextDiskBytes(UNIFORM, { pack: false, mtp: false }), 103.8e9);
+  assert.equal(flashNextDiskBytes(UNIFORM, { pack: true, mtp: true }), 103.8e9 + 68e9 + 1.5e9);
+  assert.equal(flashNextDiskBytes(MIXED, { pack: false, mtp: false }), 106.2e9);
+  assert.equal(flashNextDiskBytes(MIXED, { pack: true, mtp: false }), 106.2e9 + 68e9);
   // Serving the copy does not remove the checkpoint.
-  assert.equal(flashNextDiskBytes(MIXED_COPY, { pack: false, mtp: false }), 106e9);
+  assert.equal(flashNextDiskBytes(MIXED_COPY, { pack: false, mtp: false }), 106.2e9);
 });
 
 // ── The constants mirror the Rust side (src/flash_next.rs) ──────────────────
