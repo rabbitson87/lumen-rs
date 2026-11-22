@@ -214,16 +214,20 @@ fn check_module(
         "module {module}: weight is {}, expected U32",
         weight.dtype
     );
+    // Shapes come from the file, so their products are checked, not trusted.
+    let overflow = || anyhow!("module {module}: its shape overflows usize");
     let packed = last_dim(module, weight)?;
     let bits = spec.bits as usize;
-    let unpacked = packed * 32;
+    let unpacked = packed.checked_mul(32).ok_or_else(overflow)?;
     ensure!(
         unpacked % bits == 0,
         "module {module}: {packed} packed 32-bit words do not split into {bits}-bit values"
     );
     let in_features = unpacked / bits;
     let groups = last_dim(module, scales)?;
-    let covered = groups * spec.group_size as usize;
+    let covered = groups
+        .checked_mul(spec.group_size as usize)
+        .ok_or_else(overflow)?;
     ensure!(
         covered == in_features,
         "module {module}: {groups} scales x group {} cover {covered} input features, \
@@ -384,5 +388,23 @@ mod tests {
             text.contains("x.weight") && text.contains("packed tensor of no quantized module"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_shape_whose_product_overflows_is_an_error_not_a_panic() {
+        let huge_weight = vec![
+            tensor("m.weight", "U32", &[2, usize::MAX / 16]),
+            tensor("m.scales", "BF16", &[2, 1]),
+            tensor("m.biases", "BF16", &[2, 1]),
+        ];
+        let huge_scales = vec![
+            tensor("m.weight", "U32", &[2, 8]),
+            tensor("m.scales", "BF16", &[2, usize::MAX / 32]),
+            tensor("m.biases", "BF16", &[2, usize::MAX / 32]),
+        ];
+        for tensors in [huge_weight, huge_scales] {
+            let err = check_packed_shapes(&tensors, &affine4(), 1).unwrap_err();
+            assert!(err.to_string().contains("overflows usize"), "{err}");
+        }
     }
 }
