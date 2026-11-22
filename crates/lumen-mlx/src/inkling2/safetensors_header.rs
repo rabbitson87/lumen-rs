@@ -32,6 +32,10 @@ struct RawTensor {
 
 /// Bytes before the JSON header: its length as a little-endian u64.
 const LEN_PREFIX: u64 = 8;
+/// The largest header accepted, as in the reference parser and
+/// `offload::expert_store`. A corrupt prefix on a multi-GB shard must not
+/// allocate and read most of the file.
+const MAX_HEADER_LEN: u64 = 100_000_000;
 const METADATA_KEY: &str = "__metadata__";
 
 /// Reads the header of the shard at `path`. Tensors come back sorted by name.
@@ -49,6 +53,10 @@ pub fn read_header(path: &Path) -> Result<Vec<TensorInfo>> {
     file.read_exact(&mut len_bytes)
         .with_context(|| format!("{file_name}: truncated: shorter than its length prefix"))?;
     let header_len = u64::from_le_bytes(len_bytes);
+    ensure!(
+        header_len <= MAX_HEADER_LEN,
+        "{file_name}: header declares {header_len} bytes, over the {MAX_HEADER_LEN}-byte cap"
+    );
     ensure!(
         header_len <= file_len.saturating_sub(LEN_PREFIX),
         "{file_name}: truncated: header declares {header_len} bytes, the file has {file_len}"

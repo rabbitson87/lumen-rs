@@ -387,7 +387,7 @@ fn a_truncated_shard_fails_the_header_check() {
 }
 
 /// The length prefix is checked against the file before the header buffer is
-/// allocated, so a corrupt prefix cannot ask for an arbitrary allocation.
+/// allocated, so a corrupt prefix asks for at most the file's own size.
 #[test]
 fn a_length_prefix_past_the_end_of_the_file_is_rejected_before_reading() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -401,6 +401,24 @@ fn a_length_prefix_past_the_end_of_the_file_is_rejected_before_reading() {
     assert!(
         err.to_string()
             .contains(&format!("header declares {file_len} bytes")),
+        "{err}"
+    );
+}
+
+/// A prefix over the 100 MB cap is rejected before the file size is consulted,
+/// so even a multi-GB shard cannot be read whole as its header.
+#[test]
+fn a_length_prefix_over_the_cap_is_rejected() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("model-00009-of-00009.safetensors");
+    let header = r#"{"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#;
+    let mut bytes = shard_bytes(header, 16);
+    bytes[..8].copy_from_slice(&100_000_001u64.to_le_bytes());
+    std::fs::write(&path, &bytes).expect("write shard");
+    let err = read_header(&path).expect_err("a prefix over the cap is rejected");
+    assert!(
+        err.to_string()
+            .contains("header declares 100000001 bytes, over the 100000000-byte cap"),
         "{err}"
     );
 }
