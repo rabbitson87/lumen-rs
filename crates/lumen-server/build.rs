@@ -162,9 +162,10 @@ fn walk(dir: &PathBuf, best: &mut Option<(std::time::SystemTime, PathBuf)>, dept
     }
 }
 
-/// Diagnostic — locate any mlx-sys-* build directories under `root` and dump
-/// their out/build/ layout so a failed CI run shows what mlx-sys actually
-/// produced (vs guessing). Bounded to 3 levels of recursion under `root`.
+/// Diagnostic — locate mlx-sys's build directories under `root`
+/// (`build/mlx-sys-<hash>/`, or `build/mlx-sys/<hash>/` on cargo 1.100+) and
+/// dump their out/ layout so a failed CI run shows what mlx-sys actually
+/// produced (vs guessing). Bounded to 4 levels below each out/.
 fn list_mlx_sys_dirs(root: &Path) {
     let Ok(rd) = std::fs::read_dir(root.join("release/build")) else {
         // Try other common profile dirs if `release` isn't there.
@@ -187,9 +188,25 @@ fn list_mlx_sys_dirs_inner(build_dir: &PathBuf) {
     for entry in rd.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str.starts_with("mlx-sys-") {
-            eprintln!("found mlx-sys dir: {}", entry.path().display());
-            let out_dir = entry.path().join("out");
+        let dirs: Vec<PathBuf> = if name_str.starts_with("mlx-sys-") {
+            vec![entry.path()]
+        } else if name_str == "mlx-sys" {
+            // cargo 1.100+: one `<hash>/` per build under `build/mlx-sys/`.
+            std::fs::read_dir(entry.path())
+                .map(|hashes| {
+                    hashes
+                        .flatten()
+                        .map(|h| h.path())
+                        .filter(|p| p.is_dir())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            continue;
+        };
+        for dir in dirs {
+            eprintln!("found mlx-sys dir: {}", dir.display());
+            let out_dir = dir.join("out");
             if !out_dir.is_dir() {
                 eprintln!("  (no out/ subdir — build script likely didn't run)");
                 continue;
