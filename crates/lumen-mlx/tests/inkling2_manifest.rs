@@ -249,6 +249,20 @@ fn each_layout_rule_rejects_its_own_violation() {
             "repeats the role",
         ),
         (
+            "attn_input.query missing on a layer past the first",
+            Box::new(|t| t.retain(|x| x.name != "model.layers.12.attn_input.query")),
+            "is missing model.layers.12.attn_input.query",
+        ),
+        (
+            "attn_input.query on layer 0",
+            Box::new(|t| {
+                let mut first = find_mut(t, "model.layers.1.attn_input.query").clone();
+                first.name = "model.layers.0.attn_input.query".into();
+                t.push(first);
+            }),
+            "model.layers.0.attn_input.query is on layer 0",
+        ),
+        (
             "a zero-padded layer index",
             Box::new(|t| find_mut(t, IN_PROJ).name = "model.layers.00.attn.in_proj.weight".into()),
             "unknown tensor key \"model.layers.00.attn.in_proj.weight\"",

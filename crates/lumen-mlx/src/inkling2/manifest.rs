@@ -11,6 +11,8 @@
 //! - each (role, layer) occurs at most once;
 //! - a local-only role sits only on local layers, a global-only role only on
 //!   global layers, a core-only role only inside the loop's core range;
+//! - a role placed on all but the first layer is required on each later layer
+//!   and forbidden on layer 0;
 //! - every role a layer must carry is present on each such layer;
 //! - vision and MTP layers each carry their full role set.
 
@@ -47,6 +49,8 @@ pub enum Placement {
     Core,
     /// Required on every layer of its part.
     EveryLayer,
+    /// Required on every layer of its part but the first, forbidden on layer 0.
+    AllButFirst,
     /// Allowed on any layer, required on none.
     AnyLayer,
 }
@@ -154,8 +158,10 @@ roles! {
             ExpertsW2Weight = "model.layers.N.mlp.experts.w2.weight",
             ExpertsW2Scales = "model.layers.N.mlp.experts.w2.scales",
         }
-        AnyLayer {
+        AllButFirst {
             AttnInputQuery = "model.layers.N.attn_input.query",
+        }
+        AnyLayer {
             ExpertsW13Biases = "model.layers.N.mlp.experts.w13.biases",
             ExpertsW13GlobalScale = "model.layers.N.mlp.experts.w13.global_scale",
             ExpertsW2Biases = "model.layers.N.mlp.experts.w2.biases",
@@ -370,6 +376,7 @@ fn check_layout(cfg: &Inkling2Config, entries: &[Entry]) -> Result<()> {
                     Placement::Local => kind == Some(LayerKind::Local),
                     Placement::Global => kind == Some(LayerKind::Global),
                     Placement::Core => core,
+                    Placement::AllButFirst => layer > 0,
                     _ => true,
                 };
                 let required = allowed && placement != Placement::AnyLayer;
