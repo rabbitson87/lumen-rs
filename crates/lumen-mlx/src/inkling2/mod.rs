@@ -14,8 +14,10 @@ mod config;
 mod manifest;
 mod quant;
 mod safetensors_header;
+mod text_config;
 
 pub use config::{Inkling2Config, LayerKind, LoopConfig, MtpConfig, TextConfig, VisionConfig};
 pub use manifest::{Entry, Manifest, Part, Placement, Role};
 pub use quant::{PackedSummary, QuantMode, QuantSpec, QuantTable, check_packed_shapes};
 pub use safetensors_header::{TensorInfo, read_header};
+pub use text_config::{AttnDims, LoopArgs, TextArgs};
