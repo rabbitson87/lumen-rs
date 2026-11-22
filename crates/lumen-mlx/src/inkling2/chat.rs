@@ -517,9 +517,9 @@ mod tests {
     /// encodes is what [`TextTokenizer::encode_prompt`] encodes, for every case whose client text
     /// spells no control token.
     #[test]
-    #[ignore = "needs the real tokenizer.json; set LUMEN_INKLING2_DIR to the checkpoint directory"]
+    #[ignore = "needs the real tokenizer.json; set LUMEN_INKLING2_MODEL_DIR to the checkpoint directory"]
     fn every_golden_prompt_encodes_to_the_ids_hf_gives() {
-        let dir = std::env::var("LUMEN_INKLING2_DIR").expect("LUMEN_INKLING2_DIR");
+        let dir = std::env::var("LUMEN_INKLING2_MODEL_DIR").expect("LUMEN_INKLING2_MODEL_DIR");
         let tok = crate::text_tokenizer::TextTokenizer::from_file(
             std::path::Path::new(&dir).join("tokenizer.json"),
         )

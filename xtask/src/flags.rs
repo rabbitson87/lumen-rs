@@ -410,7 +410,11 @@ fn source_mentions(var: &str) -> Result<bool, String> {
 /// stand-in, so the timing that remains prices the stage. It carries a value, so `flag!` cannot
 /// hold it, and its output is garbage by design: a profiling probe like the other `LUMEN_PROBE_*`
 /// reads, never a setting.
-const UNMANAGED_BASELINE: usize = 195;
+/// 195 -> 196, deliberately, with `LUMEN_INKLING2_MODEL_DIR` (task 036): the checkpoint directory the
+/// ignored real-checkpoint tests of the Inkling 2 backend and renderer read, named like the
+/// `LUMEN_GEMMA4_MODEL_DIR` and `LUMEN_QWEN35_MODEL_DIR` of the other families. A path, not a
+/// boolean, so `flag!` cannot hold it, and only test code reads it.
+const UNMANAGED_BASELINE: usize = 196;
 
 /// Every `LUMEN_*` read via `env::var` in library source, and whether the
 /// registry knows about it.

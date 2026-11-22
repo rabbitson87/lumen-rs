@@ -511,10 +511,10 @@ mod tests {
     }
 }
 
-/// The backend on the real checkpoint. Set `LUMEN_INKLING2_DIR` to the checkpoint directory:
+/// The backend on the real checkpoint. Set `LUMEN_INKLING2_MODEL_DIR` to the checkpoint directory:
 ///
 /// ```text
-/// LUMEN_INKLING2_DIR=~/.slotstream/models/Inkling-2-Mini-oQ4e-mtp \
+/// LUMEN_INKLING2_MODEL_DIR=~/.slotstream/models/Inkling-2-Mini-oQ4e-mtp \
 ///   cargo test -p lumen-mlx --features mlx-native --lib inkling2::backend -- --ignored --test-threads=1
 /// ```
 #[cfg(test)]
@@ -522,7 +522,7 @@ mod real_checkpoint_tests {
     use super::*;
 
     fn backend() -> Inkling2Backend {
-        let dir = std::env::var("LUMEN_INKLING2_DIR").expect("LUMEN_INKLING2_DIR");
+        let dir = std::env::var("LUMEN_INKLING2_MODEL_DIR").expect("LUMEN_INKLING2_MODEL_DIR");
         Inkling2Backend::from_dir("inkling2", Path::new(&dir)).expect("load")
     }
 
@@ -544,7 +544,7 @@ mod real_checkpoint_tests {
     }
 
     #[test]
-    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_DIR"]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
     fn a_repeated_prompt_is_fed_only_its_last_token_and_says_the_same() {
         let mut b = backend();
         let turns = [ChatTurn::User("Name one primary color. One word.")];
@@ -559,7 +559,7 @@ mod real_checkpoint_tests {
     }
 
     #[test]
-    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_DIR"]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
     fn a_turn_continued_from_the_retained_caches_says_what_a_cold_prefill_says() {
         let mut b = backend();
         let first = [ChatTurn::User(
@@ -595,7 +595,7 @@ mod real_checkpoint_tests {
     }
 
     #[test]
-    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_DIR"]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
     fn an_edited_history_falls_back_to_a_cold_prefill() {
         let mut b = backend();
         greedy(&mut b, &[ChatTurn::User("Say hello.")], 16);
@@ -605,7 +605,7 @@ mod real_checkpoint_tests {
     }
 
     #[test]
-    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_DIR"]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
     fn a_stop_from_the_sink_ends_the_turn_and_is_not_an_error() {
         let mut b = backend();
         let turns = [ChatTurn::User(
