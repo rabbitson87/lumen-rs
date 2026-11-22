@@ -83,13 +83,17 @@ fn locate_target_dirs() -> (PathBuf, PathBuf) {
     let out_dir = std::env::var_os("OUT_DIR")
         .map(PathBuf::from)
         .expect("OUT_DIR not set by Cargo");
-    // OUT_DIR layouts:
-    //   non-target: target/<profile>/build/<pkg>/out          (4 climbs -> target/)
-    //   with triple: target/<triple>/<profile>/build/<pkg>/out (4 climbs -> target/<triple>)
+    // OUT_DIR layouts (4 climbs):
+    //   older cargo, no triple:  target/<profile>/build/<pkg>/out                -> target/
+    //   older cargo, triple:     target/<triple>/<profile>/build/<pkg>/out       -> target/<triple>
+    //   cargo 1.100+, no triple: target/<profile>/build/<pkg>/<hash>/out         -> target/<profile>
+    //   cargo 1.100+, triple:    target/<triple>/<profile>/build/<pkg>/<hash>/out -> target/<triple>/<profile>
+    // Either way the first root holds mlx-sys's build dirs, which the walk
+    // finds at any depth.
     let triple_dir = climb(&out_dir, 4);
-    // One more climb gets us to target/ even in the triple case. If we were
-    // already at target/ root, this would go to the workspace root — handled
-    // by the search itself (mlx-sys dirs only exist under target/).
+    // One more climb is a wider second root. From target/ it reaches the
+    // workspace root, which the search also handles: only paths under an
+    // mlx-sys build dir are taken.
     let root_dir = climb(&triple_dir, 1);
     (triple_dir, root_dir)
 }
@@ -104,7 +108,7 @@ fn climb(start: &Path, levels: usize) -> PathBuf {
     p
 }
 
-fn find_metallib(target_dir: &PathBuf) -> Option<PathBuf> {
+fn find_metallib(target_dir: &Path) -> Option<PathBuf> {
     // mlx-sys writes the metallib somewhere under
     //   <target>/<profile>/build/mlx-sys-<hash>/out/build/...   (older cargo)
     //   <target>/<profile>/build/mlx-sys/<hash>/out/build/...   (cargo 1.100+)
@@ -114,11 +118,18 @@ fn find_metallib(target_dir: &PathBuf) -> Option<PathBuf> {
     // Walk a generous depth so cross-compiled CI builds and any future
     // CMake layout change still find it.
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    walk(target_dir, &mut best, 16);
+    walk(target_dir, target_dir, &mut best, 16);
     best.map(|(_, p)| p)
 }
 
-fn walk(dir: &PathBuf, best: &mut Option<(std::time::SystemTime, PathBuf)>, depth_budget: usize) {
+/// Walks `dir`, keeping the newest `mlx.metallib` that sits in one of mlx-sys's
+/// build dirs below `root`.
+fn walk(
+    root: &Path,
+    dir: &Path,
+    best: &mut Option<(std::time::SystemTime, PathBuf)>,
+    depth_budget: usize,
+) {
     if depth_budget == 0 {
         return;
     }
@@ -128,7 +139,7 @@ fn walk(dir: &PathBuf, best: &mut Option<(std::time::SystemTime, PathBuf)>, dept
     for entry in rd.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            walk(&path, best, depth_budget - 1);
+            walk(root, &path, best, depth_budget - 1);
         } else if path.file_name().and_then(|s| s.to_str()) == Some("mlx.metallib") {
             // GUARD: only ever embed mlx-sys's *own* build output. Never a
             // colocated copy such as `target/<profile>/mlx.metallib`, which
@@ -140,7 +151,12 @@ fn walk(dir: &PathBuf, best: &mut Option<(std::time::SystemTime, PathBuf)>, dept
             // GPU-kernel dev that dropped mlx's full steel_attention set,
             // breaking Gemma 4 prefill with "function … not found in library").
             // mlx-sys's real artifacts always live under one of its build dirs.
+            // Only the part below `root` counts, so a target dir that is
+            // itself named like one (CARGO_TARGET_DIR=…/mlx-sys-cache) cannot
+            // let the colocated copy through.
             let under_mlx_sys = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
                 .components()
                 .any(|c| mlx_sys_dir(&c.as_os_str().to_string_lossy()).is_some());
             if !under_mlx_sys {
