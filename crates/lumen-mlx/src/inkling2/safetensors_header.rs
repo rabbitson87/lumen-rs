@@ -142,6 +142,13 @@ mod tests {
     }
 
     #[test]
+    fn a_header_longer_than_the_file_is_reported_as_truncated() {
+        let err = parse_header("s.safetensors", 4, TWO.as_bytes())
+            .expect_err("a header past the end of the file is rejected");
+        assert!(err.to_string().contains("header ends at byte"), "{err}");
+    }
+
+    #[test]
     fn backwards_offsets_are_rejected() {
         let header = r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[4,0]}}"#;
         let err = parse(header, 4).expect_err("backwards offsets are rejected");

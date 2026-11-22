@@ -5,8 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use lumen_mlx::inkling2::{
-    Inkling2Config, LayerKind, Manifest, PackedSummary, Part, QuantMode, QuantSpec, QuantTable,
-    Role, TensorInfo, check_packed_shapes, read_header,
+    Inkling2Config, LayerKind, Manifest, PackedSummary, Part, Placement, QuantMode, QuantSpec,
+    QuantTable, Role, TensorInfo, check_packed_shapes, read_header,
 };
 use serde::Deserialize;
 
@@ -194,6 +194,162 @@ fn attn_in_proj_on_global_layer_5_is_an_error() {
     );
 }
 
+fn find_mut<'a>(tensors: &'a mut [TensorInfo], name: &str) -> &'a mut TensorInfo {
+    tensors
+        .iter_mut()
+        .find(|t| t.name == name)
+        .unwrap_or_else(|| panic!("the fixture has {name}"))
+}
+
+type Edit = Box<dyn Fn(&mut Vec<TensorInfo>)>;
+
+/// Each case breaks one layout rule of the fixture, and the error must be that rule's.
+#[test]
+fn each_layout_rule_rejects_its_own_violation() {
+    const IN_PROJ: &str = "model.layers.0.attn.in_proj.weight";
+    let once = Role::ALL
+        .iter()
+        .copied()
+        .find(|r| r.part() == Part::Mtp && r.placement() == Placement::Once)
+        .expect("an MTP role placed once");
+    let cases: Vec<(&str, Edit, &str)> = vec![
+        (
+            "an MTP tensor in a main shard",
+            Box::new(|t| {
+                find_mut(t, "fuse_weight").file = "model-00001-of-00004.safetensors".into();
+            }),
+            "but sits in",
+        ),
+        (
+            "a text layer past the last one",
+            Box::new(|t| {
+                let mut extra = find_mut(t, IN_PROJ).clone();
+                extra.name = "model.layers.24.attn.in_proj.weight".into();
+                t.push(extra);
+            }),
+            "layer 24 is not below the 24",
+        ),
+        (
+            "a missing tensor that appears once",
+            Box::new(move |t| t.retain(|x| x.name != once.key())),
+            "missing required tensor",
+        ),
+        (
+            "one tensor listed in two shards",
+            Box::new(|t| {
+                let mut copy = find_mut(t, IN_PROJ).clone();
+                copy.file = "model-00002-of-00004.safetensors".into();
+                t.push(copy);
+            }),
+            "repeats the role",
+        ),
+    ];
+    let (cfg, tensors) = fixture();
+    for (what, edit, expected) in cases {
+        let mut broken = tensors.clone();
+        edit(&mut broken);
+        let err = Manifest::build(&cfg, &broken).expect_err(what);
+        assert!(err.to_string().contains(expected), "{what}: {err}");
+    }
+}
+
+/// Each case breaks one packed-shape rule of one quantized module, and the
+/// error must name that module and that rule.
+#[test]
+fn each_packed_shape_rule_rejects_its_own_violation() {
+    const NVFP4: &str = "model.layers.0.mlp.experts.w13";
+    const AFFINE: &str = "model.layers.20.mlp.experts.w13";
+    fn part(module: &str, suffix: &str, dtype: &str, shape: &[usize]) -> TensorInfo {
+        TensorInfo {
+            name: format!("{module}.{suffix}"),
+            dtype: dtype.to_string(),
+            shape: shape.to_vec(),
+            file: "model-00001-of-00004.safetensors".to_string(),
+        }
+    }
+    let cases: Vec<(&str, &str, Edit, &str)> = vec![
+        (
+            "weight not packed",
+            AFFINE,
+            Box::new(|t| find_mut(t, &format!("{AFFINE}.weight")).dtype = "BF16".into()),
+            "expected U32",
+        ),
+        (
+            "scales and weight differ in a leading dim",
+            AFFINE,
+            Box::new(|t| find_mut(t, &format!("{AFFINE}.scales")).shape[0] += 1),
+            "differ in their leading dims",
+        ),
+        (
+            "affine scales not BF16",
+            AFFINE,
+            Box::new(|t| find_mut(t, &format!("{AFFINE}.scales")).dtype = "F32".into()),
+            "affine scales are F32",
+        ),
+        (
+            "affine biases of another shape",
+            AFFINE,
+            Box::new(|t| find_mut(t, &format!("{AFFINE}.biases")).shape[0] += 1),
+            "affine biases must be",
+        ),
+        (
+            "affine module with a global_scale",
+            AFFINE,
+            Box::new(|t| t.push(part(AFFINE, "global_scale", "F32", &[128]))),
+            "affine module has a global_scale",
+        ),
+        (
+            "nvfp4 scales not U8",
+            NVFP4,
+            Box::new(|t| find_mut(t, &format!("{NVFP4}.scales")).dtype = "BF16".into()),
+            "nvfp4 scales are BF16",
+        ),
+        (
+            "nvfp4 module with biases",
+            NVFP4,
+            Box::new(|t| t.push(part(NVFP4, "biases", "BF16", &[128, 2304, 144]))),
+            "nvfp4 module has biases",
+        ),
+        (
+            "nvfp4 global_scale of another shape",
+            NVFP4,
+            Box::new(|t| find_mut(t, &format!("{NVFP4}.global_scale")).shape = vec![127]),
+            "nvfp4 global_scale must be",
+        ),
+    ];
+    let (cfg, tensors) = fixture();
+    let table = quant(&cfg);
+    for (what, module, edit, expected) in cases {
+        let mut broken = tensors.clone();
+        edit(&mut broken);
+        let err =
+            check_packed_shapes(&broken, &table, cfg.text_config.n_routed_experts).expect_err(what);
+        let text = err.to_string();
+        assert!(
+            text.contains(module) && text.contains(expected),
+            "{what}: {text}"
+        );
+    }
+}
+
+#[test]
+fn an_override_that_names_no_quantized_module_is_rejected() {
+    let (mut cfg, tensors) = fixture();
+    let module = "model.layers.0.attn.nothing";
+    cfg.quantization.insert(
+        module.to_string(),
+        serde_json::json!({"bits": 8, "group_size": 64, "mode": "affine"}),
+    );
+    let table = quant(&cfg);
+    let err = check_packed_shapes(&tensors, &table, cfg.text_config.n_routed_experts)
+        .expect_err("an override of a module that is not there");
+    let text = err.to_string();
+    assert!(
+        text.contains(module) && text.contains("names no quantized module"),
+        "{text}"
+    );
+}
+
 /// A shard file: the u64 length, the JSON header, then `body` zero bytes.
 fn shard_bytes(header: &str, body: usize) -> Vec<u8> {
     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
@@ -220,4 +376,23 @@ fn a_truncated_shard_fails_the_header_check() {
     file.set_len(complete_len - 8).expect("truncate shard");
     let err = read_header(&path).expect_err("a truncated shard is rejected");
     assert!(err.to_string().contains("truncated"), "{err}");
+}
+
+/// The length prefix is checked against the file before the header buffer is
+/// allocated, so a corrupt prefix cannot ask for an arbitrary allocation.
+#[test]
+fn a_length_prefix_past_the_end_of_the_file_is_rejected_before_reading() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("model-00009-of-00009.safetensors");
+    let header = r#"{"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#;
+    let mut bytes = shard_bytes(header, 16);
+    let file_len = bytes.len() as u64;
+    bytes[..8].copy_from_slice(&file_len.to_le_bytes());
+    std::fs::write(&path, &bytes).expect("write shard");
+    let err = read_header(&path).expect_err("a prefix past the end is rejected");
+    assert!(
+        err.to_string()
+            .contains(&format!("header declares {file_len} bytes")),
+        "{err}"
+    );
 }
