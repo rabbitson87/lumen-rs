@@ -11,6 +11,7 @@
 //! replica built with that reference. Not here yet: chat serving, the vision tower, the draft
 //! head.
 
+mod chat;
 mod config;
 mod manifest;
 #[cfg(feature = "mlx-native")]
@@ -23,6 +24,7 @@ mod safetensors_header;
 mod tests;
 mod text_config;
 
+pub use chat::{DEFAULT_EFFORT, Effort, render_prompt};
 pub use config::{Inkling2Config, LayerKind, LoopConfig, MtpConfig, TextConfig, VisionConfig};
 pub use manifest::{Entry, Manifest, Part, Placement, Role};
 #[cfg(feature = "mlx-native")]
