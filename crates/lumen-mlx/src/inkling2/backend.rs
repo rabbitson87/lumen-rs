@@ -457,10 +457,17 @@ impl Inkling2Backend {
             prompt.ids.len(),
             self.max_context
         );
-        let (mut cache, mut points, start) = self.take_reusable(&prompt.keys);
         let began = std::time::Instant::now();
+        // The features come first, before the retained conversation is taken: an image that turns
+        // out unreadable is the client's error, and must not cost it the caches.
+        let hint = self.reusable_start(&prompt.keys);
         let image_began = std::time::Instant::now();
-        let rows = self.image_rows(prompt, sources, start)?;
+        let mut rows = self.image_rows(prompt, sources, hint)?;
+        let (mut cache, mut points, start) = self.take_reusable(&prompt.keys);
+        if start != hint {
+            // The caches could not be taken back after all: the images before `start` are fed too.
+            rows = self.image_rows(prompt, sources, start)?;
+        }
         let image_ms = image_began.elapsed().as_secs_f64() * 1e3;
         let images_encoded = prompt
             .runs
@@ -573,6 +580,17 @@ impl Inkling2Backend {
             mlx_rs::ops::concatenate_axis(&refs, 0)?
         };
         Ok(Some(ImageRows::new(slots, all)?))
+    }
+
+    /// How many leading tokens of `keys` the retained caches can supply: where
+    /// [`Self::take_reusable`] will take them back to, without taking them.
+    fn reusable_start(&self, keys: &[Key]) -> usize {
+        self.retained
+            .as_ref()
+            .and_then(|kept| {
+                reusable_point(kept.points.iter().map(|(len, _)| *len), &kept.keys, keys)
+            })
+            .unwrap_or(0)
     }
 
     /// The retained caches taken back to the longest point `prompt` shares with them, or fresh
@@ -1008,6 +1026,9 @@ mod real_checkpoint_tests {
     #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
     fn images_in_the_wrong_message_or_not_an_image_are_refused_as_client_errors() {
         let mut b = backend();
+        // A conversation the caches hold: a refused request must leave it there.
+        let held = [ChatTurn::User("Name one primary color. One word.")];
+        greedy(&mut b, &held, 24);
         let ov = SamplingOverrides::default();
         let mut ask = |turns: &[ChatTurn<'_>], images: &[Vec<Vec<u8>>]| {
             b.chat(
@@ -1035,6 +1056,17 @@ mod real_checkpoint_tests {
                 .is_some(),
             "{in_system}"
         );
+        // A picture whose header reads fine and whose pixels do not: refused after the prompt is
+        // built, where the retained conversation could already have been taken.
+        let mut cut_short = image.clone();
+        cut_short.truncate(cut_short.len() / 2);
+        let broken = ask(&[ChatTurn::User("hi")], &[vec![cut_short]]);
+        assert!(
+            broken
+                .downcast_ref::<crate::chat_io::UnsupportedRequest>()
+                .is_some(),
+            "{broken}"
+        );
         let not_an_image = ask(
             &[ChatTurn::User("hi")],
             &[vec![b"definitely not an image".to_vec()]],
@@ -1044,6 +1076,11 @@ mod real_checkpoint_tests {
                 .downcast_ref::<crate::chat_io::UnsupportedRequest>()
                 .is_some(),
             "{not_an_image}"
+        );
+        greedy(&mut b, &held, 24);
+        assert!(
+            b.last_run().reused_tokens > 0,
+            "the refused requests cost the client its retained conversation"
         );
     }
 
