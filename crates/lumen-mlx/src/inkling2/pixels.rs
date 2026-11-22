@@ -96,7 +96,7 @@ fn composite_over_checkerboard(rgba: &image::RgbaImage, w: usize, h: usize) -> V
 pub(crate) fn blocks_from_rgb(rgb: &[u8], w: usize, h: usize) -> PreparedImage {
     let (rows, cols) = (blocks_for(h), blocks_for(w));
     // The value a pad pixel has after normalization: -1 on the 0-255 scale.
-    let pad = (-1.0f32 * RESCALE - MEAN) / STD;
+    let pad = (-RESCALE - MEAN) / STD;
     let mut blocks = vec![pad; rows * cols * BLOCK_VALUES];
     for r in 0..rows {
         for c in 0..cols {
