@@ -31,6 +31,10 @@ mod safetensors_header;
 #[cfg(all(test, feature = "mlx-native"))]
 mod tests;
 mod text_config;
+#[cfg(feature = "mlx-native")]
+mod vision;
+#[cfg(all(test, feature = "mlx-native"))]
+mod vision_tests;
 
 #[cfg(feature = "mlx-native")]
 pub use backend::{Inkling2Backend, RunStats, named_effort, turns_from_pairs};
@@ -47,3 +51,5 @@ pub use quant::{PackedSummary, QuantMode, QuantSpec, QuantTable, check_packed_sh
 pub use response::{Markers, ResponseParser};
 pub use safetensors_header::{TensorInfo, read_header};
 pub use text_config::{AttnDims, LoopArgs, TextArgs};
+#[cfg(feature = "mlx-native")]
+pub use vision::{VisionArgs, VisionTower};

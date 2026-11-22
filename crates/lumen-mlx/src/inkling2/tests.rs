@@ -36,14 +36,14 @@ fn reference(name: &str) -> HashMap<String, Array> {
     Array::load_safetensors(fixture_dir().join("reference").join(name)).expect("reference file")
 }
 
-fn host_f32(a: &Array) -> Vec<f32> {
+pub(super) fn host_f32(a: &Array) -> Vec<f32> {
     let a = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
     a.eval().unwrap();
     a.try_as_slice::<f32>().unwrap().to_vec()
 }
 
 /// (max |a-b|, min cosine over rows of `width`) between two flat buffers.
-fn compare(a: &[f32], b: &[f32], width: usize) -> (f32, f32) {
+pub(super) fn compare(a: &[f32], b: &[f32], width: usize) -> (f32, f32) {
     assert_eq!(a.len(), b.len());
     let max_abs = a
         .iter()
