@@ -5530,7 +5530,6 @@ impl MlxQwen35Backend {
     /// desync, this degrades to a plain greedy decode — the server-side
     /// first-JSON-value trim still yields a parseable object in the common case.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn chat_response_format_impl<F>(
         &mut self,
         prompt_ids: Vec<u32>,
