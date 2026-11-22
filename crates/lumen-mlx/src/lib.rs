@@ -41,6 +41,8 @@ pub mod gemma4_tool_syntax;
 mod gemma4_tools;
 pub mod gemma4_vision;
 pub mod grammar;
+/// `inkling2_loop` checkpoint parsing: config, shard headers, manifest, quantization. Ungated, no MLX.
+pub mod inkling2;
 mod jinja_chat;
 #[doc(hidden)]
 pub mod parser_contract;
