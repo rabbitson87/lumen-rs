@@ -106,7 +106,8 @@ fn climb(start: &Path, levels: usize) -> PathBuf {
 
 fn find_metallib(target_dir: &PathBuf) -> Option<PathBuf> {
     // mlx-sys writes the metallib somewhere under
-    //   <target>/<profile>/build/mlx-sys-<hash>/out/build/...
+    //   <target>/<profile>/build/mlx-sys-<hash>/out/build/...   (older cargo)
+    //   <target>/<profile>/build/mlx-sys/<hash>/out/build/...   (cargo 1.100+)
     // The exact depth depends on the mlx CMake layout (sometimes
     // `out/build/lib/mlx.metallib`, sometimes
     // `out/build/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib`).
@@ -138,8 +139,13 @@ fn walk(dir: &PathBuf, best: &mut Option<(std::time::SystemTime, PathBuf)>, dept
             // stale or incomplete metallib (e.g. one assembled during nvfp4
             // GPU-kernel dev that dropped mlx's full steel_attention set,
             // breaking Gemma 4 prefill with "function … not found in library").
-            // mlx-sys's real artifacts always live under `…/mlx-sys-<hash>/out/…`.
-            if !path.to_string_lossy().contains("mlx-sys-") {
+            // mlx-sys's real artifacts always live under a directory named
+            // `mlx-sys-<hash>` or, in cargo's newer build-dir layout, `mlx-sys`.
+            let under_mlx_sys = path.components().any(|c| {
+                let name = c.as_os_str().to_string_lossy();
+                name == "mlx-sys" || name.starts_with("mlx-sys-")
+            });
+            if !under_mlx_sys {
                 continue;
             }
             if let Ok(meta) = entry.metadata() {
