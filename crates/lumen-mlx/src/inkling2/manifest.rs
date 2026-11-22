@@ -317,12 +317,16 @@ fn classify(cfg: &Inkling2Config, t: &TensorInfo) -> Result<Entry> {
 }
 
 /// The key with its layer index replaced by `N`, and that index. `None` when a
-/// layered prefix is not followed by an index and a tail.
+/// layered prefix is not followed by an index and a tail, or when the index is
+/// not written the canonical way (`05` and `+5` are not layer 5).
 fn normalize(name: &str) -> Option<(String, Option<usize>)> {
     for prefix in LAYERED_PREFIXES {
         if let Some(rest) = name.strip_prefix(prefix) {
             let (index, tail) = rest.split_once('.')?;
-            let layer = index.parse().ok()?;
+            let layer: usize = index.parse().ok()?;
+            if layer.to_string() != index {
+                return None;
+            }
             return Some((format!("{prefix}N.{tail}"), Some(layer)));
         }
     }
@@ -433,5 +437,15 @@ mod tests {
         );
         assert_eq!(normalize("model.layers.x.attn"), None);
         assert_eq!(normalize("layers.2"), None);
+    }
+
+    #[test]
+    fn a_padded_or_signed_layer_index_is_not_a_layer() {
+        assert_eq!(normalize("model.layers.05.attn.q_proj.weight"), None);
+        assert_eq!(normalize("model.layers.+5.attn.q_proj.weight"), None);
+        assert_eq!(
+            normalize("model.layers.0.attn.q_proj.weight"),
+            Some(("model.layers.N.attn.q_proj.weight".into(), Some(0)))
+        );
     }
 }

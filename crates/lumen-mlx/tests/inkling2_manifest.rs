@@ -248,6 +248,11 @@ fn each_layout_rule_rejects_its_own_violation() {
             }),
             "repeats the role",
         ),
+        (
+            "a zero-padded layer index",
+            Box::new(|t| find_mut(t, IN_PROJ).name = "model.layers.00.attn.in_proj.weight".into()),
+            "unknown tensor key \"model.layers.00.attn.in_proj.weight\"",
+        ),
     ];
     let (cfg, tensors) = fixture();
     for (what, edit, expected) in cases {
