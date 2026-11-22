@@ -19,6 +19,7 @@ mod model;
 #[cfg(feature = "mlx-native")]
 mod ops;
 mod quant;
+mod response;
 mod safetensors_header;
 #[cfg(all(test, feature = "mlx-native"))]
 mod tests;
@@ -30,5 +31,6 @@ pub use manifest::{Entry, Manifest, Part, Placement, Role};
 #[cfg(feature = "mlx-native")]
 pub use model::{Inkling2Cache, Inkling2Model, LoadOptions};
 pub use quant::{PackedSummary, QuantMode, QuantSpec, QuantTable, check_packed_shapes};
+pub use response::{Markers, ResponseParser};
 pub use safetensors_header::{TensorInfo, read_header};
 pub use text_config::{AttnDims, LoopArgs, TextArgs};
