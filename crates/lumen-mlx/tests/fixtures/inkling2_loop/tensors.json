@@ -1,0 +1,10088 @@
+{
+ "source": "Inkling-2-Mini-oQ4e-mtp safetensors headers",
+ "tensors": [
+  {
+   "name": "fuse_weight",
+   "dtype": "BF16",
+   "shape": [
+    4,
+    4
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.dflare_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.input_layernorm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.mlp.down_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    9216
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.mlp.gate_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    9216,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.mlp.up_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    9216,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.post_attention_layernorm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.self_attn.k_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.self_attn.k_norm_ctx.weight",
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.self_attn.k_proj_ctx.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.self_attn.o_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    3072
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.self_attn.q_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    3072,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.0.self_attn.v_proj_ctx.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.dflare_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.input_layernorm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.mlp.down_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    9216
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.mlp.gate_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    9216,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.mlp.up_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    9216,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.post_attention_layernorm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.self_attn.k_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.self_attn.k_norm_ctx.weight",
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.self_attn.k_proj_ctx.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.self_attn.o_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    3072
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.self_attn.q_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    3072,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.1.self_attn.v_proj_ctx.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.dflare_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.input_layernorm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.mlp.down_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    9216
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.mlp.gate_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    9216,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.mlp.up_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    9216,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.post_attention_layernorm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.self_attn.k_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.self_attn.k_norm_ctx.weight",
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.self_attn.k_proj_ctx.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.self_attn.o_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    3072
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.self_attn.q_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    3072,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "layers.2.self_attn.v_proj_ctx.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "lm_head.biases",
+   "dtype": "BF16",
+   "shape": [
+    201024,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "lm_head.scales",
+   "dtype": "BF16",
+   "shape": [
+    201024,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "lm_head.weight",
+   "dtype": "U32",
+   "shape": [
+    201024,
+    576
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "markov_head.dflare_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "markov_head.hidden_out.bias",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "markov_head.hidden_out.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    256
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "markov_head.markov_w1.weight",
+   "dtype": "BF16",
+   "shape": [
+    201024,
+    256
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "markov_head.rnn_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    768
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "markov_head.rnn_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    768,
+    5120
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "mask_embed",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "model.embed.biases",
+   "dtype": "BF16",
+   "shape": [
+    201024,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.embed.scales",
+   "dtype": "BF16",
+   "shape": [
+    201024,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.embed.weight",
+   "dtype": "U32",
+   "shape": [
+    201024,
+    576
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.embed_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.final_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.0.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.1.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.10.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.k_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.k_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.k_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    1056,
+    576
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.k_static",
+   "dtype": "BF16",
+   "shape": [
+    4,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.q_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    6552,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.q_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    6552,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.q_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    6552,
+    576
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.v_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.v_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.v_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    1056,
+    576
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn.v_static",
+   "dtype": "BF16",
+   "shape": [
+    4,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    3,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.k_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.q_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.11.v_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.12.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.13.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.14.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.15.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.16.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.k_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.k_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.k_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    1056,
+    576
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.k_static",
+   "dtype": "BF16",
+   "shape": [
+    4,
+    1024
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.q_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    6552,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.q_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    6552,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.q_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    6552,
+    576
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.v_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.v_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.v_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    1056,
+    576
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn.v_static",
+   "dtype": "BF16",
+   "shape": [
+    4,
+    1024
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    3,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.k_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.q_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.17.v_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.18.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.19.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.2.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp.experts.w13.biases",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp.experts.w13.scales",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    36
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp.experts.w2.biases",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    18
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp.experts.w2.scales",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    18
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.20.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00002-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp.experts.w13.biases",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp.experts.w13.scales",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp.experts.w2.biases",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    18
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp.experts.w2.scales",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    18
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.21.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp.experts.w13.biases",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp.experts.w13.scales",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp.experts.w2.biases",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    18
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp.experts.w2.scales",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    18
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.22.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.k_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.k_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.k_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    1056,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.k_static",
+   "dtype": "BF16",
+   "shape": [
+    4,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.q_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    6552,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.q_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    6552,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.q_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    6552,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.v_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.v_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.v_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    1056,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn.v_static",
+   "dtype": "BF16",
+   "shape": [
+    4,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    3,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.k_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp.experts.w13.biases",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp.experts.w13.scales",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp.experts.w2.biases",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    18
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp.experts.w2.scales",
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2304,
+    18
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.q_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.23.v_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.3.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.4.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.k_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.k_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.k_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    1056,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.k_static",
+   "dtype": "BF16",
+   "shape": [
+    4,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.q_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    6552,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.q_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    6552,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.q_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    6552,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.v_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.v_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    1056,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.v_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    1056,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn.v_static",
+   "dtype": "BF16",
+   "shape": [
+    4,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    3,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.k_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.q_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.5.v_input_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.6.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.7.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.8.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00003-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.in_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.in_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    8600,
+    36
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.in_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    8600,
+    576
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.k_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.o_proj.biases",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.o_proj.scales",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    48
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.o_proj.weight",
+   "dtype": "U32",
+   "shape": [
+    2304,
+    768
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.q_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    128
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.r_scale",
+   "dtype": "BF16",
+   "shape": [
+    24,
+    16
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.rel_proj",
+   "dtype": "BF16",
+   "shape": [
+    16,
+    1024
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn.v_conv",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.attn_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.loop_down",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2,
+    2304,
+    64
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.loop_gain_forget",
+   "dtype": "F32",
+   "shape": [
+    4,
+    64,
+    4608
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.loop_message.query",
+   "dtype": "F32",
+   "shape": [
+    4,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp.experts.w13.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp.experts.w13.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp.experts.w13.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    288
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp.experts.w2.global_scale",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp.experts.w2.scales",
+   "dtype": "U8",
+   "shape": [
+    128,
+    2304,
+    72
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp.experts.w2.weight",
+   "dtype": "U32",
+   "shape": [
+    128,
+    2304,
+    144
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp.router_bias",
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp.router_weight",
+   "dtype": "F32",
+   "shape": [
+    128,
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp_conv",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp_input.query",
+   "dtype": "F32",
+   "shape": [
+    1,
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "model.layers.9.mlp_norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00004-of-00004.safetensors"
+  },
+  {
+   "name": "model.norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "norm.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304
+   ],
+   "file": "mtp.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.embeddings.class_embedding",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.embeddings.cls_position_embedding",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.embeddings.patch_embedding.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1200
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.embeddings.position_embedding",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.0.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.1.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.10.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.11.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.12.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.13.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.14.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.15.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.16.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.17.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.18.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.19.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.2.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.20.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.21.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.22.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.3.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.4.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.5.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.6.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.7.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.8.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.ln_1.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.ln_1.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.ln_2.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.ln_2.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.ls_1.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.ls_2.gamma",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.mlp.c_fc.bias",
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.mlp.c_fc.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.mlp.c_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.mlp.c_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.self_attn.k_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.self_attn.k_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.self_attn.out_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.self_attn.out_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.self_attn.q_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.self_attn.q_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.self_attn.v_proj.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.layers.9.self_attn.v_proj.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024,
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.ln_pre.bias",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.backbone.ln_pre.weight",
+   "dtype": "BF16",
+   "shape": [
+    1024
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.proj_in.weight",
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  },
+  {
+   "name": "vision_tower.proj_out.weight",
+   "dtype": "BF16",
+   "shape": [
+    2304,
+    4096
+   ],
+   "file": "model-00001-of-00004.safetensors"
+  }
+ ]
+}

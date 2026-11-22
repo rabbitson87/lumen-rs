@@ -98,8 +98,11 @@ reads, and self-updates from GitHub Releases.
 2. Download the `aarch64` `.dmg`. **Apple Silicon only, macOS 14 or
    later** — MLX is ARM64-native and refuses to build on x86_64, so there
    is no Intel Mac bundle. The release's Metal kernels are compiled for
-   macOS 14, which leaves out the M5 Neural Accelerator prefill kernels; a
-   source build on macOS 26.2+ includes them.
+   macOS 14, which leaves out the M5 Neural Accelerator prefill kernels.
+   Source builds use the same macOS 14 target by default
+   (`.cargo/config.toml`); setting `MACOSX_DEPLOYMENT_TARGET` to 26.2 or later
+   turns those kernels on, but the pinned MLX does not yet compile them
+   against the Xcode 27.2 SDK.
 3. Drag `Lumen.app` to `/Applications`. Releases are built without an
    Apple Developer ID certificate and are not notarized, so macOS blocks
    the first launch of the download ("Apple could not verify “Lumen” is

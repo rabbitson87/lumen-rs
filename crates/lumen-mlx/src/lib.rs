@@ -41,6 +41,8 @@ pub mod gemma4_tool_syntax;
 mod gemma4_tools;
 pub mod gemma4_vision;
 pub mod grammar;
+/// `inkling2_loop` checkpoint parsing: config, shard headers, manifest, quantization. Ungated, no MLX.
+pub mod inkling2;
 mod jinja_chat;
 #[doc(hidden)]
 pub mod parser_contract;
@@ -5529,7 +5531,6 @@ impl MlxQwen35Backend {
     /// On grammar build failure (`grammar == None`) or a mid-decode matcher
     /// desync, this degrades to a plain greedy decode — the server-side
     /// first-JSON-value trim still yields a parseable object in the common case.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn chat_response_format_impl<F>(
         &mut self,

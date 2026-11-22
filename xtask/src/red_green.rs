@@ -1446,8 +1446,8 @@ static DEFECTS: &[Defect] = &[
                   from a cold one",
         revert: &[Mutation {
             path: MLX,
-            find: "s.point_grid == grid && grid.is_some_and(|g| g.is_cut(kept))",
-            replace: "grid.is_some_and(|g| g.is_cut(kept)) /* defect: the grid is not compared */",
+            find: "s.point_grid == grid && is_cut(kept)",
+            replace: "is_cut(kept) /* defect: the grid is not compared */",
         }],
         guards: &[core_mlx_lib(
             "tests::a_point_cut_on_another_grid_is_not_resumed",

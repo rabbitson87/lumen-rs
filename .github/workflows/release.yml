@@ -61,7 +61,8 @@ jobs:
     # so the release carries no M5 Neural Accelerator (NAX) kernels — those need
     # Metal 4.0, i.e. a 26.2 target — and MLX compiles its NAX path out
     # (MLX_METAL_NO_NAX). Wider install base chosen over the M5 prefill speedup;
-    # a source build on macOS 26.2+ still gets it. Keep it equal to
+    # a source build gets it only by setting MACOSX_DEPLOYMENT_TARGET >= 26.2
+    # itself (.cargo/config.toml defaults to the same 14.0). Keep it equal to
     # `bundle.macOS.minimumSystemVersion` in crates/lumen-app/tauri.conf.json
     # (a test in crates/lumen-server/tests/packaging.rs checks).
     env:
