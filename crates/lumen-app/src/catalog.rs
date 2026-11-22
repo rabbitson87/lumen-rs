@@ -20,6 +20,7 @@ pub enum ModelFamily {
     Qwen35Moe,
     Gemma4,
     Qwen4Exp,
+    Inkling2,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

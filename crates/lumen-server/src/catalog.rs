@@ -30,6 +30,9 @@ pub enum ModelFamily {
     /// Qwen 3.8 Flash-Next (`qwen4_exp`, 125B-A6B): its routed experts and n-gram
     /// table are served from the SSD. mlx-native backend.
     Qwen4Exp,
+    /// Thinking Machines Inkling 2 (`inkling2_loop`, Inkling-2-Mini 26.4B-A3.4B): a looped MoE
+    /// whose middle 12 layers run three times per token. mlx-native backend, text only.
+    Inkling2,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +111,12 @@ pub const FAMILIES: &[FamilyInfo] = &[
         label: "Qwen 3.8 Flash-Next",
         backend: "mlx-native",
         notes: "125B-A6B hybrid MoE streamed from the SSD (experts and a 32 GB n-gram table stay on disk): runs on 16-36 GB Macs at SSD-bound speed.",
+    },
+    FamilyInfo {
+        family: ModelFamily::Inkling2,
+        label: "Inkling 2",
+        backend: "mlx-native",
+        notes: "Thinking Machines' looped mixture-of-experts (Mini: 26.4B total, 3.4B active; the middle 12 layers run three times per token). Text chat with reasoning and tool calls; no images, response_format or draft-head speculation yet.",
     },
     FamilyInfo {
         family: ModelFamily::Gemma4,
@@ -259,6 +268,21 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         min_ram_gb: 16,
         notes: "**Size / speed tier** — NVFP4 base with 3-bit MoE experts + 4-bit dense MLP. 12.5 GB and the fastest decode of the family (~78 tok/s, even faster than the base). GSM8K 84% (base 88%, within noise) — 3-bit expert noise absorbed by MoE top-8 routing; closer to the base than stock it-4bit despite 3 GB smaller. Best for: 16 GB Macs, max throughput, or running alongside other models. Korean + thinking-mode retained from the NVFP4 base.",
     },
+    RecommendedModel {
+        // Inkling-2-Mini, oMLX's oQ4e build: experts of layers 0-19 in their NVFP4 source format,
+        // 20-23 affine 4-bit, attention / embeddings / head 8-bit (4.9 bits per weight). The text
+        // model is ~15.5 GiB in memory; the 0.6 GiB vision tower and the 0.6 GiB draft head are
+        // downloaded with the repo and not loaded. Measured on an M3 Max: a 5,167-token prompt
+        // peaks at 17.2 GiB (allocator), prefill 400 tok/s, decode 22-25 tok/s; each cached token
+        // costs 192 KiB, so the context is capped at 64K tokens (12 GiB).
+        id: "mlx-community/Inkling-2-Mini-oQ4e-mtp",
+        revision: None,
+        family: ModelFamily::Inkling2,
+        label: "Inkling 2 Mini — 26.4B-A3.4B looped MoE (oQ4e)",
+        approx_size_gb: 17,
+        min_ram_gb: 24,
+        notes: "**A looped reasoning MoE: 26.4B parameters, 3.4B active, its middle 12 layers run three times per token.** 4.9 bits per weight, ~16 GB of RAM for the weights plus 192 KB per token of context (64K tokens at most). Chat with reasoning (`reasoning_effort`: none, minimal, low, medium, high, xhigh, max, or a number up to 0.99) and tool calls; reuses the previous turn's state, so a follow-up feeds only the new tokens. Not yet: image input, `response_format`, a forced `tool_choice`, and the bundled draft head. Decode ~22-25 tok/s on an M3 Max.",
+    },
 ];
 
 /// Recommended embedding models. Curated list of Qwen3-Embedding family —
@@ -340,12 +364,21 @@ pub fn family_of(model_id: &str) -> Option<ModelFamily> {
     if is_gemma4(&lower) {
         return Some(ModelFamily::Gemma4);
     }
+    if is_inkling2(&lower) {
+        return Some(ModelFamily::Inkling2);
+    }
     // Strict match — don't accept arbitrary IDs as "Qwen 2.5". Must contain
     // the explicit version marker.
     if lower.contains("qwen2.5") || lower.contains("qwen2_5") {
         return Some(ModelFamily::Qwen25);
     }
     None
+}
+
+fn is_inkling2(lower_id: &str) -> bool {
+    lower_id.contains("inkling-2")
+        || lower_id.contains("inkling2")
+        || lower_id.contains("inkling_2")
 }
 
 fn is_gemma4(lower_id: &str) -> bool {
@@ -492,6 +525,33 @@ mod tests {
                 .any(|f| matches!(f.family, ModelFamily::Qwen4Exp))
         );
         assert_eq!(family_of(row.id), Some(row.family));
+    }
+
+    #[test]
+    fn inkling2_is_its_own_family_with_a_recommended_row() {
+        for id in [
+            "mlx-community/Inkling-2-Mini-oQ4e-mtp",
+            "thinkingmachines/Inkling-2-Mini",
+            "my-inkling2-copy",
+        ] {
+            assert_eq!(family_of(id), Some(ModelFamily::Inkling2), "{id}");
+        }
+        let Catalog {
+            recommended,
+            families,
+            ..
+        } = catalog();
+        let row = recommended
+            .iter()
+            .find(|r| r.id == "mlx-community/Inkling-2-Mini-oQ4e-mtp")
+            .expect("the Inkling 2 row is recommended");
+        assert!(matches!(row.family, ModelFamily::Inkling2));
+        assert_eq!(family_of(row.id), Some(row.family));
+        assert!(
+            families
+                .iter()
+                .any(|f| matches!(f.family, ModelFamily::Inkling2))
+        );
     }
 
     #[test]
