@@ -396,6 +396,12 @@ pub struct SamplingOverrides {
     /// that do not understand the concept ignore it, so the field is inert for
     /// every model except a checkpoint whose own chat template declares it.
     pub reasoning_effort: Option<crate::chat_io::ReasoningEffort>,
+    /// The client's `reasoning_effort`, as it was spelled, whether or not thinking turned out to
+    /// be on. [`Self::reasoning_effort`] is Qwen's three levels and drops the spellings that mean
+    /// "no thinking"; a checkpoint whose template has a wider vocabulary of its own (Inkling 2:
+    /// `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a number) reads this one.
+    /// Inert for every other family.
+    pub reasoning_effort_raw: Option<String>,
 }
 
 /// Output of `Runner::forward_probe`: per-row argmaxes + max-abs logit + new

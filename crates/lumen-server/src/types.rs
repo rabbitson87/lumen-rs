@@ -193,6 +193,7 @@ impl ChatCompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             stop: stop_field_vec(&self.stop),
+            reasoning_effort_raw: self.reasoning_effort.clone(),
             parallel_tool_calls: self.parallel_tool_calls,
             // Only meaningful when thinking is actually on — the upstream
             // template gates its whole effort block on `enable_thinking`. The
@@ -1022,6 +1023,7 @@ impl CompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             stop: stop_field_vec(&self.stop),
+            reasoning_effort_raw: None,
             // /v1/completions has no tools, so no tool-call count to cap.
             parallel_tool_calls: None,
             // Raw-prompt completions bypass the chat template entirely, so
@@ -1044,6 +1046,7 @@ impl AnthropicRequest {
             presence_penalty: None,
             frequency_penalty: None,
             stop: self.stop_sequences.clone().unwrap_or_default(),
+            reasoning_effort_raw: None,
             // Anthropic hangs the knob off `tool_choice`, inverted.
             parallel_tool_calls: self
                 .tool_choice

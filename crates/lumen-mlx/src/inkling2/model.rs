@@ -954,6 +954,11 @@ struct VisitCache {
     conv: [Option<Array>; 4],
 }
 
+/// The convolution states of every layer visit at one point of a sequence ([`Inkling2Cache::conv_snapshot`]).
+/// The KV caches only append, so they can be cut back to any length; these cannot, which is why
+/// a point to go back to has to be recorded when the sequence is there.
+pub struct ConvSnapshot(Vec<[Option<Array>; 4]>);
+
 /// One entry per layer visit (`TextArgs::layer_schedule`): a layer in the loop core has one for
 /// each pass.
 pub struct Inkling2Cache {
@@ -984,6 +989,45 @@ impl Inkling2Cache {
             }
         }
         Ok(total)
+    }
+
+    /// The convolution states of every layer visit, to put back with [`Self::rewind`]. Evaluated
+    /// here, so what is kept is the small state and not the graph that made it.
+    pub fn conv_snapshot(&self) -> Result<ConvSnapshot> {
+        let snapshot: Vec<[Option<Array>; 4]> =
+            self.visits.iter().map(|v| v.conv.clone()).collect();
+        mlx_rs::transforms::eval(snapshot.iter().flatten().flatten())?;
+        Ok(ConvSnapshot(snapshot))
+    }
+
+    /// Goes back to `len` tokens: the KV caches drop what is past it (they only ever append) and
+    /// the convolution states are the ones `conv` was taken with, which must have been taken at
+    /// exactly `len` tokens.
+    pub fn rewind(&mut self, len: usize, conv: &ConvSnapshot) -> Result<()> {
+        ensure!(
+            conv.0.len() == self.visits.len(),
+            "the snapshot has {} entries, the cache {}",
+            conv.0.len(),
+            self.visits.len()
+        );
+        for (visit, states) in self.visits.iter_mut().zip(&conv.0) {
+            visit.kv.truncate_to(len)?;
+            visit.conv = states.clone();
+        }
+        Ok(())
+    }
+
+    /// Evaluates the caches' arrays: the KV buffers and the convolution states. A prefill chunk
+    /// ends with this, so the lazy graph of one chunk is not carried into the next.
+    pub fn eval_state(&self) -> Result<()> {
+        let mut pending: Vec<&Array> = Vec::new();
+        for visit in &self.visits {
+            pending.extend(visit.kv.keys());
+            pending.extend(visit.kv.values());
+            pending.extend(visit.conv.iter().flatten());
+        }
+        mlx_rs::transforms::eval(pending)?;
+        Ok(())
     }
 }
 
@@ -1090,6 +1134,28 @@ impl Inkling2Model {
                 })
                 .collect(),
         }
+    }
+
+    /// Feeds `ids` to the caches without computing logits, and evaluates the result.
+    pub fn advance(&self, ids: &[u32], cache: &mut Inkling2Cache) -> Result<()> {
+        self.hidden(ids, cache, None)?.eval()?;
+        cache.eval_state()
+    }
+
+    /// Feeds `ids` in chunks of at most `chunk` tokens and returns the logits of the last one,
+    /// `[1, 1, vocab]`, evaluated. Only the last chunk pays for the output layer: a chunk's
+    /// activations are bounded by its length, the whole prompt's would not be.
+    pub fn prefill(&self, ids: &[u32], cache: &mut Inkling2Cache, chunk: usize) -> Result<Array> {
+        ensure!(!ids.is_empty(), "no token ids");
+        let chunk = chunk.max(1);
+        let last_start = (ids.len() - 1) / chunk * chunk;
+        for piece in ids[..last_start].chunks(chunk) {
+            self.advance(piece, cache)?;
+        }
+        let logits = self.forward(&ids[last_start..], cache, true)?;
+        logits.eval()?;
+        cache.eval_state()?;
+        Ok(logits)
     }
 
     /// Logits `[1, L, vocab]` float32 for `ids`, the next tokens after `cache.len()` (or `[1, 1,
