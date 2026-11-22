@@ -162,7 +162,11 @@ fn an_unknown_key_is_an_error_that_names_the_key() {
         file: "model-00001-of-00004.safetensors".to_string(),
     });
     let err = Manifest::build(&cfg, &tensors).expect_err("an unknown key is rejected");
-    assert!(err.to_string().contains(key), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("unknown tensor key") && text.contains(key),
+        "{text}"
+    );
 }
 
 #[test]
@@ -172,7 +176,7 @@ fn deleting_layer_5_q_proj_is_an_error() {
     let err = Manifest::build(&cfg, &tensors).expect_err("a missing q_proj is rejected");
     let text = err.to_string();
     assert!(
-        text.contains("layer 5") && text.contains("q_proj"),
+        text.contains("layer 5") && text.contains("is missing model.layers.5.attn.q_proj."),
         "{text}"
     );
 }
@@ -189,7 +193,8 @@ fn attn_in_proj_on_global_layer_5_is_an_error() {
     let err = Manifest::build(&cfg, &tensors).expect_err("a local-only role on a global layer");
     let text = err.to_string();
     assert!(
-        text.contains("in_proj") && text.contains("layer 5"),
+        text.contains("model.layers.5.attn.in_proj.weight is on layer 5")
+            && text.contains("which may not carry it"),
         "{text}"
     );
 }
@@ -375,7 +380,10 @@ fn a_truncated_shard_fails_the_header_check() {
         .expect("reopen shard");
     file.set_len(complete_len - 8).expect("truncate shard");
     let err = read_header(&path).expect_err("a truncated shard is rejected");
-    assert!(err.to_string().contains("truncated"), "{err}");
+    assert!(
+        err.to_string().contains("truncated: tensor w ends at byte"),
+        "{err}"
+    );
 }
 
 /// The length prefix is checked against the file before the header buffer is

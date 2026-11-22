@@ -331,7 +331,10 @@ mod tests {
         let scalar = QuantTable::from_block(&block(json!({
             "bits": 4, "group_size": 64, "mode": "affine", "quant_method": "x"
         })));
-        assert!(scalar.is_err());
+        let scalar = scalar
+            .expect_err("a scalar override is rejected")
+            .to_string();
+        assert!(scalar.contains("quant_method is not an object"), "{scalar}");
         let mode = QuantTable::from_block(&block(json!({
             "bits": 4, "group_size": 64, "mode": "mxfp4"
         })));
@@ -365,13 +368,21 @@ mod tests {
             }
         );
         let err = check_packed_shapes(&affine_module(2), &affine4(), 1).unwrap_err();
-        assert!(err.to_string().contains("module m"), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("module m") && text.contains("cover 128 input features"),
+            "{text}"
+        );
     }
 
     #[test]
     fn a_packed_tensor_with_no_scales_is_an_orphan() {
         let tensors = vec![tensor("x.weight", "U32", &[2, 8])];
         let err = check_packed_shapes(&tensors, &affine4(), 1).unwrap_err();
-        assert!(err.to_string().contains("x.weight"), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("x.weight") && text.contains("packed tensor of no quantized module"),
+            "{text}"
+        );
     }
 }

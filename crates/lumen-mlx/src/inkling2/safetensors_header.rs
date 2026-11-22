@@ -132,7 +132,11 @@ mod tests {
     #[test]
     fn one_byte_short_is_reported_as_truncated() {
         let err = parse(TWO, 11).expect_err("a short shard is rejected");
-        assert!(err.to_string().contains("truncated"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("truncated: tensor a.scales ends at byte"),
+            "{err}"
+        );
     }
 
     #[test]
