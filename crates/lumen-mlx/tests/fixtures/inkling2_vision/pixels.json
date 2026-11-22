@@ -1,0 +1,85 @@
+{
+ "images": [
+  {
+   "name": "rgb 37x53 (one column, two rows of blocks)",
+   "png": "image_00.png",
+   "blocks": "image_00.blocks.bin",
+   "rows": 2,
+   "cols": 1,
+   "mode": "RGB",
+   "transparent": false
+  },
+  {
+   "name": "rgba 45x41 with an alpha ramp",
+   "png": "image_01.png",
+   "blocks": "image_01.blocks.bin",
+   "rows": 2,
+   "cols": 2,
+   "mode": "RGBA",
+   "transparent": true
+  },
+  {
+   "name": "gray 40x40 (exactly one block)",
+   "png": "image_02.png",
+   "blocks": "image_02.blocks.bin",
+   "rows": 1,
+   "cols": 1,
+   "mode": "L",
+   "transparent": false
+  },
+  {
+   "name": "gray with alpha 17x23",
+   "png": "image_03.png",
+   "blocks": "image_03.blocks.bin",
+   "rows": 1,
+   "cols": 1,
+   "mode": "LA",
+   "transparent": true
+  },
+  {
+   "name": "palette with a transparent index 50x30",
+   "png": "image_04.png",
+   "blocks": "image_04.blocks.bin",
+   "rows": 1,
+   "cols": 2,
+   "mode": "P",
+   "transparent": true
+  },
+  {
+   "name": "rgb 80x40 (two blocks across)",
+   "png": "image_05.png",
+   "blocks": "image_05.blocks.bin",
+   "rows": 1,
+   "cols": 2,
+   "mode": "RGB",
+   "transparent": false
+  },
+  {
+   "name": "rgba 20x20, fully opaque",
+   "png": "image_06.png",
+   "blocks": "image_06.blocks.bin",
+   "rows": 1,
+   "cols": 1,
+   "mode": "RGBA",
+   "transparent": true
+  },
+  {
+   "name": "rgb 1x1",
+   "png": "image_07.png",
+   "blocks": "image_07.blocks.bin",
+   "rows": 1,
+   "cols": 1,
+   "mode": "RGB",
+   "transparent": false
+  },
+  {
+   "name": "rgb 41x81 (one pixel over a block each way)",
+   "png": "image_08.png",
+   "blocks": "image_08.blocks.bin",
+   "rows": 3,
+   "cols": 2,
+   "mode": "RGB",
+   "transparent": false
+  }
+ ]
+}

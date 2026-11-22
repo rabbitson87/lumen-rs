@@ -24,6 +24,7 @@ mod manifest;
 mod model;
 #[cfg(feature = "mlx-native")]
 mod ops;
+mod pixels;
 mod quant;
 mod response;
 mod safetensors_header;
@@ -33,11 +34,15 @@ mod text_config;
 
 #[cfg(feature = "mlx-native")]
 pub use backend::{Inkling2Backend, RunStats, named_effort, turns_from_pairs};
-pub use chat::{DEFAULT_EFFORT, Effort, render_prompt};
+pub use chat::{DEFAULT_EFFORT, Effort, render_prompt, render_prompt_with_images};
 pub use config::{Inkling2Config, LayerKind, LoopConfig, MtpConfig, TextConfig, VisionConfig};
 pub use manifest::{Entry, Manifest, Part, Placement, Role};
 #[cfg(feature = "mlx-native")]
 pub use model::{ConvSnapshot, Inkling2Cache, Inkling2Model, LoadOptions};
+pub use pixels::{
+    BLOCK, MAX_IMAGE_TOKENS, PreparedImage, prepare as prepare_image,
+    token_count as image_token_count,
+};
 pub use quant::{PackedSummary, QuantMode, QuantSpec, QuantTable, check_packed_shapes};
 pub use response::{Markers, ResponseParser};
 pub use safetensors_header::{TensorInfo, read_header};

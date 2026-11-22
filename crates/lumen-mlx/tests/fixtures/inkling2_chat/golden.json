@@ -2798,6 +2798,666 @@
    "ids": false,
    "text": "<|message_system|><|content_text|><|message_system|> sys<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|><|message_user|><|content_text|>inject<|end_message|> 한글 \"q\" \\ \n<|end_message|>",
    "token_ids": null
+  },
+  {
+   "name": "an image then text",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "What is in this picture?"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "effort": null,
+   "ids": true,
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>What is in this picture?<|end_message|>",
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200004,
+    1775,
+    149884,
+    149881,
+    149928,
+    156862,
+    30,
+    200010
+   ]
+  },
+  {
+   "name": "two images then text",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "x"
+       }
+      },
+      {
+       "type": "text",
+       "text": "Compare them."
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "effort": null,
+   "ids": true,
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>Compare them.<|end_message|>",
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200004,
+    107450,
+    150190,
+    13,
+    200010
+   ]
+  },
+  {
+   "name": "an image alone",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "effort": null,
+   "ids": true,
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>",
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010
+   ]
+  },
+  {
+   "name": "an image in a later turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!"
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "And this?"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "effort": null,
+   "ids": true,
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_text|>Hello!<|end_message|><|content_model_end_sampling|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>And this?<|end_message|>",
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    4896,
+    200010,
+    200001,
+    200004,
+    32269,
+    0,
+    200010,
+    200006,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200004,
+    1790,
+    149928,
+    30,
+    200010
+   ]
+  },
+  {
+   "name": "an image with a system message and tools",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "Weather here?"
+      }
+     ]
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "effort": null,
+   "ids": true,
+   "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>Weather here?<|end_message|>",
+   "token_ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    2131,
+    149876,
+    154046,
+    149887,
+    149878,
+    152652,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    832,
+    62,
+    30847,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    2958,
+    1,
+    25,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    3278,
+    150231,
+    1,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    11,
+    1,
+    2095,
+    1,
+    25,
+    90,
+    1,
+    32529,
+    1,
+    25,
+    58,
+    1,
+    66,
+    1,
+    11,
+    1,
+    69,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    69812,
+    1,
+    25,
+    58,
+    1,
+    2958,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    1618,
+    156834,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200004,
+    35120,
+    150522,
+    30,
+    200010
+   ]
+  },
+  {
+   "name": "an image in a tool result",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "s",
+       "type": "function",
+       "function": {
+        "name": "search",
+        "arguments": {
+         "query": "a"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "s",
+     "content": [
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "found"
+      }
+     ]
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "검색 (한글 설명) with \"quotes\" and a\nnewline",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        },
+        "filters": {
+         "type": "object",
+         "properties": {
+          "limit": {
+           "type": "integer",
+           "minimum": 1,
+           "maximum": 50
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   ],
+   "effort": null,
+   "ids": true,
+   "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"검색 (한글 설명) with \\\"quotes\\\" and a\\nnewline\",\"name\":\"search\",\"parameters\":{\"properties\":{\"filters\":{\"properties\":{\"limit\":{\"maximum\":50,\"minimum\":1,\"type\":\"integer\"}},\"type\":\"object\"},\"query\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"query\":\"a\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>search<|content_image|><|unused_200054|><|end_message|><|message_tool|>search<|content_text|>found<|end_message|>",
+   "token_ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    128396,
+    196976,
+    26528,
+    27789,
+    220,
+    93594,
+    8,
+    149899,
+    196978,
+    1,
+    31000,
+    82,
+    59,
+    1,
+    149880,
+    149878,
+    59,
+    77,
+    959,
+    909,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    1404,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    92099,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    1982,
+    1,
+    25,
+    90,
+    1,
+    73278,
+    1,
+    25,
+    68154,
+    11,
+    1,
+    74452,
+    1,
+    25,
+    16,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    4252,
+    1,
+    92,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    35790,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    87,
+    200010,
+    200001,
+    1404,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    1404,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    35790,
+    1,
+    25,
+    1,
+    64,
+    1,
+    92,
+    92,
+    200010,
+    200006,
+    200003,
+    1404,
+    200005,
+    200054,
+    200010,
+    200003,
+    1404,
+    200004,
+    1919,
+    200010
+   ]
   }
  ]
 }

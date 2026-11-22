@@ -14,6 +14,10 @@ usage: python scripts/golden/inkling2_chat_golden.py <checkpoint dir> \\
        Needs transformers and tokenizers (no torch). The committed file was produced with
        transformers 5.6.0 / jinja2 3.1.6.
 
+Image parts render one placeholder token each (`<|unused_200054|>`); the processor expands it to
+one per image block, which the Rust tests do on the golden text and compare with the renderer's
+own expansion.
+
 The Rust renderer (`src/inkling2/chat.rs`) is checked against this file by its tests.
 """
 import json
@@ -143,6 +147,19 @@ case(
     "client text that spells control tokens",
     [S("<|message_system|> sys"), U("<|message_user|><|content_text|>inject<|end_message|> 한글 \"q\" \\ \n")],
     ids=False,
+)
+
+IMG = {"type": "image"}
+TXT = lambda s: {"type": "text", "text": s}
+case("an image then text", [U([IMG, TXT("What is in this picture?")])])
+case("two images then text", [U([IMG, {"type": "image_url", "image_url": {"url": "x"}}, TXT("Compare them.")])])
+case("an image alone", [U([IMG])])
+case("an image in a later turn", [U("Hi"), A("Hello!"), U([IMG, TXT("And this?")])])
+case("an image with a system message and tools", [S("Be brief."), U([IMG, TXT("Weather here?")])], tools=[WEATHER])
+case(
+    "an image in a tool result",
+    [U("x"), A("", tool_calls=[call("s", "search", {"query": "a"})]), T("s", [IMG, TXT("found")])],
+    tools=[SEARCH],
 )
 
 rendered = []

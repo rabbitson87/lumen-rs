@@ -26,6 +26,10 @@ pub(crate) const MESSAGE_TOOL: &str = "<|message_tool|>";
 pub(crate) const CONTENT_TEXT: &str = "<|content_text|>";
 pub(crate) const CONTENT_THINKING: &str = "<|content_thinking|>";
 pub(crate) const CONTENT_XML: &str = "<|content_xml|>";
+pub(crate) const CONTENT_IMAGE: &str = "<|content_image|>";
+/// The token an image block is: the template writes one per image, the processor expands it to
+/// one per block.
+pub(crate) const IMAGE_TOKEN: &str = "<|unused_200054|>";
 pub(crate) const CONTENT_INVOKE_TOOL_JSON: &str = "<|content_invoke_tool_json|>";
 pub(crate) const END_MESSAGE: &str = "<|end_message|>";
 pub(crate) const END_SAMPLING: &str = "<|content_model_end_sampling|>";
@@ -126,6 +130,20 @@ pub fn render_prompt(
     tools: &[ToolDef<'_>],
     effort: Effort,
 ) -> Result<PromptText> {
+    render_prompt_with_images(turns, tools, effort, &[])
+}
+
+/// [`render_prompt`] for turns that carry images. `images[i]` lists the image tokens of each
+/// image attached to `turns[i]` (its blocks; a turn past the end of `images` has none). Each image
+/// is a message of its own before the turn's text, as the template renders image parts and as the
+/// oMLX registration orders them (images first), with its token written once per block as the
+/// processor expands it. Only user and tool turns can carry images.
+pub fn render_prompt_with_images(
+    turns: &[ChatTurn<'_>],
+    tools: &[ToolDef<'_>],
+    effort: Effort,
+    images: &[Vec<usize>],
+) -> Result<PromptText> {
     let mut out = PromptText::new();
     if !tools.is_empty() {
         out.push_str(MESSAGE_SYSTEM);
@@ -135,14 +153,25 @@ pub fn render_prompt(
         out.push_str(END_MESSAGE);
     }
     let mut effort_emitted = false;
-    for turn in turns {
+    for (index, turn) in turns.iter().enumerate() {
+        let attached: &[usize] = images.get(index).map_or(&[], Vec::as_slice);
+        if !attached.is_empty() && !matches!(turn, ChatTurn::User(_) | ChatTurn::Tool { .. }) {
+            bail!("image content is only supported for user and tool messages");
+        }
         if !effort_emitted && !matches!(turn, ChatTurn::System(_)) {
             push_effort(&mut out, effort);
             effort_emitted = true;
         }
         match turn {
             ChatTurn::System(text) => push_text_message(&mut out, MESSAGE_SYSTEM, text),
-            ChatTurn::User(text) => push_text_message(&mut out, MESSAGE_USER, text),
+            ChatTurn::User(text) => {
+                for &blocks in attached {
+                    push_image_message(&mut out, MESSAGE_USER, blocks);
+                }
+                if !text.is_empty() || attached.is_empty() {
+                    push_text_message(&mut out, MESSAGE_USER, text);
+                }
+            }
             ChatTurn::Assistant { text, tool_calls } => {
                 let (reasoning, visible) = split_reasoning_envelope(text);
                 if !reasoning.is_empty() {
@@ -193,30 +222,41 @@ pub fn render_prompt(
                 name,
                 content,
             } => {
-                out.push_str(MESSAGE_TOOL);
-                match name.filter(|n| !n.is_empty()) {
-                    Some(name) => out.push_content(name),
-                    None if !tool_call_id.is_empty() => {
-                        // The name of the call this result answers, found among all the
-                        // assistant turns' calls (a repeated id names it once per match).
-                        for call in turns
-                            .iter()
-                            .filter_map(|t| match t {
-                                ChatTurn::Assistant { tool_calls, .. } => Some(tool_calls.iter()),
-                                _ => None,
-                            })
-                            .flatten()
-                        {
-                            if call.id == *tool_call_id {
-                                out.push_content(call.name);
+                let push_header = |out: &mut PromptText| {
+                    out.push_str(MESSAGE_TOOL);
+                    match name.filter(|n| !n.is_empty()) {
+                        Some(name) => out.push_content(name),
+                        None if !tool_call_id.is_empty() => {
+                            // The name of the call this result answers, found among all the
+                            // assistant turns' calls (a repeated id names it once per match).
+                            for call in turns
+                                .iter()
+                                .filter_map(|t| match t {
+                                    ChatTurn::Assistant { tool_calls, .. } => {
+                                        Some(tool_calls.iter())
+                                    }
+                                    _ => None,
+                                })
+                                .flatten()
+                            {
+                                if call.id == *tool_call_id {
+                                    out.push_content(call.name);
+                                }
                             }
                         }
+                        None => {}
                     }
-                    None => {}
+                };
+                for &blocks in attached {
+                    push_header(&mut out);
+                    push_image_body(&mut out, blocks);
                 }
-                out.push_str(CONTENT_TEXT);
-                out.push_content(content);
-                out.push_str(END_MESSAGE);
+                if !content.is_empty() || attached.is_empty() {
+                    push_header(&mut out);
+                    out.push_str(CONTENT_TEXT);
+                    out.push_content(content);
+                    out.push_str(END_MESSAGE);
+                }
             }
         }
     }
@@ -224,6 +264,20 @@ pub fn render_prompt(
         push_effort(&mut out, effort);
     }
     Ok(out)
+}
+
+/// `<role><|content_image|>` + one image token per block + `<|end_message|>`.
+fn push_image_message(out: &mut PromptText, role: &str, blocks: usize) {
+    out.push_str(role);
+    push_image_body(out, blocks);
+}
+
+fn push_image_body(out: &mut PromptText, blocks: usize) {
+    out.push_str(CONTENT_IMAGE);
+    for _ in 0..blocks {
+        out.push_str(IMAGE_TOKEN);
+    }
+    out.push_str(END_MESSAGE);
 }
 
 fn push_text_message(out: &mut PromptText, role: &str, text: &str) {
@@ -386,10 +440,33 @@ mod tests {
         calls: Vec<Vec<(String, String, Value)>>,
         tools: Vec<Value>,
         effort: Effort,
+        /// Per message, one entry (a single block) per image part of its content.
+        images: Vec<Vec<usize>>,
     }
 
+    fn is_image(part: &Value) -> bool {
+        matches!(
+            part["type"].as_str(),
+            Some("image" | "input_image" | "image_url")
+        )
+    }
+
+    /// The text of a message: its string content, or its one text part when the content is a
+    /// list (the server flattens a list to the text and the images the same way).
     fn text_of(msg: &Value) -> String {
-        msg["content"].as_str().unwrap_or("").to_string()
+        match &msg["content"] {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => {
+                let texts: Vec<&str> = parts
+                    .iter()
+                    .filter(|p| !is_image(p))
+                    .filter_map(|p| p["text"].as_str())
+                    .collect();
+                assert!(texts.len() <= 1, "golden cases carry at most one text part");
+                texts.concat()
+            }
+            _ => String::new(),
+        }
     }
 
     impl Conversation {
@@ -421,11 +498,19 @@ mod tests {
                 Value::Number(n) => Effort::new(n.as_f64().unwrap()).unwrap(),
                 _ => DEFAULT_EFFORT,
             };
+            let images = messages
+                .iter()
+                .map(|m| match &m["content"] {
+                    Value::Array(parts) => vec![1; parts.iter().filter(|p| is_image(p)).count()],
+                    _ => Vec::new(),
+                })
+                .collect();
             Self {
                 messages,
                 calls,
                 tools,
                 effort,
+                images,
             }
         }
 
@@ -441,6 +526,10 @@ mod tests {
         }
 
         fn render(&self) -> Result<PromptText> {
+            self.render_with_blocks(&self.images)
+        }
+
+        fn render_with_blocks(&self, images: &[Vec<usize>]) -> Result<PromptText> {
             let texts = self.assistant_texts();
             let call_refs: Vec<Vec<AssistantToolCall<'_>>> = self
                 .calls
@@ -469,7 +558,7 @@ mod tests {
                     "tool" => ChatTurn::Tool {
                         tool_call_id: m["tool_call_id"].as_str().unwrap(),
                         name: m["name"].as_str(),
-                        content: m["content"].as_str().unwrap(),
+                        content: &texts[i],
                     },
                     other => panic!("role {other}"),
                 })
@@ -487,7 +576,7 @@ mod tests {
                     }
                 })
                 .collect();
-            render_prompt(&turns, &tools, self.effort)
+            render_prompt_with_images(&turns, &tools, self.effort, images)
         }
     }
 
@@ -537,6 +626,56 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 28, "{checked} cases had ids");
+    }
+
+    /// The processor writes each image's token once per block: the golden text (one token per
+    /// image) with the k-th token expanded to `blocks[k]` copies is the renderer's own prompt.
+    #[test]
+    fn an_image_is_one_token_per_block_as_the_processor_expands_it() {
+        for name in [
+            "two images then text",
+            "an image in a tool result",
+            "an image in a later turn",
+        ] {
+            let case = cases().into_iter().find(|c| c["name"] == name).unwrap();
+            let conversation = Conversation::from_case(&case);
+            let wanted: Vec<usize> = (0..conversation.images.iter().map(Vec::len).sum::<usize>())
+                .map(|k| 3 + 2 * k)
+                .collect();
+            let mut next = wanted.iter();
+            let blocks: Vec<Vec<usize>> = conversation
+                .images
+                .iter()
+                .map(|per| per.iter().map(|_| *next.next().unwrap()).collect())
+                .collect();
+            let golden = case["text"].as_str().unwrap();
+            let mut expanded = String::new();
+            let mut pieces = golden.split(IMAGE_TOKEN);
+            expanded.push_str(pieces.next().unwrap());
+            for (count, piece) in wanted.iter().zip(pieces) {
+                expanded.push_str(&IMAGE_TOKEN.repeat(*count));
+                expanded.push_str(piece);
+            }
+            let got = conversation.render_with_blocks(&blocks).unwrap();
+            assert_eq!(got.as_str(), expanded, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_image_on_a_system_or_assistant_message_is_refused() {
+        let turns = [ChatTurn::System("s"), ChatTurn::User("u")];
+        let err = render_prompt_with_images(&turns, &[], DEFAULT_EFFORT, &[vec![4]]).unwrap_err();
+        assert!(err.to_string().contains("user and tool"), "{err}");
+        let turns = [
+            ChatTurn::User("u"),
+            ChatTurn::Assistant {
+                text: "a",
+                tool_calls: &[],
+            },
+        ];
+        let err =
+            render_prompt_with_images(&turns, &[], DEFAULT_EFFORT, &[vec![], vec![2]]).unwrap_err();
+        assert!(err.to_string().contains("user and tool"), "{err}");
     }
 
     #[test]
