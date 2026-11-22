@@ -959,6 +959,64 @@ struct VisitCache {
 /// a point to go back to has to be recorded when the sequence is there.
 pub struct ConvSnapshot(Vec<[Option<Array>; 4]>);
 
+/// Image features to put in place of some of a prompt's token embeddings (`embed_inputs` of the
+/// reference: `embeds[mask] = features[cumsum(mask) - 1]`, the features cast to the embedding's
+/// dtype and not normalized).
+///
+/// `slots` is indexed by a token's position in the prompt the cache is being filled with, so a
+/// prompt fed in chunks passes the same value with each of them: a slot of `-1` is a plain token,
+/// any other is the row of `features` (`[rows, hidden]`) that stands in for that position.
+pub struct ImageRows {
+    slots: Vec<i32>,
+    features: Array,
+}
+
+impl ImageRows {
+    pub fn new(slots: Vec<i32>, features: Array) -> Result<Self> {
+        ensure!(
+            features.ndim() == 2,
+            "image features are {:?}, expected [rows, hidden]",
+            features.shape()
+        );
+        let rows = features.shape()[0];
+        if let Some(bad) = slots.iter().find(|&&s| s < -1 || s >= rows) {
+            bail!("an image slot of {bad} with {rows} feature rows");
+        }
+        Ok(Self { slots, features })
+    }
+
+    /// `h` (`[1, L, hidden]`, the embeddings of the tokens at `start..start + L`) with the image
+    /// positions replaced.
+    fn splice(&self, h: &Array, start: usize) -> Result<Array> {
+        let len = h.shape()[1] as usize;
+        ensure!(
+            start + len <= self.slots.len(),
+            "the image slots cover {} tokens, the pass feeds positions {start}..{}",
+            self.slots.len(),
+            start + len
+        );
+        ensure!(
+            self.features.shape()[1] == h.shape()[2],
+            "image features are {} wide, the embeddings {}",
+            self.features.shape()[1],
+            h.shape()[2]
+        );
+        let window = &self.slots[start..start + len];
+        if window.iter().all(|&s| s < 0) {
+            return Ok(h.clone());
+        }
+        let rows: Vec<i32> = window.iter().map(|&s| s.max(0)).collect();
+        let mask: Vec<bool> = window.iter().map(|&s| s >= 0).collect();
+        let picked = mlx_rs::ops::expand_dims(
+            take_axis(&self.features, Array::from_slice(&rows, &[len as i32]), 0)?
+                .as_dtype(h.dtype())?,
+            0,
+        )?;
+        let mask = Array::from_slice(&mask, &[1, len as i32, 1]);
+        Ok(mlx_rs::ops::which(&mask, &picked, h)?)
+    }
+}
+
 /// One entry per layer visit (`TextArgs::layer_schedule`): a layer in the loop core has one for
 /// each pass.
 pub struct Inkling2Cache {
@@ -1138,8 +1196,31 @@ impl Inkling2Model {
 
     /// Feeds `ids` to the caches without computing logits, and evaluates the result.
     pub fn advance(&self, ids: &[u32], cache: &mut Inkling2Cache) -> Result<()> {
-        self.hidden(ids, cache, None)?.eval()?;
+        self.advance_with(ids, cache, None)
+    }
+
+    /// [`Self::advance`] with image features standing in for some positions.
+    pub fn advance_with(
+        &self,
+        ids: &[u32],
+        cache: &mut Inkling2Cache,
+        images: Option<&ImageRows>,
+    ) -> Result<()> {
+        self.hidden(ids, cache, None, images)?.eval()?;
         cache.eval_state()
+    }
+
+    /// The embedding of each of `ids` as the stack sees it, `[1, L, H]`: looked up and
+    /// normalized.
+    pub(super) fn embed_tokens(&self, ids: &[u32]) -> Result<Array> {
+        let ids_i32: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
+        let ids = Array::from_slice(&ids_i32, &[1, ids_i32.len() as i32]);
+        let embedded = self.embed.lookup(&ids)?;
+        Ok(mlx_rs::fast::rms_norm(
+            &embedded,
+            &self.embed_norm,
+            self.args.rms_norm_eps,
+        )?)
     }
 
     /// Feeds `ids` in chunks of at most `chunk` tokens and returns the logits of the last one,
@@ -1166,7 +1247,18 @@ impl Inkling2Model {
         cache: &mut Inkling2Cache,
         last_only: bool,
     ) -> Result<Array> {
-        let mut hidden = self.hidden(ids, cache, None)?;
+        self.forward_with(ids, cache, last_only, None)
+    }
+
+    /// [`Self::forward`] with image features standing in for some positions.
+    pub fn forward_with(
+        &self,
+        ids: &[u32],
+        cache: &mut Inkling2Cache,
+        last_only: bool,
+        images: Option<&ImageRows>,
+    ) -> Result<Array> {
+        let mut hidden = self.hidden(ids, cache, None, images)?;
         if last_only {
             let len = hidden.shape()[1];
             hidden = hidden.try_index((.., (len - 1).., ..))?;
@@ -1182,7 +1274,7 @@ impl Inkling2Model {
         cache: &mut Inkling2Cache,
     ) -> Result<(Array, Vec<Array>)> {
         let mut captured = Vec::with_capacity(self.schedule.len() + 1);
-        let hidden = self.hidden(ids, cache, Some(&mut captured))?;
+        let hidden = self.hidden(ids, cache, Some(&mut captured), None)?;
         Ok((self.logits_from_hidden(&hidden)?, captured))
     }
 
@@ -1202,6 +1294,7 @@ impl Inkling2Model {
         ids: &[u32],
         cache: &mut Inkling2Cache,
         mut capture: Option<&mut Vec<Array>>,
+        images: Option<&ImageRows>,
     ) -> Result<Array> {
         ensure!(!ids.is_empty(), "no token ids");
         ensure!(
@@ -1210,10 +1303,10 @@ impl Inkling2Model {
             cache.visits.len(),
             self.schedule.len()
         );
-        let ids_i32: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
-        let ids = Array::from_slice(&ids_i32, &[1, ids_i32.len() as i32]);
-        let embedded = self.embed.lookup(&ids)?;
-        let mut h = mlx_rs::fast::rms_norm(&embedded, &self.embed_norm, self.args.rms_norm_eps)?;
+        let mut h = self.embed_tokens(ids)?;
+        if let Some(images) = images {
+            h = images.splice(&h, cache.len())?;
+        }
         let cx = Ctx {
             args: &self.args,
             round_loop_mix: self.options.round_loop_mix,

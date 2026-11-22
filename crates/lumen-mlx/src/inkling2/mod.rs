@@ -42,7 +42,7 @@ pub use chat::{DEFAULT_EFFORT, Effort, render_prompt, render_prompt_with_images}
 pub use config::{Inkling2Config, LayerKind, LoopConfig, MtpConfig, TextConfig, VisionConfig};
 pub use manifest::{Entry, Manifest, Part, Placement, Role};
 #[cfg(feature = "mlx-native")]
-pub use model::{ConvSnapshot, Inkling2Cache, Inkling2Model, LoadOptions};
+pub use model::{ConvSnapshot, ImageRows, Inkling2Cache, Inkling2Model, LoadOptions};
 pub use pixels::{
     BLOCK, MAX_IMAGE_TOKENS, PreparedImage, prepare as prepare_image,
     token_count as image_token_count,

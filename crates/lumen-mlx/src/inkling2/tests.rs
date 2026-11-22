@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use mlx_rs::Array;
 
-use super::model::{Inkling2Model, LoadOptions};
+use super::model::{ImageRows, Inkling2Model, LoadOptions};
 use super::ops::mix_messages;
 
 /// The committed replica. A missing fixture fails the test: a skip here would read as a pass.
@@ -248,4 +248,118 @@ fn last_only_returns_the_last_position_of_the_full_logits() {
     let live = model.args().unpadded_vocab_size;
     let (max_abs, _) = compare(&got[..live], &expected[..live], live);
     assert!(max_abs < 5e-3, "last-only: {max_abs}");
+}
+
+/// The positions a spliced prompt marks as images in the splice tests: a run of 8 and a run of 3,
+/// with text between and after, so a chunk boundary can fall inside a run, between runs and on a
+/// run's edge.
+const IMAGE_RUNS: [(usize, usize); 2] = [(10, 8), (30, 3)];
+
+/// `ids` with an image-token stand-in at the marked positions, and the rows that must take the
+/// place of the embeddings those positions had: the model's own embeddings of the original ids, so
+/// the spliced forward pass has to land on exactly what the plain one computes.
+fn marked_prompt(model: &Inkling2Model, ids: &[u32]) -> (Vec<u32>, ImageRows) {
+    let stand_in = ids.iter().max().unwrap() + 1;
+    let mut marked = ids.to_vec();
+    let mut slots = vec![-1i32; ids.len()];
+    let mut originals = Vec::new();
+    for &(start, len) in &IMAGE_RUNS {
+        for p in start..start + len {
+            slots[p] = originals.len() as i32;
+            originals.push(ids[p]);
+            marked[p] = stand_in;
+        }
+    }
+    let features =
+        mlx_rs::ops::squeeze_axes(model.embed_tokens(&originals).unwrap(), &[0]).unwrap();
+    (marked, ImageRows::new(slots, features).unwrap())
+}
+
+#[test]
+fn spliced_rows_stand_in_for_the_embeddings_they_replace() {
+    let model = load_replica();
+    let ids = prompt_ids(&reference("outputs.safetensors"));
+    let (marked, rows) = marked_prompt(&model, &ids);
+
+    let plain = model.forward(&ids, &mut model.make_cache(), false).unwrap();
+    let spliced = model
+        .forward_with(&marked, &mut model.make_cache(), false, Some(&rows))
+        .unwrap();
+    assert_eq!(
+        host_f32(&plain),
+        host_f32(&spliced),
+        "a splice of the same rows is the same pass"
+    );
+
+    // The test can tell: the stand-in tokens alone are a different prompt.
+    let unspliced = model
+        .forward(&marked, &mut model.make_cache(), false)
+        .unwrap();
+    let (max_abs, _) = compare(
+        &host_f32(&unspliced),
+        &host_f32(&plain),
+        model.args().vocab_size,
+    );
+    assert!(
+        max_abs > 1e-2 || max_abs.is_nan(),
+        "the stand-ins did not change the logits: {max_abs}"
+    );
+}
+
+#[test]
+fn a_prompt_fed_in_chunks_splices_each_chunk_with_its_own_rows() {
+    let model = load_replica();
+    let ids = prompt_ids(&reference("outputs.safetensors"));
+    let (marked, rows) = marked_prompt(&model, &ids);
+    let plain = model.forward(&ids, &mut model.make_cache(), true).unwrap();
+    // 7 cuts the first run, 4 leaves chunk edges on both runs' edges, 1 feeds a token at a time.
+    for chunk in [7usize, 4, 1, 13] {
+        let mut cache = model.make_cache();
+        let last_start = (marked.len() - 1) / chunk * chunk;
+        for piece in marked[..last_start].chunks(chunk) {
+            model.advance_with(piece, &mut cache, Some(&rows)).unwrap();
+        }
+        let got = model
+            .forward_with(&marked[last_start..], &mut cache, true, Some(&rows))
+            .unwrap();
+        assert_logits_match(&format!("chunk {chunk}"), &got, &plain, &model);
+    }
+}
+
+#[test]
+fn image_rows_that_do_not_fit_the_pass_are_refused() {
+    let model = load_replica();
+    let ids = prompt_ids(&reference("outputs.safetensors"));
+    let (marked, rows) = marked_prompt(&model, &ids);
+    let hidden = model.args().hidden_size as i32;
+    let one_row = || Array::zeros::<f32>(&[1, hidden]).unwrap();
+
+    // A slot past the rows, or below the plain marker.
+    assert!(ImageRows::new(vec![-1, 1], one_row()).is_err());
+    assert!(ImageRows::new(vec![-2], one_row()).is_err());
+    // Features that are not a matrix, or not as wide as the embeddings.
+    assert!(ImageRows::new(vec![0], Array::zeros::<f32>(&[hidden]).unwrap()).is_err());
+    let narrow = ImageRows::new(
+        vec![0; marked.len()],
+        Array::zeros::<f32>(&[1, hidden - 1]).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        model
+            .forward_with(&marked, &mut model.make_cache(), true, Some(&narrow))
+            .is_err()
+    );
+    // Slots for fewer tokens than the pass feeds.
+    let short = ImageRows::new(vec![-1; marked.len() - 1], one_row()).unwrap();
+    assert!(
+        model
+            .forward_with(&marked, &mut model.make_cache(), true, Some(&short))
+            .is_err()
+    );
+    // The intact set still works.
+    assert!(
+        model
+            .forward_with(&marked, &mut model.make_cache(), true, Some(&rows))
+            .is_ok()
+    );
 }
