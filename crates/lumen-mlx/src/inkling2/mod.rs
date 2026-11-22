@@ -38,7 +38,10 @@ mod vision_tests;
 
 #[cfg(feature = "mlx-native")]
 pub use backend::{Inkling2Backend, RunStats, named_effort, turns_from_pairs};
-pub use chat::{DEFAULT_EFFORT, Effort, render_prompt, render_prompt_with_images};
+pub use chat::{
+    DEFAULT_EFFORT, Effort, IMAGE_MESSAGE_FRAME_TOKENS, image_message_tokens, render_prompt,
+    render_prompt_with_images,
+};
 pub use config::{Inkling2Config, LayerKind, LoopConfig, MtpConfig, TextConfig, VisionConfig};
 pub use manifest::{Entry, Manifest, Part, Placement, Role};
 #[cfg(feature = "mlx-native")]

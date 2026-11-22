@@ -5,14 +5,15 @@
 //!
 //! ```text
 //! cargo run --release -p lumen-mlx --features mlx-native --example inkling2_chat -- \
-//!     <model_dir> [--think] [--effort E] [--system S] [--weather] [--max N] [--temp T] \
-//!     "<turn 1>" "<turn 2>" ...
+//!     <model_dir> [--think] [--effort E] [--system S] [--weather] [--image PATH] [--max N] \
+//!     [--temp T] "<turn 1>" "<turn 2>" ...
 //! ```
 //!
 //! Each argument after the flags is a user turn; the reply to each is kept in the history the next
 //! one is rendered from (reasoning included, as a client that sends it back would). `--think`
 //! turns thinking on; `--effort` names a level (`low`, `medium`, `high`, `0.5`, ...). `--weather` declares a
-//! `get_weather` tool whose result is always "15C and sunny".
+//! `get_weather` tool whose result is always "15C and sunny". `--image` attaches a picture to the
+//! first user turn (and the history keeps it, so later turns send it again).
 
 #![cfg(feature = "mlx-native")]
 
@@ -39,6 +40,7 @@ fn main() -> Result<()> {
     let temperature: f32 = value("--temp").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let effort = value("--effort");
     let system = value("--system");
+    let image = value("--image");
     let with_weather = if let Some(at) = args.iter().position(|a| a == "--weather") {
         args.remove(at);
         true
@@ -84,6 +86,12 @@ fn main() -> Result<()> {
         },
     }
     let mut history: Vec<Msg> = Vec::new();
+    let picture: Option<Vec<u8>> = image
+        .as_deref()
+        .map(|path| std::fs::read(path).map_err(|e| anyhow!("read {path}: {e}")))
+        .transpose()?;
+    // The history index of the user turn the picture is attached to (the first one).
+    let mut picture_at: Option<usize> = None;
     if let Some(s) = system {
         history.push(Msg::System(s));
     }
@@ -108,6 +116,9 @@ fn main() -> Result<()> {
     while let Some(slot) = pending.pop() {
         if let Some(user) = slot {
             println!("\n=== user: {user}");
+            if picture_at.is_none() && picture.is_some() {
+                picture_at = Some(history.len());
+            }
             history.push(Msg::User(user));
         }
         // Borrow the history as turns.
@@ -153,8 +164,15 @@ fn main() -> Result<()> {
             Ok(())
         };
         lumen_mlx::metal_memory::reset_peak_memory();
+        let images: Vec<Vec<Vec<u8>>> = (0..turns.len())
+            .map(|i| match (&picture, picture_at) {
+                (Some(bytes), Some(at)) if at == i => vec![bytes.clone()],
+                _ => Vec::new(),
+            })
+            .collect();
         let reply = backend.chat(
             &turns,
+            &images,
             &tools,
             &ResolvedToolChoice::Auto,
             max_new,
@@ -166,9 +184,11 @@ fn main() -> Result<()> {
         )?;
         let s = backend.last_run();
         println!(
-            "\n--- prompt {} tokens ({} from the retained caches), prefill {:.0} ms; {} generated in {:.0} ms ({:.1} tok/s); stop {:?}",
+            "\n--- prompt {} tokens ({} from the retained caches), {} image(s) encoded in {:.0} ms, prefill {:.0} ms; {} generated in {:.0} ms ({:.1} tok/s); stop {:?}",
             s.prompt_tokens,
             s.reused_tokens,
+            s.images_encoded,
+            s.image_ms,
             s.prefill_ms,
             s.generated_tokens,
             s.decode_ms,

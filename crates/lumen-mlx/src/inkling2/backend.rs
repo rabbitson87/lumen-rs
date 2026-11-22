@@ -9,17 +9,26 @@
 //! prompt can still be fed its last token and give logits), the end of the prompt, and the end of
 //! the turn the model wrote (so a client that sends the reply back, reasoning included, starts
 //! from the end of it).
+//!
+//! Images ride along. A prompt names each image by a run of image tokens (one per 40-pixel block);
+//! what the run stands for is the image's features, computed by the vision tower only when a token
+//! of the run has to be fed. So that a prompt whose caches are retained is not mistaken for another
+//! with the same grid but a different picture, each image token's key carries a hash of the image,
+//! and a follow-up turn that sends the same image back reuses the caches without decoding it.
 
-use std::path::Path;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use lumen_core::sampling::{SamplingConfig, Xorshift64, sample_from_logits};
 use mlx_rs::Array;
 
-use super::chat::{Effort, render_prompt};
-use super::model::{ConvSnapshot, Inkling2Cache, Inkling2Model, LoadOptions};
+use super::chat::{Effort, IMAGE_TOKEN, render_prompt_with_images};
+use super::model::{ConvSnapshot, ImageRows, Inkling2Cache, Inkling2Model, LoadOptions};
+use super::pixels::{prepare, token_count};
 use super::response::{Markers, ResponseParser};
+use super::vision::VisionTower;
 use crate::SamplingOverrides;
 use crate::chat_io::{
     BackendStreamEvent, ChatTurn, ParsedResponse, ResolvedToolChoice, StopCause, ToolDef,
@@ -50,12 +59,65 @@ pub struct RunStats {
     pub prefill_ms: f64,
     pub generated_tokens: usize,
     pub decode_ms: f64,
+    /// Images the vision tower encoded for this request (those whose tokens were fed), and how
+    /// long that took, the tower's first load included.
+    pub images_encoded: usize,
+    pub image_ms: f64,
+}
+
+/// What a token of a prompt is, for telling prompts apart: the token, and for an image token a hash
+/// of the image its run stands for (0 for every other token).
+type Key = (u32, u64);
+
+/// A prompt: its token ids and which runs of them are images.
+struct Prompt {
+    ids: Vec<u32>,
+    keys: Vec<Key>,
+    /// `(start, len)` of each image's run of image tokens, in prompt order.
+    runs: Vec<(usize, usize)>,
+}
+
+impl Prompt {
+    /// A prompt of plain tokens.
+    fn plain(ids: &[u32]) -> Self {
+        Self {
+            ids: ids.to_vec(),
+            keys: ids.iter().map(|&t| (t, 0)).collect(),
+            runs: Vec::new(),
+        }
+    }
+}
+
+/// The maximal runs of `image_token` in `ids`, as `(start, len)`.
+fn image_runs(ids: &[u32], image_token: u32) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (i, &t) in ids.iter().enumerate() {
+        match (t == image_token, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                runs.push((s, i - s));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        runs.push((s, ids.len() - s));
+    }
+    runs
+}
+
+fn image_hash(encoded: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    encoded.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A conversation's caches, to be picked up by the next request.
 struct Retained {
     /// What the caches have seen.
-    tokens: Vec<u32>,
+    keys: Vec<Key>,
     cache: Inkling2Cache,
     /// Lengths the caches can go back to, ascending, with their convolution states.
     points: Vec<(usize, ConvSnapshot)>,
@@ -70,15 +132,20 @@ pub struct Inkling2Backend {
     max_context: usize,
     retained: Option<Retained>,
     last_run: RunStats,
+    dir: PathBuf,
+    /// The id of the image token, when the checkpoint has a vision tower the prompt can name.
+    image_token: Option<u32>,
+    /// The vision tower, read from the checkpoint the first time an image has to be encoded.
+    tower: Option<VisionTower>,
 }
 
 /// The longest recorded point the caches can go back to for a prompt `new`: its tokens are a
 /// prefix of `new` and shorter than it (at least one token is left to feed, since the logits of
 /// the next token come from feeding).
-fn reusable_point(
+fn reusable_point<T: PartialEq>(
     lengths: impl Iterator<Item = usize>,
-    seen: &[u32],
-    new: &[u32],
+    seen: &[T],
+    new: &[T],
 ) -> Option<usize> {
     lengths
         .filter(|&len| len > 0 && len < new.len() && len <= seen.len())
@@ -104,6 +171,18 @@ impl Inkling2Backend {
             "config.json eos_token_id {declared_eos:?} is not the end-of-turn marker {}",
             markers.end_sampling
         );
+        // The image token is the one the processor config names and the renderer writes.
+        let processor: Option<serde_json::Value> =
+            std::fs::read_to_string(dir.join("processor_config.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok());
+        let names_it = processor
+            .as_ref()
+            .and_then(|p| p["image_token"].as_str())
+            .is_some_and(|token| token == IMAGE_TOKEN);
+        let image_token = (names_it && config.get("vision_config").is_some())
+            .then(|| tokenizer.single_token_id(IMAGE_TOKEN))
+            .flatten();
         let model_max = config["text_config"]["model_max_length"]
             .as_u64()
             .map_or(MAX_CONTEXT_CAP, |v| v as usize);
@@ -116,6 +195,9 @@ impl Inkling2Backend {
             max_context: model_max.min(MAX_CONTEXT_CAP),
             retained: None,
             last_run: RunStats::default(),
+            dir: dir.to_path_buf(),
+            image_token,
+            tower: None,
         })
     }
 
@@ -161,16 +243,92 @@ impl Inkling2Backend {
         thinking: bool,
         named: Option<Effort>,
     ) -> Result<Vec<u32>> {
+        Ok(self
+            .prompt_with_images(turns, &[], tools, tool_choice, thinking, named)?
+            .ids)
+    }
+
+    /// [`Self::build_prompt`] for turns that carry images (`images[i]` are the encoded images of
+    /// `turns[i]`): each image is a run of image tokens, one per block, found again in the ids so
+    /// the features can be put where they belong. Only the images' headers are read here.
+    fn prompt_with_images(
+        &self,
+        turns: &[ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
+        thinking: bool,
+        named: Option<Effort>,
+    ) -> Result<Prompt> {
         let tools = if matches!(tool_choice, ResolvedToolChoice::None) {
             &[][..]
         } else {
             tools
         };
         let effort = Effort::resolve_named(thinking, named);
-        let prompt = render_prompt(turns, tools, effort)?;
-        self.tokenizer
-            .encode_prompt(&prompt)
-            .map_err(|e| anyhow!("encode the prompt: {e}"))
+        let attached = images.iter().any(|per_turn| !per_turn.is_empty());
+        if !attached {
+            let prompt = render_prompt_with_images(turns, tools, effort, &[])?;
+            let ids = self
+                .tokenizer
+                .encode_prompt(&prompt)
+                .map_err(|e| anyhow!("encode the prompt: {e}"))?;
+            return Ok(Prompt::plain(&ids));
+        }
+        let unsupported = |why: String| crate::chat_io::UnsupportedRequest(why);
+        let Some(image_token) = self.image_token else {
+            return Err(unsupported(
+                "this Inkling 2 checkpoint has no vision tower, so it cannot read images".into(),
+            )
+            .into());
+        };
+        let mut counts: Vec<Vec<usize>> = Vec::with_capacity(turns.len());
+        for (index, turn) in turns.iter().enumerate() {
+            let own = images.get(index).map_or(&[][..], Vec::as_slice);
+            if !own.is_empty() && !matches!(turn, ChatTurn::User(_) | ChatTurn::Tool { .. }) {
+                return Err(unsupported(
+                    "images are only supported in user and tool messages".into(),
+                )
+                .into());
+            }
+            counts.push(
+                own.iter()
+                    .enumerate()
+                    .map(|(n, bytes)| {
+                        token_count(bytes).map_err(|e| {
+                            anyhow::Error::from(unsupported(format!(
+                                "image {} of message {index} cannot be read: {e}",
+                                n + 1
+                            )))
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            );
+        }
+        let text = render_prompt_with_images(turns, tools, effort, &counts)?;
+        let ids = self
+            .tokenizer
+            .encode_prompt(&text)
+            .map_err(|e| anyhow!("encode the prompt: {e}"))?;
+        let runs = image_runs(&ids, image_token);
+        let flat: Vec<(usize, &Vec<u8>)> = counts
+            .iter()
+            .flatten()
+            .copied()
+            .zip(images.iter().flatten())
+            .collect();
+        ensure!(
+            runs.len() == flat.len() && runs.iter().zip(&flat).all(|(r, f)| r.1 == f.0),
+            "the prompt's image tokens do not match the images it carries"
+        );
+        let mut keys: Vec<Key> = ids.iter().map(|&t| (t, 0)).collect();
+        for (&(start, len), (_, bytes)) in runs.iter().zip(&flat) {
+            let hash = image_hash(bytes);
+            for key in &mut keys[start..start + len] {
+                key.1 = hash;
+            }
+        }
+        Ok(Prompt { ids, keys, runs })
     }
 
     /// [`Self::build_prompt`] for a request's own overrides.
@@ -201,6 +359,7 @@ impl Inkling2Backend {
     pub fn chat(
         &mut self,
         turns: &[ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
         tools: &[ToolDef<'_>],
         tool_choice: &ResolvedToolChoice<'_>,
         max_new_tokens: usize,
@@ -210,7 +369,15 @@ impl Inkling2Backend {
         ov: &SamplingOverrides,
         on_event: &mut dyn FnMut(BackendStreamEvent<'_>) -> Result<()>,
     ) -> Result<ParsedResponse> {
-        let prompt = self.build_chat_input(turns, tools, tool_choice, thinking, ov)?;
+        let prompt = self.prompt_with_images(
+            turns,
+            images,
+            tools,
+            tool_choice,
+            thinking,
+            named_effort(ov),
+        )?;
+        let sources: Vec<&[u8]> = images.iter().flatten().map(Vec::as_slice).collect();
         let mut parser = ResponseParser::new(self.markers);
         // The loop below needs `&mut self` for the caches, so the decode closure holds its own
         // handle on the tokenizer.
@@ -224,6 +391,7 @@ impl Inkling2Backend {
         let mut stopped_by_sink = false;
         let generated = self.generate_with(
             &prompt,
+            &sources,
             max_new_tokens,
             sampling,
             ov,
@@ -261,36 +429,50 @@ impl Inkling2Backend {
     ) -> Result<Vec<u32>> {
         let sampling = sampling_config(temperature, top_p, ov);
         let eos = self.eos.clone();
-        self.generate_with(prompt, max_new_tokens, sampling, ov, &mut |t| {
-            Ok(eos.contains(&t))
-        })
+        self.generate_with(
+            &Prompt::plain(prompt),
+            &[],
+            max_new_tokens,
+            sampling,
+            ov,
+            &mut |t| Ok(eos.contains(&t)),
+        )
     }
 
     /// The generation loop. `on_token` sees each generated token and says whether to stop (the
     /// end-of-turn marker is a token like the others and is passed to it too).
     fn generate_with(
         &mut self,
-        prompt: &[u32],
+        prompt: &Prompt,
+        sources: &[&[u8]],
         max_new_tokens: usize,
         sampling: Option<SamplingConfig>,
         ov: &SamplingOverrides,
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
     ) -> Result<Vec<u32>> {
-        ensure!(!prompt.is_empty(), "an empty prompt");
+        ensure!(!prompt.ids.is_empty(), "an empty prompt");
         ensure!(
-            prompt.len() + max_new_tokens.min(1) <= self.max_context,
+            prompt.ids.len() + max_new_tokens.min(1) <= self.max_context,
             "a prompt of {} tokens is past this backend's context of {}",
-            prompt.len(),
+            prompt.ids.len(),
             self.max_context
         );
-        let (mut cache, mut points, start) = self.take_reusable(prompt);
+        let (mut cache, mut points, start) = self.take_reusable(&prompt.keys);
         let began = std::time::Instant::now();
-        let logits = self.prefill(prompt, start, &mut cache, &mut points)?;
+        let image_began = std::time::Instant::now();
+        let rows = self.image_rows(prompt, sources, start)?;
+        let image_ms = image_began.elapsed().as_secs_f64() * 1e3;
+        let images_encoded = prompt
+            .runs
+            .iter()
+            .filter(|&&(at, len)| at + len > start)
+            .count();
+        let logits = self.prefill(&prompt.ids, start, &mut cache, &mut points, rows.as_ref())?;
         let prefill_ms = began.elapsed().as_secs_f64() * 1e3;
         let decode_began = std::time::Instant::now();
 
         let mut rng = Xorshift64::new(crate::resolve_sampling_seed(ov));
-        let mut seen: Vec<u32> = prompt.to_vec();
+        let mut seen: Vec<u32> = prompt.ids.clone();
         let mut generated: Vec<u32> = Vec::new();
         let mut logits = logits;
         while generated.len() < max_new_tokens {
@@ -312,35 +494,99 @@ impl Inkling2Backend {
         }
         points.push((cache.len(), cache.conv_snapshot()?));
         self.last_run = RunStats {
-            prompt_tokens: prompt.len(),
+            prompt_tokens: prompt.ids.len(),
             reused_tokens: start,
             prefill_ms,
             generated_tokens: generated.len(),
             decode_ms: decode_began.elapsed().as_secs_f64() * 1e3,
+            images_encoded,
+            image_ms,
         };
+        let mut keys = prompt.keys.clone();
+        keys.extend(seen[prompt.ids.len()..].iter().map(|&t| (t, 0)));
         self.retained = Some(Retained {
-            tokens: seen,
+            keys,
             cache,
             points,
         });
         Ok(generated)
     }
 
+    /// The vision tower, read from the checkpoint on first use.
+    fn tower(&mut self) -> Result<&VisionTower> {
+        if self.tower.is_none() {
+            self.tower =
+                Some(VisionTower::load(&self.dir).with_context(|| {
+                    format!("load the vision tower from {}", self.dir.display())
+                })?);
+        }
+        Ok(self.tower.as_ref().expect("loaded above"))
+    }
+
+    /// The features of the images whose tokens `prompt[start..]` contains, as the rows that stand
+    /// in for those tokens; `None` when there are none (a text prompt, or every image already in
+    /// the caches). `sources` are the encoded images in the order the prompt names them.
+    fn image_rows(
+        &mut self,
+        prompt: &Prompt,
+        sources: &[&[u8]],
+        start: usize,
+    ) -> Result<Option<ImageRows>> {
+        ensure!(
+            sources.len() == prompt.runs.len(),
+            "{} images for {} image runs",
+            sources.len(),
+            prompt.runs.len()
+        );
+        let needed: Vec<usize> = (0..prompt.runs.len())
+            .filter(|&i| prompt.runs[i].0 + prompt.runs[i].1 > start)
+            .collect();
+        if needed.is_empty() {
+            return Ok(None);
+        }
+        let mut slots = vec![-1i32; prompt.ids.len()];
+        let mut features: Vec<Array> = Vec::with_capacity(needed.len());
+        let mut rows = 0usize;
+        for &i in &needed {
+            let (at, len) = prompt.runs[i];
+            let image = prepare(sources[i]).map_err(|e| {
+                crate::chat_io::UnsupportedRequest(format!("image {} cannot be read: {e}", i + 1))
+            })?;
+            ensure!(
+                image.tokens() == len,
+                "image {} is {} blocks once decoded, its header said {len}",
+                i + 1,
+                image.tokens()
+            );
+            let encoded = self.tower()?.encode(&image)?;
+            encoded.eval()?;
+            for (offset, slot) in slots[at..at + len].iter_mut().enumerate() {
+                *slot = (rows + offset) as i32;
+            }
+            rows += len;
+            features.push(encoded);
+        }
+        let refs: Vec<&Array> = features.iter().collect();
+        let all = if refs.len() == 1 {
+            features[0].clone()
+        } else {
+            mlx_rs::ops::concatenate_axis(&refs, 0)?
+        };
+        Ok(Some(ImageRows::new(slots, all)?))
+    }
+
     /// The retained caches taken back to the longest point `prompt` shares with them, or fresh
     /// caches. Returns the caches, the points still valid, and how many prompt tokens they hold.
     fn take_reusable(
         &mut self,
-        prompt: &[u32],
+        prompt: &[Key],
     ) -> (Inkling2Cache, Vec<(usize, ConvSnapshot)>, usize) {
         let fresh = |model: &Inkling2Model| (model.make_cache(), Vec::new(), 0);
         let Some(mut kept) = self.retained.take() else {
             return fresh(&self.model);
         };
-        let Some(len) = reusable_point(
-            kept.points.iter().map(|(len, _)| *len),
-            &kept.tokens,
-            prompt,
-        ) else {
+        let Some(len) = reusable_point(kept.points.iter().map(|(len, _)| *len), &kept.keys, prompt)
+        else {
             return fresh(&self.model);
         };
         let at = kept
@@ -363,15 +609,18 @@ impl Inkling2Backend {
         start: usize,
         cache: &mut Inkling2Cache,
         points: &mut Vec<(usize, ConvSnapshot)>,
+        images: Option<&ImageRows>,
     ) -> Result<Array> {
         let last = prompt.len() - 1;
         if last > start {
             for chunk in prompt[start..last].chunks(PREFILL_CHUNK) {
-                self.model.advance(chunk, cache)?;
+                self.model.advance_with(chunk, cache, images)?;
             }
             points.push((last, cache.conv_snapshot()?));
         }
-        let logits = self.model.forward(&prompt[last..], cache, true)?;
+        let logits = self
+            .model
+            .forward_with(&prompt[last..], cache, true, images)?;
         logits.eval()?;
         cache.eval_state()?;
         points.push((prompt.len(), cache.conv_snapshot()?));
@@ -482,6 +731,38 @@ mod tests {
     }
 
     #[test]
+    fn image_runs_are_the_maximal_runs_of_the_image_token() {
+        const IMG: u32 = 9;
+        assert_eq!(image_runs(&[], IMG), vec![]);
+        assert_eq!(image_runs(&[1, 2, 3], IMG), vec![]);
+        assert_eq!(image_runs(&[IMG, IMG, 1], IMG), vec![(0, 2)]);
+        assert_eq!(
+            image_runs(&[1, IMG, IMG, IMG, 2, IMG, 3, IMG, IMG], IMG),
+            vec![(1, 3), (5, 1), (7, 2)]
+        );
+    }
+
+    #[test]
+    fn two_images_of_one_grid_are_different_prompts_and_the_same_image_is_not() {
+        // The prompts are token for token alike; what tells them apart is the hash of the image.
+        let prompt = |picture: &[u8]| -> Vec<Key> {
+            let hash = image_hash(picture);
+            vec![(1, 0), (9, hash), (9, hash), (2, 0), (3, 0)]
+        };
+        let (red, red_again, green) = (prompt(b"red"), prompt(b"red"), prompt(b"green"));
+        assert_eq!(red, red_again);
+        assert_ne!(red, green);
+        // A retained conversation that saw the red picture can be taken back to the text before
+        // the image (position 1) for the green one, but not past it.
+        assert_eq!(reusable_point([1, 4].into_iter(), &red, &green), Some(1));
+        // And for the red one again, to the longest point shorter than the new prompt.
+        assert_eq!(
+            reusable_point([1, 4].into_iter(), &red, &red_again),
+            Some(4)
+        );
+    }
+
+    #[test]
     fn flat_messages_become_turns() {
         let messages = vec![
             ("system".to_string(), "s".to_string()),
@@ -531,6 +812,7 @@ mod real_checkpoint_tests {
         let ov = SamplingOverrides::default();
         b.chat(
             turns,
+            &[],
             &[],
             &ResolvedToolChoice::Auto,
             max_new,
@@ -604,6 +886,167 @@ mod real_checkpoint_tests {
         assert_eq!(b.last_run().reused_tokens, 0);
     }
 
+    /// A reply as a client sends it back: the reasoning inside the envelope, then the answer.
+    fn join_envelope(reply: &ParsedResponse) -> String {
+        if reply.reasoning.is_empty() {
+            reply.visible.clone()
+        } else {
+            crate::chat_io::join_reasoning_envelope(&reply.reasoning, &reply.visible)
+        }
+    }
+
+    fn scene(name: &str) -> Vec<u8> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/inkling2_vision")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// One greedy turn over `turns` with `images`, returning what the model said.
+    fn greedy_with_images(
+        b: &mut Inkling2Backend,
+        turns: &[ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        max_new: usize,
+    ) -> ParsedResponse {
+        let ov = SamplingOverrides::default();
+        b.chat(
+            turns,
+            images,
+            &[],
+            &ResolvedToolChoice::Auto,
+            max_new,
+            0.0,
+            1.0,
+            false,
+            &ov,
+            &mut |_| Ok(()),
+        )
+        .expect("chat")
+    }
+
+    #[test]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
+    fn an_image_is_described_and_the_follow_up_reuses_the_caches_without_encoding_it() {
+        let mut b = backend();
+        let image = scene("scene.png");
+        let question = "What shapes are in this picture and what color is each? Be brief.";
+        let turns = [ChatTurn::User(question)];
+        let images = vec![vec![image.clone()]];
+
+        let first = greedy_with_images(&mut b, &turns, &images, 160);
+        let stats = b.last_run();
+        println!("first: {:?}\n{stats:?}", first.visible);
+        let said = first.visible.to_lowercase();
+        assert!(said.contains("red") && said.contains("blue"), "{said}");
+        assert!(said.contains("square") && said.contains("circle"), "{said}");
+        assert_eq!(stats.images_encoded, 1);
+        assert_eq!(stats.reused_tokens, 0);
+        // 15 blocks, framed by the role marker, <|content_image|> and <|end_message|>.
+        let text_only = b
+            .build_prompt(&turns, &[], &ResolvedToolChoice::Auto, false, None)
+            .unwrap();
+        assert_eq!(
+            stats.prompt_tokens,
+            text_only.len() + crate::inkling2::image_message_tokens(&image).unwrap(),
+            "the count the server adds for an image is the count the prompt has"
+        );
+
+        // The reply goes back with the same image and a follow-up: the image is in the caches.
+        let reply = join_envelope(&first);
+        let follow_up = [
+            ChatTurn::User(question),
+            ChatTurn::Assistant {
+                text: &reply,
+                tool_calls: &[],
+            },
+            ChatTurn::User("And which one is on the left?"),
+        ];
+        let images = vec![vec![image], vec![], vec![]];
+        let second = greedy_with_images(&mut b, &follow_up, &images, 120);
+        let stats = b.last_run();
+        println!("second: {:?}\n{stats:?}", second.visible);
+        assert_eq!(stats.images_encoded, 0, "the image was encoded again");
+        assert!(stats.reused_tokens > 100, "reused {}", stats.reused_tokens);
+        assert!(
+            second.visible.to_lowercase().contains("square"),
+            "{}",
+            second.visible
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
+    fn a_different_picture_on_the_same_grid_is_not_taken_for_the_cached_one() {
+        let mut b = backend();
+        let question = "What is the leftmost shape, and what color? Answer in one short sentence.";
+        let turns = [ChatTurn::User(question)];
+        let red_first = greedy_with_images(&mut b, &turns, &[vec![scene("scene.png")]], 80);
+        assert!(
+            red_first.visible.to_lowercase().contains("red"),
+            "{}",
+            red_first.visible
+        );
+
+        // Token for token the same prompt, another picture: nothing past the text before the image
+        // may come from the caches, and the answer follows the new picture.
+        let yellow = greedy_with_images(&mut b, &turns, &[vec![scene("scene_alt.png")]], 80);
+        let stats = b.last_run();
+        println!("alt: {:?}\n{stats:?}", yellow.visible);
+        assert_eq!(stats.images_encoded, 1);
+        assert!(
+            stats.reused_tokens < 20,
+            "reused {} tokens",
+            stats.reused_tokens
+        );
+        let said = yellow.visible.to_lowercase();
+        assert!(said.contains("yellow") || said.contains("circle"), "{said}");
+        assert!(!said.contains("red"), "{said}");
+    }
+
+    #[test]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
+    fn images_in_the_wrong_message_or_not_an_image_are_refused_as_client_errors() {
+        let mut b = backend();
+        let ov = SamplingOverrides::default();
+        let mut ask = |turns: &[ChatTurn<'_>], images: &[Vec<Vec<u8>>]| {
+            b.chat(
+                turns,
+                images,
+                &[],
+                &ResolvedToolChoice::Auto,
+                8,
+                0.0,
+                1.0,
+                false,
+                &ov,
+                &mut |_| Ok(()),
+            )
+            .expect_err("refused")
+        };
+        let image = scene("scene.png");
+        let in_system = ask(
+            &[ChatTurn::System("be brief"), ChatTurn::User("hi")],
+            &[vec![image.clone()], vec![]],
+        );
+        assert!(
+            in_system
+                .downcast_ref::<crate::chat_io::UnsupportedRequest>()
+                .is_some(),
+            "{in_system}"
+        );
+        let not_an_image = ask(
+            &[ChatTurn::User("hi")],
+            &[vec![b"definitely not an image".to_vec()]],
+        );
+        assert!(
+            not_an_image
+                .downcast_ref::<crate::chat_io::UnsupportedRequest>()
+                .is_some(),
+            "{not_an_image}"
+        );
+    }
+
     #[test]
     #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
     fn a_stop_from_the_sink_ends_the_turn_and_is_not_an_error() {
@@ -616,6 +1059,7 @@ mod real_checkpoint_tests {
         let reply = b
             .chat(
                 &turns,
+                &[],
                 &[],
                 &ResolvedToolChoice::Auto,
                 200,

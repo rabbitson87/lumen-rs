@@ -2742,6 +2742,12 @@ impl MlxBackend {
                 .flatten()
                 .map(|bytes| m.image_prompt_tokens(bytes).unwrap_or(0))
                 .sum(),
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => images
+                .iter()
+                .flatten()
+                .map(|bytes| crate::inkling2::image_message_tokens(bytes).unwrap_or(0))
+                .sum(),
             #[allow(unreachable_patterns)]
             _ => 0,
         }
@@ -3005,6 +3011,7 @@ impl MlxBackend {
                 inkling2_chat(
                     b,
                     PromptSource::Flat(messages),
+                    &[],
                     max_new_tokens,
                     temperature,
                     top_p,
@@ -3165,10 +3172,23 @@ impl MlxBackend {
                 })
             }
             #[cfg(feature = "mlx-native")]
-            Self::Inkling2(_) => Err(crate::chat_io::UnsupportedRequest(
-                "image input is not supported for Inkling 2 yet (text only)".into(),
-            )
-            .into()),
+            Self::Inkling2(b) => {
+                let _ = session_id;
+                inkling2_chat(
+                    b,
+                    PromptSource::Flat(messages),
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    &mut stop_sink(&ov.stop),
+                )
+            }
             #[allow(unreachable_patterns)]
             _ => Err(anyhow::anyhow!(
                 "image input requires a vision-capable MLX backend (LUMEN_VISION=1)"
@@ -3294,10 +3314,24 @@ impl MlxBackend {
                 })
             }
             #[cfg(feature = "mlx-native")]
-            Self::Inkling2(_) => Err(crate::chat_io::UnsupportedRequest(
-                "image input is not supported for Inkling 2 yet (text only)".into(),
-            )
-            .into()),
+            Self::Inkling2(b) => {
+                let _ = session_id;
+                let mut on_event = on_event;
+                inkling2_chat(
+                    b,
+                    PromptSource::Flat(messages),
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    &mut on_event,
+                )
+            }
             #[allow(unreachable_patterns)]
             _ => Err(anyhow::anyhow!(
                 "image input requires a vision-capable MLX backend (LUMEN_VISION=1)"
@@ -3414,10 +3448,23 @@ impl MlxBackend {
                 )
             }
             #[cfg(feature = "mlx-native")]
-            Self::Inkling2(_) => Err(crate::chat_io::UnsupportedRequest(
-                "image input is not supported for Inkling 2 yet (text only)".into(),
-            )
-            .into()),
+            Self::Inkling2(b) => {
+                let _ = session_id;
+                inkling2_chat(
+                    b,
+                    PromptSource::History(turns),
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    &mut stop_sink(&ov.stop),
+                )
+            }
             #[allow(unreachable_patterns)]
             _ => Err(anyhow::anyhow!(
                 "image input with a tool-calling history requires a vision-capable MLX \
@@ -3493,6 +3540,7 @@ impl MlxBackend {
                 inkling2_chat(
                     b,
                     PromptSource::History(turns),
+                    &[],
                     max_new_tokens,
                     temperature,
                     top_p,
@@ -3671,6 +3719,7 @@ impl MlxBackend {
                 inkling2_chat(
                     b,
                     PromptSource::Flat(messages),
+                    &[],
                     max_new_tokens,
                     temperature,
                     top_p,
@@ -3799,10 +3848,24 @@ impl MlxBackend {
                 )
             }
             #[cfg(feature = "mlx-native")]
-            Self::Inkling2(_) => Err(crate::chat_io::UnsupportedRequest(
-                "image input is not supported for Inkling 2 yet (text only)".into(),
-            )
-            .into()),
+            Self::Inkling2(b) => {
+                let _ = session_id;
+                let mut on_event = on_event;
+                inkling2_chat(
+                    b,
+                    PromptSource::History(turns),
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    &mut on_event,
+                )
+            }
             #[allow(unreachable_patterns)]
             _ => Err(anyhow::anyhow!(
                 "image input with a tool-calling history requires a vision-capable MLX \
@@ -3882,6 +3945,7 @@ impl MlxBackend {
                 inkling2_chat(
                     b,
                     PromptSource::History(turns),
+                    &[],
                     max_new_tokens,
                     temperature,
                     top_p,
@@ -3968,14 +4032,16 @@ fn inkling2_named(
 
 /// One Inkling 2 chat turn behind the unified entry points, whatever shape the prompt arrived in.
 ///
-/// Two things the other families do are not done here yet, and both say so rather than pass
-/// silently: `response_format` is refused, and `tool_choice` `required` or a named tool is
+/// `images[i]` are the encoded images of turn `i` (empty for a text-only request). Two things the
+/// other families do are not done here yet, and both say so rather than pass silently:
+/// `response_format` is refused, and `tool_choice` `required` or a named tool is
 /// treated as `auto` (the model usually calls a tool the prompt asks for; nothing forces it).
 #[cfg(feature = "mlx-native")]
 #[allow(clippy::too_many_arguments)]
 fn inkling2_chat(
     b: &mut crate::inkling2::Inkling2Backend,
     source: PromptSource<'_, '_>,
+    images: &[Vec<Vec<u8>>],
     max_new_tokens: usize,
     temperature: f32,
     top_p: f32,
@@ -4009,6 +4075,7 @@ fn inkling2_chat(
     let reply = match source {
         PromptSource::History(turns) => b.chat(
             turns,
+            images,
             tools,
             tool_choice,
             max_new_tokens,
@@ -4022,6 +4089,7 @@ fn inkling2_chat(
             let turns = crate::inkling2::turns_from_pairs(messages)?;
             b.chat(
                 &turns,
+                images,
                 tools,
                 tool_choice,
                 max_new_tokens,

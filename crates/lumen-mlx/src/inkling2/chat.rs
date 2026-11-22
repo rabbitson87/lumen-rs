@@ -267,6 +267,15 @@ pub fn render_prompt_with_images(
 }
 
 /// `<role><|content_image|>` + one image token per block + `<|end_message|>`.
+/// Tokens an image adds to a prompt besides its blocks: the role marker, `<|content_image|>` and
+/// `<|end_message|>` of the message the image is.
+pub const IMAGE_MESSAGE_FRAME_TOKENS: usize = 3;
+
+/// Tokens an encoded image adds to a prompt, from its header alone.
+pub fn image_message_tokens(encoded: &[u8]) -> Result<usize> {
+    Ok(super::pixels::token_count(encoded)? + IMAGE_MESSAGE_FRAME_TOKENS)
+}
+
 fn push_image_message(out: &mut PromptText, role: &str, blocks: usize) {
     out.push_str(role);
     push_image_body(out, blocks);

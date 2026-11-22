@@ -6,14 +6,15 @@ usage: python scripts/golden/inkling2_vision_real.py <dir containing omlx/patche
 
 Writes into <out dir>:
   scene.png                 a 200 x 120 drawing (a red square, a blue circle), deterministic
+  scene_alt.png             the same size, another picture (a yellow circle, a green square)
   features_bf16.safetensors the reference tower's output on the checkpoint's own (bfloat16) weights
   features_f32.safetensors  the same tower with every weight widened to float32: the answer the
                             bfloat16 run is an approximation of, and so the noise floor to read a
                             bfloat16 comparison against
 
 `crates/lumen-mlx/examples/inkling2_vision.rs` compares the Rust tower with both. The checkpoint is
-not in the repository, so neither is the output; `scene.png` is also committed at
-`tests/fixtures/inkling2_vision/scene.png` for the ignored real-checkpoint tests.
+not in the repository, so neither is the output; the two scenes are also committed under
+`tests/fixtures/inkling2_vision/` for the ignored real-checkpoint tests.
 """
 import importlib.util
 import json
@@ -48,6 +49,14 @@ draw.ellipse([115, 25, 185, 95], fill=(30, 60, 220))
 scene.save(out / "scene.png")
 scene = Image.open(out / "scene.png")
 scene.load()
+
+# The same size with another picture (a green square, a yellow circle, swapped sides): same token
+# grid, different content, for the test that a retained conversation is not reused across them.
+alt = Image.new("RGB", (200, 120), (255, 255, 255))
+draw = ImageDraw.Draw(alt)
+draw.ellipse([15, 25, 85, 95], fill=(240, 200, 20))
+draw.rectangle([115, 25, 185, 95], fill=(30, 160, 60))
+alt.save(out / "scene_alt.png")
 
 processor = processing.Inkling2ImageProcessor(
     size={"height": 40, "width": 40},
