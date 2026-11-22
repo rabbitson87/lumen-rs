@@ -139,12 +139,10 @@ fn walk(dir: &PathBuf, best: &mut Option<(std::time::SystemTime, PathBuf)>, dept
             // stale or incomplete metallib (e.g. one assembled during nvfp4
             // GPU-kernel dev that dropped mlx's full steel_attention set,
             // breaking Gemma 4 prefill with "function … not found in library").
-            // mlx-sys's real artifacts always live under a directory named
-            // `mlx-sys-<hash>` or, in cargo's newer build-dir layout, `mlx-sys`.
-            let under_mlx_sys = path.components().any(|c| {
-                let name = c.as_os_str().to_string_lossy();
-                name == "mlx-sys" || name.starts_with("mlx-sys-")
-            });
+            // mlx-sys's real artifacts always live under one of its build dirs.
+            let under_mlx_sys = path
+                .components()
+                .any(|c| mlx_sys_dir(&c.as_os_str().to_string_lossy()).is_some());
             if !under_mlx_sys {
                 continue;
             }
@@ -159,6 +157,26 @@ fn walk(dir: &PathBuf, best: &mut Option<(std::time::SystemTime, PathBuf)>, dept
                 }
             }
         }
+    }
+}
+
+/// How a directory under `build/` holds mlx-sys's output. Both the metallib
+/// search and the diagnostics below read the layout from here, so a new cargo
+/// layout is a change in one place.
+enum MlxSysDir {
+    /// `mlx-sys-<hash>/`: the directory is one build (older cargo).
+    OneBuild,
+    /// `mlx-sys/`: one `<hash>/` per build below it (cargo 1.100+).
+    PerHash,
+}
+
+fn mlx_sys_dir(name: &str) -> Option<MlxSysDir> {
+    if name == "mlx-sys" {
+        Some(MlxSysDir::PerHash)
+    } else if name.starts_with("mlx-sys-") {
+        Some(MlxSysDir::OneBuild)
+    } else {
+        None
     }
 }
 
@@ -188,11 +206,9 @@ fn list_mlx_sys_dirs_inner(build_dir: &PathBuf) {
     for entry in rd.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        let dirs: Vec<PathBuf> = if name_str.starts_with("mlx-sys-") {
-            vec![entry.path()]
-        } else if name_str == "mlx-sys" {
-            // cargo 1.100+: one `<hash>/` per build under `build/mlx-sys/`.
-            std::fs::read_dir(entry.path())
+        let dirs: Vec<PathBuf> = match mlx_sys_dir(&name_str) {
+            Some(MlxSysDir::OneBuild) => vec![entry.path()],
+            Some(MlxSysDir::PerHash) => std::fs::read_dir(entry.path())
                 .map(|hashes| {
                     hashes
                         .flatten()
@@ -200,9 +216,8 @@ fn list_mlx_sys_dirs_inner(build_dir: &PathBuf) {
                         .filter(|p| p.is_dir())
                         .collect()
                 })
-                .unwrap_or_default()
-        } else {
-            continue;
+                .unwrap_or_default(),
+            None => continue,
         };
         for dir in dirs {
             eprintln!("found mlx-sys dir: {}", dir.display());
