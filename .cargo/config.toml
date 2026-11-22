@@ -7,6 +7,16 @@
 # measurement depends on.
 PCRE2_SYS_STATIC = "1"
 
+# Same floor as the release job (.github/workflows/release.yml) and the app
+# bundle's minimumSystemVersion. Unset, MLX's `metal` compiler targets the SDK,
+# which turns on the M5-only NAX kernels; the pinned MLX's NAX gated-delta
+# kernel does not compile against the Xcode 27.2 SDK. A target below 26.2
+# compiles NAX out (MLX_METAL_NO_NAX). An environment variable of the same name
+# overrides this, for a source build that wants NAX on M5. Neither change
+# rebuilds MLX: mlx-sys does not watch this variable and CMake caches the target
+# on first configure, so run `cargo clean -p mlx-sys` after changing it.
+MACOSX_DEPLOYMENT_TARGET = "14.0"
+
 # `cargo xtask …` runs the workspace task runner. Kept out of `default-members`
 # so it never slows down a plain `cargo build` at the root.
 [alias]
