@@ -32,7 +32,7 @@ mod tests;
 mod text_config;
 
 #[cfg(feature = "mlx-native")]
-pub use backend::{Inkling2Backend, RunStats, turns_from_pairs};
+pub use backend::{Inkling2Backend, RunStats, named_effort, turns_from_pairs};
 pub use chat::{DEFAULT_EFFORT, Effort, render_prompt};
 pub use config::{Inkling2Config, LayerKind, LoopConfig, MtpConfig, TextConfig, VisionConfig};
 pub use manifest::{Entry, Manifest, Part, Placement, Role};

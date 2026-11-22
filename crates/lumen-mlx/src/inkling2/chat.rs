@@ -53,6 +53,17 @@ impl Effort {
         self.0
     }
 
+    /// The level in ten-thousandths, which is how [`crate::chat_io::ReasoningEffort::Level`]
+    /// carries it (a level with more than four decimals is rounded to four).
+    pub fn basis_points(self) -> u16 {
+        (self.0 * 10_000.0).round() as u16
+    }
+
+    /// The level a `ReasoningEffort::Level` carries.
+    pub fn from_basis_points(basis_points: u16) -> Self {
+        Self(f64::from(basis_points) / 10_000.0)
+    }
+
     /// The template's vocabulary: `none` 0, `minimal` 0.1, `low` 0.2, `medium` 0.7, `high` 0.9,
     /// `xhigh` and `max` 0.99. A number in the same range is taken as a level too (the template
     /// itself only takes numbers that arrive as numbers, but the request carries a string).
@@ -77,7 +88,11 @@ impl Effort {
     /// thinking off, 0 — except that a level the client named at or below `minimal` is kept, so
     /// `minimal` is the template's 0.1 and not 0.
     pub fn resolve(thinking: bool, raw: Option<&str>) -> Self {
-        let named = raw.and_then(Self::parse);
+        Self::resolve_named(thinking, raw.and_then(Self::parse))
+    }
+
+    /// [`Self::resolve`] for a level already read from the request.
+    pub fn resolve_named(thinking: bool, named: Option<Self>) -> Self {
         match (thinking, named) {
             (true, Some(e)) => e,
             (true, None) => DEFAULT_EFFORT,

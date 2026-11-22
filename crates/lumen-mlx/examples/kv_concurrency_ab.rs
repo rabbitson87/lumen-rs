@@ -603,7 +603,9 @@ fn main() -> Result<()> {
     );
 
     let post_load = active_bytes();
-    let driver = backend.batched_seq_driver_mut();
+    let driver = backend
+        .batched_seq_driver_mut()
+        .expect("this example drives a family that batches");
     let mut next_id: u64 = 1;
 
     // MLX loads weights lazily: nothing is resident until the first forward

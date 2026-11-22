@@ -107,6 +107,20 @@ impl StopCause {
     }
 }
 
+/// A request a backend cannot serve because of what it asks for (a field the backend does not
+/// implement, an input it does not read), as opposed to a failure while serving it. It is the
+/// client's to fix, so the HTTP layer answers 400 and an SDK does not retry it as a 5xx.
+#[derive(Debug)]
+pub struct UnsupportedRequest(pub String);
+
+impl std::fmt::Display for UnsupportedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnsupportedRequest {}
+
 /// One tool surface the model is allowed to invoke. Used by chat-template
 /// renderers (e.g. Gemma 4 `format_function_declaration` → tokenized
 /// `<|tool>declaration:NAME{...}<tool|>` blocks). Intentionally independent
@@ -288,6 +302,11 @@ pub enum ReasoningEffort {
     Xhigh,
     Medium,
     Low,
+    /// A level on a checkpoint's own numeric scale, in ten-thousandths (Inkling 2 prints
+    /// `Thinking effort level: 0.9`, so 9000). Qwen never receives it: only a backend whose
+    /// template takes a number puts it into [`SamplingOverrides::reasoning_effort`] or the token
+    /// counters' `effort`.
+    Level(u16),
 }
 
 impl Default for ReasoningEffort {
@@ -337,7 +356,7 @@ impl ReasoningEffort {
                 "Reasoning effort is set to low. Keep your thinking brief and focused, moving \
                  directly to the conclusion without unnecessary elaboration.",
             ),
-            Self::Medium => None,
+            Self::Medium | Self::Level(_) => None,
         }
     }
 
@@ -349,6 +368,7 @@ impl ReasoningEffort {
             Self::Xhigh => "xh",
             Self::Medium => "md",
             Self::Low => "lo",
+            Self::Level(_) => "lv",
         }
     }
 }

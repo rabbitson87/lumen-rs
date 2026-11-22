@@ -230,7 +230,9 @@ fn main() -> Result<()> {
     println!();
 
     let mut backend = MlxBackend::load(&model_id)?;
-    let driver = backend.batched_seq_driver_mut();
+    let driver = backend
+        .batched_seq_driver_mut()
+        .expect("this example drives a family that batches");
 
     // Prime: MLX loads weights lazily, so the baseline must be taken after a
     // real forward or the whole weight set lands in the first KV measurement.

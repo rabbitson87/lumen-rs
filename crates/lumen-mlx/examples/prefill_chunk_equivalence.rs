@@ -162,7 +162,9 @@ fn main() -> Result<()> {
     println!("chunks        = {chunks:?}  (reference = {})", chunks[0]);
 
     let mut backend = MlxBackend::load(&model_id)?;
-    let driver = backend.batched_seq_driver_mut();
+    let driver = backend
+        .batched_seq_driver_mut()
+        .expect("this example drives a family that batches");
 
     // Prime so the baseline is weights-resident, not zero — MLX loads lazily.
     let warm = build_prompt(driver, FILLER_SEED, 64)?;

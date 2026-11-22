@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use lumen_core::sampling::{SamplingConfig, Xorshift64, sample_from_logits};
 use mlx_rs::Array;
 
@@ -26,9 +26,15 @@ use crate::chat_io::{
 };
 use crate::text_tokenizer::{TextTokenizer, TokenizeStats};
 
-/// Tokens a prefill feeds at a time. The activations of one chunk are bounded by its length; the
-/// whole prompt's would not be (the same bound the Qwen path keeps, and for the same reason).
-const PREFILL_CHUNK: usize = 2048;
+/// Tokens a prefill feeds at a time. The activations of one chunk are bounded by its length, the
+/// whole prompt's would not be.
+///
+/// Measured on a 5,167-token prompt (M3 Max), allocator peak and prefill time at chunks of
+/// 128 / 256 / 512 / 1024 / 2048: 16.0 / 16.5 / 17.2 / 18.0 / 19.5 GiB and 15.3 / 16.5 / 12.8 /
+/// 13.2 / 18.4 s, on 15.5 GiB of weights. Unlike the Qwen path, where a smaller chunk costs
+/// latency, here the unfused masked attention over a long chunk is the expensive part, so 512 is
+/// both the fastest and nearly the lowest.
+const PREFILL_CHUNK: usize = 512;
 
 /// The longest prompt plus reply served. Every one of the 48 layer visits keeps a KV cache, so a
 /// token costs 192 KiB (the 8 visits of the global layers 5, 11, 17, 23 hold all tokens, the 40
@@ -131,8 +137,10 @@ impl Inkling2Backend {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        // A raw prompt (`/v1/completions`) reads control-token spellings as the tokens they name,
+        // as HF does: only chat turns keep the client's text out of the template's markers.
         self.tokenizer
-            .encode_text(text)
+            .encode(text, false)
             .map_err(|e| anyhow!("encode: {e}"))
     }
 
@@ -143,7 +151,29 @@ impl Inkling2Backend {
     }
 
     /// The prompt of a conversation as token ids: the template's markers as control tokens, the
-    /// client's text as ordinary text. `tool_choice: none` leaves the tools out.
+    /// client's text as ordinary text. `tool_choice: none` leaves the tools out. `named` is the
+    /// effort the client asked for, if it named one a level can be read from.
+    pub fn build_prompt(
+        &self,
+        turns: &[ChatTurn<'_>],
+        tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
+        thinking: bool,
+        named: Option<Effort>,
+    ) -> Result<Vec<u32>> {
+        let tools = if matches!(tool_choice, ResolvedToolChoice::None) {
+            &[][..]
+        } else {
+            tools
+        };
+        let effort = Effort::resolve_named(thinking, named);
+        let prompt = render_prompt(turns, tools, effort)?;
+        self.tokenizer
+            .encode_prompt(&prompt)
+            .map_err(|e| anyhow!("encode the prompt: {e}"))
+    }
+
+    /// [`Self::build_prompt`] for a request's own overrides.
     pub fn build_chat_input(
         &self,
         turns: &[ChatTurn<'_>],
@@ -152,16 +182,7 @@ impl Inkling2Backend {
         thinking: bool,
         ov: &SamplingOverrides,
     ) -> Result<Vec<u32>> {
-        let tools = if matches!(tool_choice, ResolvedToolChoice::None) {
-            &[][..]
-        } else {
-            tools
-        };
-        let effort = Effort::resolve(thinking, ov.reasoning_effort_raw.as_deref());
-        let prompt = render_prompt(turns, tools, effort)?;
-        self.tokenizer
-            .encode_prompt(&prompt)
-            .map_err(|e| anyhow!("encode the prompt: {e}"))
+        self.build_prompt(turns, tools, tool_choice, thinking, named_effort(ov))
     }
 
     /// The cost of the last request.
@@ -379,6 +400,12 @@ fn pick(
     }
 }
 
+/// The effort a request names: its `reasoning_effort` as spelled, when a level can be read from
+/// it.
+pub fn named_effort(ov: &SamplingOverrides) -> Option<Effort> {
+    ov.reasoning_effort_raw.as_deref().and_then(Effort::parse)
+}
+
 /// The sampling of a request. `None` is greedy.
 ///
 /// The checkpoint's `generation_config.json` samples at temperature 1; the server's default of 0.7
@@ -417,7 +444,10 @@ pub fn turns_from_pairs(messages: &[(String, String)]) -> Result<Vec<ChatTurn<'_
                 text: content,
                 tool_calls: &[],
             }),
-            other => bail!("Inkling 2 has no flat message role {other:?}"),
+            other => Err(crate::chat_io::UnsupportedRequest(format!(
+                "Inkling 2 has no message role {other:?} (system, user, assistant and tool)"
+            ))
+            .into()),
         })
         .collect()
 }

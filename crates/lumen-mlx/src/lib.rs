@@ -2309,6 +2309,10 @@ pub enum MlxBackend {
     /// Gemma 4 26B-A4B MoE (3-bit / 4-bit MLX shards).
     #[cfg(feature = "mlx-native")]
     Gemma4(crate::gemma4::Gemma4Backend),
+    /// Inkling 2 (`inkling2_loop`), text only: its own chat template and reply format, KV caches
+    /// per layer visit, and the last conversation's caches retained between requests.
+    #[cfg(feature = "mlx-native")]
+    Inkling2(Box<crate::inkling2::Inkling2Backend>),
 }
 
 impl MlxBackend {
@@ -2335,6 +2339,8 @@ impl MlxBackend {
     pub fn tokenize_stats(&self) -> Option<std::sync::Arc<TokenizeStats>> {
         match self {
             Self::Qwen35Family(m) => m.tokenize_stats(),
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => Some(b.tokenize_stats()),
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(g) => Some(g.tokenize_stats()),
         }
@@ -2363,6 +2369,18 @@ impl MlxBackend {
                 let inner = crate::gemma4::Gemma4Backend::from_dir(model_id, &dir)?;
                 Ok(Self::Gemma4(inner))
             }
+            #[cfg(feature = "mlx-native")]
+            MlxFamily::Inkling2 => {
+                let dir = std::path::Path::new(model_id);
+                if !dir.is_dir() {
+                    return Err(anyhow!(
+                        "Inkling 2 needs MODEL_ID to be the local directory of the checkpoint \
+                         (got {model_id:?}); download it first"
+                    ));
+                }
+                let inner = crate::inkling2::Inkling2Backend::from_dir(model_id, dir)?;
+                Ok(Self::Inkling2(Box::new(inner)))
+            }
             MlxFamily::Qwen35 => {
                 let inner = MlxQwen35Backend::load(model_id)?;
                 Ok(Self::Qwen35Family(inner))
@@ -2388,6 +2406,11 @@ impl MlxBackend {
     ) -> Option<crate::chat_io::ReasoningEffort> {
         match self {
             Self::Qwen35Family(m) if m.wants_reasoning_effort => ov.reasoning_effort,
+            // Inkling 2's template takes a level on its own scale, which the client's spelling
+            // names (Qwen's three levels cannot say `high`, `max` or a number).
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => crate::inkling2::named_effort(ov)
+                .map(|e| crate::chat_io::ReasoningEffort::Level(e.basis_points())),
             _ => None,
         }
     }
@@ -2401,6 +2424,8 @@ impl MlxBackend {
         match self {
             Self::Qwen35Family(m) => Some(m),
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => None,
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(_) => None,
         }
     }
@@ -2409,6 +2434,8 @@ impl MlxBackend {
     pub fn as_qwen35(&self) -> Option<&MlxQwen35Backend> {
         match self {
             Self::Qwen35Family(m) => Some(m),
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => None,
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(_) => None,
         }
@@ -2420,6 +2447,7 @@ impl MlxBackend {
         match self {
             Self::Gemma4(m) => Some(m),
             Self::Qwen35Family(_) => None,
+            Self::Inkling2(_) => None,
         }
     }
 
@@ -2429,15 +2457,25 @@ impl MlxBackend {
         match self {
             Self::Gemma4(m) => Some(m),
             Self::Qwen35Family(_) => None,
+            Self::Inkling2(_) => None,
         }
     }
 
-    /// Phase 3: family-agnostic `&mut dyn` driver for the batched scheduler.
+    /// Whether this family can be served by the continuous-batching scheduler.
     #[cfg(feature = "mlx-native")]
-    pub fn batched_seq_driver_mut(&mut self) -> &mut dyn MlxBatchedSeqDriver {
+    pub fn supports_batched_decode(&self) -> bool {
+        !matches!(self, Self::Inkling2(_))
+    }
+
+    /// Phase 3: family-agnostic `&mut dyn` driver for the batched scheduler; `None` for a family
+    /// that does not batch (see [`Self::supports_batched_decode`]).
+    #[cfg(feature = "mlx-native")]
+    pub fn batched_seq_driver_mut(&mut self) -> Option<&mut dyn MlxBatchedSeqDriver> {
         match self {
-            Self::Qwen35Family(m) => m,
-            Self::Gemma4(m) => m,
+            Self::Qwen35Family(m) => Some(m),
+            Self::Gemma4(m) => Some(m),
+            // One sequence at a time: its caches are retained between requests.
+            Self::Inkling2(_) => None,
         }
     }
 
@@ -2447,6 +2485,8 @@ impl MlxBackend {
     pub fn kind(&self) -> MlxBackendKind {
         match self {
             Self::Qwen35Family(_) => MlxBackendKind::Qwen35Family,
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => MlxBackendKind::Inkling2,
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(_) => MlxBackendKind::Gemma4,
         }
@@ -2467,6 +2507,8 @@ impl MlxBackend {
         match self {
             Self::Qwen35Family(m) => m.model_id(),
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => b.model_id(),
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => m.model_id(),
         }
     }
@@ -2482,6 +2524,8 @@ impl MlxBackend {
         match self {
             Self::Qwen35Family(m) => m.prefill_peak(prompt_tokens),
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => None,
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(_) => None,
         }
     }
@@ -2489,6 +2533,8 @@ impl MlxBackend {
     pub fn max_context(&self) -> Option<usize> {
         match self {
             Self::Qwen35Family(m) => m.max_context(),
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => Some(b.max_context()),
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => Some(m.max_context()),
         }
@@ -2502,6 +2548,8 @@ impl MlxBackend {
         match self {
             Self::Qwen35Family(m) => m.eos_tokens(),
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => b.eos_tokens(),
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => m.eos_tokens(),
         }
     }
@@ -2510,6 +2558,8 @@ impl MlxBackend {
         match self {
             Self::Qwen35Family(m) => m.encode(text),
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => b.encode(text),
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => m.encode(text),
         }
     }
@@ -2517,6 +2567,8 @@ impl MlxBackend {
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
         match self {
             Self::Qwen35Family(m) => m.decode(tokens),
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => b.decode(tokens),
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => m.decode(tokens),
         }
@@ -2530,6 +2582,17 @@ impl MlxBackend {
     ) -> Result<Vec<u32>> {
         match self {
             Self::Qwen35Family(m) => m.build_chat_input(messages, thinking, effort),
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => {
+                let turns = crate::inkling2::turns_from_pairs(messages)?;
+                b.build_prompt(
+                    &turns,
+                    &[],
+                    &crate::chat_io::ResolvedToolChoice::Auto,
+                    thinking,
+                    inkling2_named(effort),
+                )
+            }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 // Gemma 4's template has no reasoning-effort block.
@@ -2577,6 +2640,14 @@ impl MlxBackend {
                 }
                 m.build_chat_input_with_tools(messages, thinking, tools, tool_choice, effort)
                     .map(|(ids, _prefill)| ids)
+            }
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => {
+                // `response_format` is refused when the turn is generated, so the count has
+                // nothing to mirror for it.
+                let _ = structured;
+                let turns = crate::inkling2::turns_from_pairs(messages)?;
+                b.build_prompt(&turns, tools, tool_choice, thinking, inkling2_named(effort))
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
@@ -2632,6 +2703,11 @@ impl MlxBackend {
                 .map(|(ids, _prefill)| ids)
             }
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => {
+                let _ = structured;
+                b.build_prompt(turns, tools, tool_choice, thinking, inkling2_named(effort))
+            }
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let _ = effort;
                 m.build_chat_input_prefilled_from_history(
@@ -2675,6 +2751,8 @@ impl MlxBackend {
         match self {
             Self::Qwen35Family(m) => m.drop_prefix_cache(key),
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => false,
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => m.drop_prefix_cache(key),
         }
     }
@@ -2682,6 +2760,8 @@ impl MlxBackend {
     pub fn clear_prefix_cache(&mut self) -> usize {
         match self {
             Self::Qwen35Family(m) => m.clear_prefix_cache(),
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => usize::from(b.clear_retained()),
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => m.clear_prefix_cache(),
         }
@@ -2693,6 +2773,8 @@ impl MlxBackend {
     pub fn drop_session(&mut self, session_id: &str) -> bool {
         match self {
             Self::Qwen35Family(m) => m.drop_session(session_id),
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => false,
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(_) => false,
         }
@@ -2918,6 +3000,23 @@ impl MlxBackend {
                 })
             }
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => {
+                let _ = session_id;
+                inkling2_chat(
+                    b,
+                    PromptSource::Flat(messages),
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    &mut stop_sink(&ov.stop),
+                )
+            }
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => gemma4_chat(
                 m,
                 PromptSource::Flat(messages),
@@ -3065,6 +3164,11 @@ impl MlxBackend {
                     ..Default::default()
                 })
             }
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => Err(crate::chat_io::UnsupportedRequest(
+                "image input is not supported for Inkling 2 yet (text only)".into(),
+            )
+            .into()),
             #[allow(unreachable_patterns)]
             _ => Err(anyhow::anyhow!(
                 "image input requires a vision-capable MLX backend (LUMEN_VISION=1)"
@@ -3189,6 +3293,11 @@ impl MlxBackend {
                     ..Default::default()
                 })
             }
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => Err(crate::chat_io::UnsupportedRequest(
+                "image input is not supported for Inkling 2 yet (text only)".into(),
+            )
+            .into()),
             #[allow(unreachable_patterns)]
             _ => Err(anyhow::anyhow!(
                 "image input requires a vision-capable MLX backend (LUMEN_VISION=1)"
@@ -3304,6 +3413,11 @@ impl MlxBackend {
                     effort,
                 )
             }
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => Err(crate::chat_io::UnsupportedRequest(
+                "image input is not supported for Inkling 2 yet (text only)".into(),
+            )
+            .into()),
             #[allow(unreachable_patterns)]
             _ => Err(anyhow::anyhow!(
                 "image input with a tool-calling history requires a vision-capable MLX \
@@ -3371,6 +3485,23 @@ impl MlxBackend {
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     stop_sink(&ov.stop),
                     effort,
+                )
+            }
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => {
+                let _ = session_id;
+                inkling2_chat(
+                    b,
+                    PromptSource::History(turns),
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    &mut stop_sink(&ov.stop),
                 )
             }
             #[cfg(feature = "mlx-native")]
@@ -3535,6 +3666,23 @@ impl MlxBackend {
                 })
             }
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => {
+                let _ = session_id;
+                inkling2_chat(
+                    b,
+                    PromptSource::Flat(messages),
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    &mut on_event,
+                )
+            }
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => gemma4_chat_streaming(
                 m,
                 PromptSource::Flat(messages),
@@ -3650,6 +3798,11 @@ impl MlxBackend {
                     effort,
                 )
             }
+            #[cfg(feature = "mlx-native")]
+            Self::Inkling2(_) => Err(crate::chat_io::UnsupportedRequest(
+                "image input is not supported for Inkling 2 yet (text only)".into(),
+            )
+            .into()),
             #[allow(unreachable_patterns)]
             _ => Err(anyhow::anyhow!(
                 "image input with a tool-calling history requires a vision-capable MLX \
@@ -3723,6 +3876,24 @@ impl MlxBackend {
                 )
             }
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => {
+                let _ = session_id;
+                let mut on_event = on_event;
+                inkling2_chat(
+                    b,
+                    PromptSource::History(turns),
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    &mut on_event,
+                )
+            }
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => gemma4_chat_streaming(
                 m,
                 PromptSource::History(turns),
@@ -3769,6 +3940,11 @@ impl MlxBackend {
                 m.completion_session(input_ids, max_new_tokens, session_id)
             }
             #[cfg(feature = "mlx-native")]
+            Self::Inkling2(b) => {
+                let _ = session_id;
+                b.generate(input_ids, max_new_tokens, temperature, top_p, ov)
+            }
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let _ = session_id;
                 m.generate(input_ids, max_new_tokens, temperature, top_p, ov)
@@ -3777,12 +3953,107 @@ impl MlxBackend {
     }
 }
 
+/// The effort a [`chat_io::ReasoningEffort::Level`] carries, as Inkling 2 renders it.
+#[cfg(feature = "mlx-native")]
+fn inkling2_named(
+    effort: Option<crate::chat_io::ReasoningEffort>,
+) -> Option<crate::inkling2::Effort> {
+    match effort {
+        Some(crate::chat_io::ReasoningEffort::Level(bp)) => {
+            Some(crate::inkling2::Effort::from_basis_points(bp))
+        }
+        _ => None,
+    }
+}
+
+/// One Inkling 2 chat turn behind the unified entry points, whatever shape the prompt arrived in.
+///
+/// Two things the other families do are not done here yet, and both say so rather than pass
+/// silently: `response_format` is refused, and `tool_choice` `required` or a named tool is
+/// treated as `auto` (the model usually calls a tool the prompt asks for; nothing forces it).
+#[cfg(feature = "mlx-native")]
+#[allow(clippy::too_many_arguments)]
+fn inkling2_chat(
+    b: &mut crate::inkling2::Inkling2Backend,
+    source: PromptSource<'_, '_>,
+    max_new_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+    ov: &SamplingOverrides,
+    thinking: bool,
+    tools: &[crate::chat_io::ToolDef<'_>],
+    tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    response_schema: Option<&serde_json::Value>,
+    on_event: &mut dyn FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+) -> Result<crate::chat_io::ParsedResponse> {
+    use crate::chat_io::ResolvedToolChoice;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED_TOOL_CHOICE: AtomicBool = AtomicBool::new(false);
+    if response_schema.is_some() {
+        return Err(crate::chat_io::UnsupportedRequest(
+            "response_format is not supported for Inkling 2 yet".into(),
+        )
+        .into());
+    }
+    if matches!(
+        tool_choice,
+        ResolvedToolChoice::Required | ResolvedToolChoice::Tool(_)
+    ) && !tools.is_empty()
+        && !WARNED_TOOL_CHOICE.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "[inkling2] tool_choice required/named is not enforced: the model decides whether to \
+             call a tool"
+        );
+    }
+    let reply = match source {
+        PromptSource::History(turns) => b.chat(
+            turns,
+            tools,
+            tool_choice,
+            max_new_tokens,
+            temperature,
+            top_p,
+            thinking,
+            ov,
+            on_event,
+        ),
+        PromptSource::Flat(messages) => {
+            let turns = crate::inkling2::turns_from_pairs(messages)?;
+            b.chat(
+                &turns,
+                tools,
+                tool_choice,
+                max_new_tokens,
+                temperature,
+                top_p,
+                thinking,
+                ov,
+                on_event,
+            )
+        }
+    }?;
+    let s = b.last_run();
+    eprintln!(
+        "[inkling2] prompt={} reused={} prefill={:.0}ms generated={} decode={:.0}ms ({:.1} tok/s)",
+        s.prompt_tokens,
+        s.reused_tokens,
+        s.prefill_ms,
+        s.generated_tokens,
+        s.decode_ms,
+        s.generated_tokens as f64 / (s.decode_ms / 1e3).max(1e-9),
+    );
+    Ok(reply)
+}
+
 /// Family discriminant — exposed for engine-layer logging / metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MlxBackendKind {
     Qwen35Family,
     #[cfg(feature = "mlx-native")]
     Gemma4,
+    #[cfg(feature = "mlx-native")]
+    Inkling2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3790,6 +4061,21 @@ enum MlxFamily {
     Qwen35,
     #[cfg(feature = "mlx-native")]
     Gemma4,
+    #[cfg(feature = "mlx-native")]
+    Inkling2,
+}
+
+/// Whether `model_id` names a local directory holding an `inkling2_loop` checkpoint. The
+/// checkpoint's own `config.json` is the evidence: an HF-style id or a renamed directory says
+/// nothing reliable about the architecture inside.
+#[cfg(feature = "mlx-native")]
+fn is_inkling2_dir(model_id: &str) -> bool {
+    let path = std::path::Path::new(model_id).join("config.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| v.get("model_type")?.as_str().map(str::to_owned))
+        .is_some_and(|t| t.starts_with("inkling2"))
 }
 
 fn detect_mlx_family(model_id: &str) -> MlxFamily {
@@ -3799,11 +4085,21 @@ fn detect_mlx_family(model_id: &str) -> MlxFamily {
         match v.trim().to_lowercase().as_str() {
             #[cfg(feature = "mlx-native")]
             "gemma4" | "gemma" | "gemma-4" => return MlxFamily::Gemma4,
+            #[cfg(feature = "mlx-native")]
+            "inkling2" | "inkling" | "inkling-2" => return MlxFamily::Inkling2,
             "qwen" | "qwen35" | "qwen3_5" | "qwen3.6" => return MlxFamily::Qwen35,
             _ => {}
         }
     }
     let lower = model_id.to_lowercase();
+    #[cfg(feature = "mlx-native")]
+    if is_inkling2_dir(model_id)
+        || lower.contains("inkling-2")
+        || lower.contains("inkling2")
+        || lower.contains("inkling_2")
+    {
+        return MlxFamily::Inkling2;
+    }
     #[cfg(feature = "mlx-native")]
     if lower.contains("gemma-4")
         || lower.contains("gemma4-")
@@ -11300,5 +11596,67 @@ mod tests {
         );
         // Empty batch is a valid no-op.
         assert_eq!(r.decode_step_batch(&[], &[], &[]).unwrap(), vec![]);
+    }
+}
+
+/// Which family a model id or directory loads as.
+#[cfg(all(test, feature = "mlx-native"))]
+mod family_detection_tests {
+    use super::*;
+
+    #[test]
+    fn an_inkling2_id_loads_as_inkling2_and_the_neighbours_keep_theirs() {
+        for id in [
+            "mlx-community/Inkling-2-Mini-oQ4e-mtp",
+            "thinkingmachines/Inkling-2-Mini",
+            "/models/my_inkling_2_copy",
+        ] {
+            assert_eq!(detect_mlx_family(id), MlxFamily::Inkling2, "{id}");
+        }
+        assert_eq!(
+            detect_mlx_family("mlx-community/gemma-4-26b-a4b-it-nvfp4"),
+            MlxFamily::Gemma4
+        );
+        assert_eq!(
+            detect_mlx_family("mlx-community/Qwen3.6-35B-A3B-mxfp4"),
+            MlxFamily::Qwen35
+        );
+    }
+
+    #[test]
+    fn a_directory_is_judged_by_its_own_config_not_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("some-neutral-name");
+        std::fs::create_dir(&path).unwrap();
+        let id = path.to_str().unwrap();
+        assert_ne!(detect_mlx_family(id), MlxFamily::Inkling2);
+        std::fs::write(
+            path.join("config.json"),
+            r#"{"model_type":"inkling2_loop"}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_mlx_family(id), MlxFamily::Inkling2);
+        std::fs::write(path.join("config.json"), r#"{"model_type":"qwen3_5_moe"}"#).unwrap();
+        assert_ne!(detect_mlx_family(id), MlxFamily::Inkling2);
+    }
+
+    #[test]
+    fn the_effort_a_client_spelled_is_the_level_the_counters_and_the_renderer_share() {
+        let ov = SamplingOverrides {
+            reasoning_effort_raw: Some("max".into()),
+            ..Default::default()
+        };
+        let named = crate::inkling2::named_effort(&ov).expect("max is a level");
+        assert_eq!(named.basis_points(), 9900);
+        assert_eq!(
+            crate::inkling2::Effort::from_basis_points(named.basis_points()),
+            named
+        );
+        // A spelling that is not a level is not an effort (the default applies).
+        let ov = SamplingOverrides {
+            reasoning_effort_raw: Some("ludicrous".into()),
+            ..Default::default()
+        };
+        assert!(crate::inkling2::named_effort(&ov).is_none());
     }
 }

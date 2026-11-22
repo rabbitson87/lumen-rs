@@ -152,6 +152,7 @@ fn main() -> Result<()> {
             std::io::stdout().flush()?;
             Ok(())
         };
+        lumen_mlx::metal_memory::reset_peak_memory();
         let reply = backend.chat(
             &turns,
             &tools,
@@ -173,6 +174,15 @@ fn main() -> Result<()> {
             s.decode_ms,
             s.generated_tokens as f64 / (s.decode_ms / 1e3).max(1e-9),
             reply.stop
+        );
+        fn gib<E>(r: std::result::Result<usize, E>) -> f64 {
+            r.map_or(f64::NAN, |b| b as f64 / 1_073_741_824.0)
+        }
+        println!(
+            "    memory: peak {:.1} GiB, active {:.1} GiB, cached {:.1} GiB",
+            gib(lumen_mlx::metal_memory::get_peak_memory()),
+            gib(lumen_mlx::metal_memory::get_active_memory()),
+            gib(lumen_mlx::metal_memory::get_cache_memory()),
         );
         let text = if reply.reasoning.is_empty() {
             reply.visible.clone()

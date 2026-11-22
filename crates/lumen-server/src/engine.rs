@@ -3332,7 +3332,7 @@ impl InferenceEngine {
         // the sequential stream.
         #[cfg(feature = "mlx-native")]
         let mlx_batched = mlx_feature_on("LUMEN_MLX_BATCH_DECODE")
-            && matches!(&self.backend, ModelBackend::Mlx(_));
+            && matches!(&self.backend, ModelBackend::Mlx(b) if b.supports_batched_decode());
         #[cfg(feature = "mlx-native")]
         if mlx_batched {
             self.run_batched_mlx(&mut rx).await;
@@ -3550,7 +3550,7 @@ impl InferenceEngine {
     #[cfg(feature = "mlx-native")]
     fn mlx_batched_driver(&mut self) -> Option<&mut dyn lumen_mlx::MlxBatchedSeqDriver> {
         match &mut self.backend {
-            ModelBackend::Mlx(b) => Some(b.batched_seq_driver_mut()),
+            ModelBackend::Mlx(b) => b.batched_seq_driver_mut(),
         }
     }
 

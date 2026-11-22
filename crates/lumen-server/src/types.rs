@@ -837,12 +837,14 @@ pub fn refusal_message(msg: &str) -> String {
 }
 
 /// The status an inference failure goes out with: 400 for a prompt the size
-/// guard refused — the client's to fix, and one an SDK must not retry the way
-/// it retries a 5xx — and 500 for everything else.
+/// guard refused or a request the backend cannot serve (`UnsupportedRequest`: a
+/// field or an input it does not implement) — the client's to fix, and ones an
+/// SDK must not retry the way it retries a 5xx — and 500 for everything else.
 pub fn inference_error_status(e: &anyhow::Error) -> u16 {
-    if e.chain()
-        .any(|cause| cause.is::<crate::engine::PromptTooLarge>())
-    {
+    if e.chain().any(|cause| {
+        cause.is::<crate::engine::PromptTooLarge>()
+            || cause.is::<lumen_mlx::chat_io::UnsupportedRequest>()
+    }) {
         400
     } else {
         500
@@ -2327,6 +2329,40 @@ mod reasoning_effort_wiring_tests {
 
     fn req(json: serde_json::Value) -> ChatCompletionRequest {
         serde_json::from_value(json).expect("request parses")
+    }
+
+    #[test]
+    fn the_effort_as_spelled_reaches_the_overrides_even_when_it_turns_thinking_off() {
+        // Qwen's three levels cannot say these; Inkling 2 reads the spelling itself.
+        for sent in ["minimal", "none", "high", "max", "0.5"] {
+            let r = req(serde_json::json!({
+                "model": "q",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": sent,
+            }));
+            assert_eq!(
+                r.sampling_overrides().reasoning_effort_raw.as_deref(),
+                Some(sent)
+            );
+        }
+        let none = req(serde_json::json!({
+            "model": "q",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(none.sampling_overrides().reasoning_effort_raw, None);
+    }
+
+    #[test]
+    fn a_request_the_backend_cannot_serve_is_a_400_not_a_500() {
+        let unsupported: anyhow::Error =
+            lumen_mlx::chat_io::UnsupportedRequest("no images".into()).into();
+        assert_eq!(inference_error_status(&unsupported), 400);
+        let wrapped = unsupported.context("chat");
+        assert_eq!(inference_error_status(&wrapped), 400);
+        assert_eq!(
+            inference_error_status(&anyhow::anyhow!("a Metal failure")),
+            500
+        );
     }
 
     #[test]
