@@ -768,7 +768,7 @@ mod imp {
         /// `[0..new_offset)` which excludes them, and subsequent writes
         /// (`slice_update` at the new write position) overwrite cleanly.
         ///
-        /// We do NOT shrink the buffer (no slice + reassign) because that
+        /// On the step-prealloc path we do NOT shrink the buffer (no slice + reassign) because that
         /// causes mlx's slice op to return a strided view sharing storage
         /// with the parent — concat-during-grow on the next decode step
         /// then reads through the strided view in a way that produces
@@ -789,6 +789,23 @@ mod imp {
                 k.eval().context("NativeKvCache::truncate_to: eval keys")?;
                 v.eval()
                     .context("NativeKvCache::truncate_to: eval values")?;
+            }
+            if !use_step_prealloc() {
+                // Legacy concat path (`LUMEN_NATIVE_KV_STEP_PREALLOC=0`): the buffers are exactly
+                // `offset` long and the next append goes after their end, so lowering the offset
+                // alone would leave the rows past `target` in place as live keys. Cut them. (The
+                // concat that follows reads through the view and copies; the in-place hazard
+                // described above is the step-prealloc path's.)
+                self.keys = self
+                    .keys
+                    .as_ref()
+                    .map(|k| slice_axis2(k, 0, target as i32))
+                    .transpose()?;
+                self.values = self
+                    .values
+                    .as_ref()
+                    .map(|v| slice_axis2(v, 0, target as i32))
+                    .transpose()?;
             }
             self.offset = target;
             // The slots past `target` will be overwritten: keep only the pages
@@ -2307,6 +2324,58 @@ mod lifecycle_tests {
         assert_eq!(c.offset(), 0);
         assert!(c.keys().is_none());
         assert!(c.values().is_none());
+    }
+
+    /// RED before, on the legacy path: with `LUMEN_NATIVE_KV_STEP_PREALLOC=0` the buffers are exactly
+    /// `offset` long and the next append goes after their end, so a `truncate_to` that only lowered
+    /// the offset left the cut-off rows in place as live keys (a rolled-back draft, or a conversation
+    /// rewound to a shared prefix, attended to them).
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn truncate_then_append_reads_back_the_kept_rows_and_the_new_one_on_both_append_paths() {
+        for prealloc in [false, true] {
+            super::imp::kv_step_prealloc::with(prealloc, || {
+                let mut c = NativeKvCache::new();
+                // Five one-row blocks: element 0 of row j holds j (keys) or 100 + j (values).
+                for step in 0..5 {
+                    let k = make_kv_block(1, 2, 1, 8, step as f32);
+                    let v = make_kv_block(1, 2, 1, 8, step as f32 + 100.0);
+                    c.update_and_fetch(&k, &v).unwrap();
+                }
+                c.truncate_to(3).unwrap();
+                assert_eq!(c.offset(), 3, "prealloc={prealloc}");
+                let k = make_kv_block(1, 2, 1, 8, 50.0);
+                let v = make_kv_block(1, 2, 1, 8, 150.0);
+                let (kf, vf) = c.update_and_fetch(&k, &v).unwrap();
+                assert_eq!(c.offset(), 4, "prealloc={prealloc}");
+                assert_eq!(
+                    kf.shape()[2],
+                    4,
+                    "prealloc={prealloc}: three kept rows and the new one, none of the two cut off"
+                );
+                assert_eq!(vf.shape()[2], 4, "prealloc={prealloc}");
+                // Head 0 of a `[1, 2, rows, 8]` array: row j starts at j * 8, in either layout.
+                kf.eval().unwrap();
+                vf.eval().unwrap();
+                let (kg, vg) = (kf.as_slice::<f32>(), vf.as_slice::<f32>());
+                for (j, (want_k, want_v)) in
+                    [(0.0, 100.0), (1.0, 101.0), (2.0, 102.0), (50.0, 150.0)]
+                        .into_iter()
+                        .enumerate()
+                {
+                    assert!(
+                        (kg[j * 8] - want_k).abs() < 1e-3,
+                        "prealloc={prealloc}: key row {j} holds {}, expected {want_k}",
+                        kg[j * 8]
+                    );
+                    assert!(
+                        (vg[j * 8] - want_v).abs() < 1e-3,
+                        "prealloc={prealloc}: value row {j} holds {}, expected {want_v}",
+                        vg[j * 8]
+                    );
+                }
+            });
+        }
     }
 
     #[test]

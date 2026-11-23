@@ -2562,6 +2562,20 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "kv-legacy-truncate-keeps-the-cut-rows",
+        symptom: "with `LUMEN_NATIVE_KV_STEP_PREALLOC=0` (the emergency revert to the concat path) `truncate_to` only lowered the offset, so the next append went after the rows it was meant to drop and attention read them as live keys: a rolled-back draft or a conversation rewound to a shared prefix answered from stale K/V (nothing crashes; the answers drift)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "            if !use_step_prealloc() {\n                // Legacy concat path (`LUMEN_NATIVE_KV_STEP_PREALLOC=0`): the buffers are exactly",
+            replace: "            if false && !use_step_prealloc() { // defect: the rows past the cut stay\n                // Legacy concat path (`LUMEN_NATIVE_KV_STEP_PREALLOC=0`): the buffers are exactly",
+        }],
+        guards: &[mlx(
+            "native_cache::lifecycle_tests::truncate_then_append_reads_back_the_kept_rows_and_the_new_one_on_both_append_paths",
+        )],
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
         name: "inkling2-effort-number-rejected",
         symptom: "`reasoning_effort` was read as text only, so a client sending the level as a number (`0.5`, which Inkling 2's template takes and its model card documents) got a 400 from the request parser",
         revert: &[Mutation {
@@ -2641,9 +2655,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "causal-mask-coverage")
         | (_, "causal-mask-builders-agree")
         | (_, "quantized-kv-prefill-unmasked") => "native_attention.rs",
-        (_, "rotating-cache-both-paths") | (_, "compressed-cache-reports-offset-zero") => {
-            "native_cache.rs"
-        }
+        (_, "rotating-cache-both-paths")
+        | (_, "compressed-cache-reports-offset-zero")
+        | (_, "kv-legacy-truncate-keeps-the-cut-rows") => "native_cache.rs",
         (_, "flux-scheduler-invariants") => "scheduler.rs",
         (_, "flux-left-padding") => "tokenizer.rs",
         (_, "tool-choice-none")
