@@ -250,6 +250,8 @@ pub use native_cache::KV_CACHE_STEP;
 /// The GPU's streaming read bandwidth (`lumen-server --measure-memory-bandwidth`).
 #[cfg(feature = "mlx-native")]
 mod bandwidth;
+#[cfg(feature = "mlx-native")]
+mod keyed_compile;
 mod native_compile_cache;
 mod native_conv1d;
 mod native_embedding;

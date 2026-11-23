@@ -13,7 +13,7 @@
 //! The loop controllers' bf16 rounding is off in the end-to-end runs (on both sides; see the
 //! fixture script for why) and pinned on its own in `the_loop_controllers_match_the_reference`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use mlx_rs::Array;
@@ -569,30 +569,134 @@ fn assert_same_logits(label: &str, plain: &[Vec<f32>], fused: &[Vec<f32>]) {
     }
 }
 
+/// The regions `fused.rs` compiles, under the names it counts them by.
+const REGIONS: [&str; 7] = [
+    "swiglu",
+    "local projection",
+    "global projection",
+    "conv residual",
+    "conv next",
+    "mix messages",
+    "attention-residual mix",
+];
+
+/// How many times each region has been served since `before`.
+fn served_since(before: &BTreeMap<&'static str, usize>) -> Vec<(&'static str, usize)> {
+    let now = super::fused::served();
+    REGIONS
+        .into_iter()
+        .map(|name| {
+            let then = before.get(name).copied().unwrap_or(0);
+            (name, now.get(name).copied().unwrap_or(0) - then)
+        })
+        .collect()
+}
+
+fn assert_every_region_served(label: &str, before: &BTreeMap<&'static str, usize>) {
+    for (name, ran) in served_since(before) {
+        assert!(ran > 0, "{label}: the {name} region was never served");
+    }
+}
+
 /// The compiled regions (`fused.rs`) run the plain ops' arithmetic in the same order and dtypes:
 /// the same steps with them on and off give the same logits (bit for bit on the replica; the bound
 /// allows float noise on another GPU), over single tokens and over blocks of rows, with the loop
-/// controllers' bf16 rounding off (the parity replica) and on (as serving runs them). They are
-/// also served at all: a run with them on counts compiled calls, one with them off counts none.
+/// controllers' bf16 rounding off (the parity replica) and on (as serving runs them). Every region
+/// is also served: a run with them on counts calls of each, one with them off counts none. Both
+/// models load in one process, the second after the first has compiled its regions.
 #[test]
 fn the_compiled_regions_give_the_logits_the_plain_ops_give() {
     for (label, model) in [
         ("replica", load_replica()),
         ("rounded replica", load_replica_rounded()),
     ] {
-        let served = || super::fused::SERVED.with(std::cell::Cell::get);
-        let before = served();
+        let before = super::fused::served();
         let off = steps_with(&model, false);
-        assert_eq!(served(), before, "{label}: the plain run served a region");
-        let on = steps_with(&model, true);
-        assert!(
-            served() > before + 100,
-            "{label}: the compiled regions were not served ({} calls)",
-            served() - before
+        assert_eq!(
+            super::fused::served(),
+            before,
+            "{label}: the plain run served a region"
         );
+        let on = steps_with(&model, true);
+        assert_every_region_served(label, &before);
         assert_same_logits(&format!("{label}, token by token"), &off.0, &on.0);
         assert_same_logits(&format!("{label}, in blocks"), &off.1, &on.1);
     }
+}
+
+/// The replica with other clip thresholds in its config: the same shapes and weights, other
+/// constants for the compiled projection regions. The directory lives as long as the returned guard.
+fn load_replica_with_clips(qk: f32, rel: f32) -> (Inkling2Model, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let config = std::fs::read_to_string(fixture_dir().join("config.json")).expect("config.json");
+    let edit = |text: &str, key: &str, value: f32| {
+        let at = text.find(&format!("\"{key}\":")).expect("the key is there");
+        let end = at + text[at..].find(',').expect("the value ends");
+        format!("{}\"{key}\": {value:?}{}", &text[..at], &text[end..])
+    };
+    let config = edit(
+        &edit(&config, "qk_l2_clip_threshold", qk),
+        "rel_l2_clip_threshold",
+        rel,
+    );
+    std::fs::write(dir.path().join("config.json"), config).unwrap();
+    std::fs::copy(
+        fixture_dir().join("model.safetensors"),
+        dir.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let model = Inkling2Model::load(
+        dir.path(),
+        LoadOptions {
+            round_loop_mix: true,
+        },
+    )
+    .expect("load the replica with other clips");
+    (model, dir)
+}
+
+/// The largest difference between two runs' logits (finite entries).
+fn worst_difference(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
+    a.iter()
+        .zip(b)
+        .flat_map(|(x, y)| x.iter().zip(y))
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
+}
+
+/// A compiled region is keyed on the constants it was traced with, so a model whose layers have
+/// other constants (here other clip thresholds, with the same shapes MLX also keys on) gets graphs
+/// of its own in the same process, and the first model's are untouched. Run in the order A, B, A,
+/// each region is served compiled for B, B's compiled logits equal its plain ones, and A's logits
+/// are the same before and after B ran. (RED if the constants were left out of the key: B would
+/// replay A's graphs, or A the ones B traced.) The configs do differ: the clip thresholds move the
+/// logits, so the test cannot pass by the two models computing the same thing.
+#[test]
+fn a_model_with_other_constants_is_served_graphs_of_its_own() {
+    let a = load_replica_rounded();
+    let (b, _dir) = load_replica_with_clips(0.4, 0.2);
+    let a_first = steps_with(&a, true);
+    let before_b = super::fused::served();
+    let b_compiled = steps_with(&b, true);
+    assert_every_region_served("the second model", &before_b);
+    let a_again = steps_with(&a, true);
+    let b_plain = steps_with(&b, false);
+    assert_same_logits("the second model, compiled", &b_plain.0, &b_compiled.0);
+    assert_same_logits(
+        "the second model, compiled, in blocks",
+        &b_plain.1,
+        &b_compiled.1,
+    );
+    assert_same_logits(
+        "the first model after the second ran",
+        &a_first.0,
+        &a_again.0,
+    );
+    assert!(
+        worst_difference(&a_first.0, &b_compiled.0) > 1e-3,
+        "the clip thresholds move nothing, so this test proves nothing"
+    );
 }
 
 /// A block's mask geometry is shared by the layer visits of a step (`ops::band_geometry`): a sliding

@@ -16,12 +16,12 @@ use mlx_rs::{Array, Dtype};
 
 use super::fused;
 use super::ops::{
-    attn_res_mix, banded_sink_attention, dynamic_conv, dynamic_conv_scale, l2_clip, mix_messages,
-    next_conv_state, owned, route_topk, scalar, softcap, softcapped_swiglu, static_conv,
-    static_conv_scale, unit_rms,
+    attn_res_mix, banded_sink_attention, dynamic_conv_scale, mix_messages, next_conv_state, owned,
+    route_topk, scalar, softcap, softcapped_swiglu, static_conv_scale, unit_rms,
 };
 use super::profile;
 use super::quant::{QuantMode, QuantTable};
+use super::regions::{self, ProjCfg};
 use super::text_config::{AttnDims, TextArgs};
 use crate::native_cache::NativeKvCache;
 use crate::native_embedding::quantized_embedding_lookup_with_mode;
@@ -284,27 +284,14 @@ impl AttnResQuery {
         })
     }
 
-    /// `fuse` is the layer's shared constants when the compiled mix may serve this call.
-    fn mix(
-        &self,
-        blocks: &[Array],
-        partial_n: &Array,
-        fuse: Option<&fused::SharedCfg>,
-    ) -> Result<Array> {
-        if let Some(cfg) = fuse
-            && partial_n.shape()[1] as usize <= fused::DECODE_ROWS
-        {
-            let mut args: Vec<&Array> = vec![partial_n, &self.query];
-            args.extend(blocks);
-            let cfg = fused::SharedCfg {
-                mix_scale: self.scale,
-                ..*cfg
-            };
-            if let Some(out) = fused::attn_res_mix(cfg, &args)? {
-                return Ok(out);
-            }
-        }
-        attn_res_mix(blocks, partial_n, &self.query, self.scale)
+    /// The mix of the depth sources, compiled when `fuse` (decode-sized, `fused.rs`).
+    fn mix(&self, blocks: &[Array], partial_n: &Array, fuse: bool) -> Result<Array> {
+        let run = if fuse {
+            fused::attn_res_mix
+        } else {
+            attn_res_mix
+        };
+        run(blocks, partial_n, &self.query, self.scale)
     }
 }
 
@@ -459,7 +446,7 @@ impl Attention {
 
     /// Projections, short convolutions and clips. `xk` and `xv` are the separate k and v inputs
     /// of a global layer or of a local layer in a later loop pass; `None` on a local layer that
-    /// feeds one input to the fused projection.
+    /// feeds one input to the fused projection. `fuse` runs the region after the matmuls compiled.
     fn project(
         &self,
         xq: &Array,
@@ -468,17 +455,9 @@ impl Attention {
         k_state: &Array,
         v_state: &Array,
         tau: Option<&Array>,
+        fuse: bool,
     ) -> Result<Projected> {
-        let (b, length) = (xq.shape()[0], xq.shape()[1]);
-        let AttnDims {
-            heads: nh,
-            kv_heads: nkv,
-            head_dim: hd,
-            ..
-        } = self.dims;
-        let (nh, nkv, hd) = (nh as i32, nkv as i32, hd as i32);
-        let dkv = self.dkv;
-        let (q, k, v, r, gate, sink, k_window, v_window) = match &self.proj {
+        let (out, gate, sink) = match &self.proj {
             AttnProj::Local {
                 in_proj,
                 k_conv,
@@ -525,18 +504,8 @@ impl Attention {
                     }
                     _ => bail!("a local layer takes either one input or all three"),
                 };
-                if let Some(done) = self.project_fused(
-                    fused::project_local,
-                    self.sconv_scale,
-                    &[&q, &k, &v, &r, k_state, v_state, k_conv, v_conv],
-                    tau,
-                    (&gate, &sink),
-                )? {
-                    return Ok(done);
-                }
-                let (k, k_window) = static_conv(&k, k_conv, k_state, self.sconv_scale)?;
-                let (v, v_window) = static_conv(&v, v_conv, v_state, self.sconv_scale)?;
-                (q, k, v, r, gate, sink, k_window, v_window)
+                let lead = [&q, &k, &v, &r, k_state, v_state, k_conv, v_conv];
+                (self.region(&lead, tau, fuse)?, gate, sink)
             }
             AttnProj::Global {
                 q_proj,
@@ -557,69 +526,15 @@ impl Attention {
                 let (q, r, gate, sink) = (next()?, next()?, next()?, next()?);
                 let kp = k_proj.apply(xk)?;
                 let vp = v_proj.apply(xv)?;
-                if let Some(done) = self.project_fused(
-                    fused::project_global,
-                    self.dconv_scale,
-                    &[&q, &r, &kp, &vp, k_state, v_state, k_static, v_static],
-                    tau,
-                    (&gate, &sink),
-                )? {
-                    return Ok(done);
-                }
-                let (k, k_window) = dynamic_conv(
-                    &kp.try_index((.., .., ..dkv))?,
-                    &kp.try_index((.., .., dkv..))?,
-                    k_static,
-                    k_state,
-                    nkv,
-                    self.dconv_scale,
-                )?;
-                let (v, v_window) = dynamic_conv(
-                    &vp.try_index((.., .., ..dkv))?,
-                    &vp.try_index((.., .., dkv..))?,
-                    v_static,
-                    v_state,
-                    nkv,
-                    self.dconv_scale,
-                )?;
-                (q, k, v, r, gate, sink, k_window, v_window)
+                let lead = [&q, &r, &kp, &vp, k_state, v_state, k_static, v_static];
+                (self.region(&lead, tau, fuse)?, gate, sink)
             }
         };
-        let one = scalar(1.0);
-        let q = l2_clip(
-            &mlx_rs::ops::reshape(&q, &[b, length, nh, hd])?,
-            &self.q_scale,
-            self.qk_clip,
-        )?;
-        let k = l2_clip(
-            &mlx_rs::ops::reshape(&k, &[b, length, nkv, hd])?,
-            &one,
-            self.qk_clip,
-        )?;
-        // The value norm has no gamma.
-        let v =
-            unit_rms(&mlx_rs::ops::reshape(&v, &[b, length, nkv, hd])?.as_dtype(Dtype::Float32)?)?
-                .as_dtype(xq.dtype())?;
-        let r = l2_clip(
-            &mlx_rs::ops::reshape(&r, &[b, length, nh, self.d_rel])?,
-            &self.r_scale,
-            self.rel_clip,
-        )?;
-        let (q, r) = match tau {
-            None => (q, r),
-            Some(tau) => {
-                let scaled = |a: &Array| -> Result<Array> {
-                    Ok(mlx_rs::ops::multiply(a.as_dtype(Dtype::Float32)?, tau)?
-                        .as_dtype(a.dtype())?)
-                };
-                (scaled(&q)?, scaled(&r)?)
-            }
-        };
-        let rel = mlx_rs::ops::matmul(&r, self.rel_proj.as_dtype(r.dtype())?)?;
+        let [q, k, v, rel, k_window, v_window] = out;
         Ok(Projected {
-            q: mlx_rs::ops::transpose_axes(&q, &[0, 2, 1, 3])?,
-            k: mlx_rs::ops::transpose_axes(&k, &[0, 2, 1, 3])?,
-            v: mlx_rs::ops::transpose_axes(&v, &[0, 2, 1, 3])?,
+            q,
+            k,
+            v,
             rel,
             gate,
             sink,
@@ -628,52 +543,34 @@ impl Attention {
         })
     }
 
-    /// The compiled projection region (`fused.rs`) for decode-sized inputs: `lead` are the pieces
-    /// the region starts from (q, k, v, r with their states and taps, or the global layer's), after
-    /// which come the layer's scales and relative projection and the position scaling. `None` when
-    /// the region does not serve this call (the plain ops do).
-    fn project_fused(
-        &self,
-        region: fn(fused::ProjCfg, &[&Array]) -> Result<Option<Vec<Array>>>,
-        conv_scale: f32,
-        lead: &[&Array],
-        tau: Option<&Array>,
-        (gate, sink): (&Array, &Array),
-    ) -> Result<Option<Projected>> {
-        if !fused::enabled() || lead[0].shape()[1] as usize > fused::DECODE_ROWS {
-            return Ok(None);
-        }
-        let cfg = fused::ProjCfg {
+    /// The projection region of this layer kind (`regions.rs`), compiled when `fuse` (`fused.rs`):
+    /// `lead` are the pieces it starts from (q, k, v, r with their states and taps, or the global
+    /// layer's), after which come the layer's scales and relative projection and the position scaling.
+    fn region(&self, lead: &[&Array], tau: Option<&Array>, fuse: bool) -> Result<[Array; 6]> {
+        let local = matches!(self.proj, AttnProj::Local { .. });
+        let cfg = ProjCfg {
             heads: self.dims.heads as i32,
             kv_heads: self.dims.kv_heads as i32,
             head_dim: self.dims.head_dim as i32,
             d_rel: self.d_rel,
-            dkv: self.dkv,
             qk_clip: self.qk_clip,
             rel_clip: self.rel_clip,
-            conv_scale,
+            conv_scale: if local {
+                self.sconv_scale
+            } else {
+                self.dconv_scale
+            },
         };
         let mut args: Vec<&Array> = lead.to_vec();
         args.extend([&self.q_scale, &self.r_scale, &self.rel_proj]);
         args.extend(tau);
-        let Some(out) = region(cfg, &args)? else {
-            return Ok(None);
+        let run: fn(&ProjCfg, &[&Array]) -> Result<[Array; 6]> = match (local, fuse) {
+            (true, true) => fused::project_local,
+            (true, false) => regions::project_local,
+            (false, true) => fused::project_global,
+            (false, false) => regions::project_global,
         };
-        let mut out = out.into_iter();
-        let mut next = || {
-            out.next()
-                .ok_or_else(|| anyhow!("the projection region returned too few arrays"))
-        };
-        Ok(Some(Projected {
-            q: next()?,
-            k: next()?,
-            v: next()?,
-            rel: next()?,
-            gate: gate.clone(),
-            sink: sink.clone(),
-            k_window: next()?,
-            v_window: next()?,
-        }))
+        run(&cfg, &args)
     }
 
     fn attend(&self, p: &Projected, kv: &mut NativeKvCache) -> Result<Array> {
@@ -796,7 +693,13 @@ impl Moe {
                 &[-1],
             )?,
         );
-        let act = softcapped_swiglu(&gate, &up, self.gate_cap, self.up_cap)?;
+        // Elementwise and compiled shapeless: every row count takes the compiled form.
+        let swiglu = if fused::enabled() {
+            fused::softcapped_swiglu
+        } else {
+            softcapped_swiglu
+        };
+        let act = swiglu(&gate, &up, self.gate_cap, self.up_cap)?;
         profile::mark("moe softcapped swiglu", &[&act])?;
         let mut z = self.w2.apply(&act, &idx, do_sort)?;
         if let Some(inverse) = inverse {
@@ -907,34 +810,25 @@ impl Layer {
         })
     }
 
-    /// The convolution of an attention or MLP output and the residual it joins, in float32: `h`
-    /// plus the output, or the output alone at a block boundary (`h` is `None`). Returns the
-    /// residual and the convolution's padded input window.
+    /// The convolution of an attention output and the residual it joins, in float32: `h` plus the
+    /// output, or the output alone at a block boundary (`h` is `None`). Returns the residual and the
+    /// convolution's padded input window.
     fn conv_residual(
         &self,
-        fuse: Option<&fused::SharedCfg>,
+        fuse: bool,
         x: &Array,
         w: &Array,
         state: &Array,
         h: Option<&Array>,
     ) -> Result<(Array, Array)> {
-        if let Some(cfg) = fuse {
-            let mut args: Vec<&Array> = vec![x, w, state];
-            args.extend(h);
-            if let Some(out) = fused::conv_residual(*cfg, &args)? {
-                let mut out = out.into_iter();
-                if let (Some(residual), Some(window)) = (out.next(), out.next()) {
-                    return Ok((residual, window));
-                }
-                bail!("the residual region returned too few arrays");
-            }
-        }
-        let (y, window) = static_conv(x, w, state, self.attn.sconv_scale)?;
-        let y = y.as_dtype(Dtype::Float32)?;
-        let residual = match h {
-            Some(h) => mlx_rs::ops::add(h.as_dtype(Dtype::Float32)?, y)?,
-            None => y,
+        let mut args: Vec<&Array> = vec![x, w, state];
+        args.extend(h);
+        let run = if fuse {
+            fused::conv_residual
+        } else {
+            regions::conv_residual
         };
+        let [residual, window] = run(self.attn.sconv_scale, &args)?;
         Ok((residual, window))
     }
 
@@ -942,25 +836,19 @@ impl Layer {
     /// output and the convolution's padded input window.
     fn conv_next(
         &self,
-        fuse: Option<&fused::SharedCfg>,
+        fuse: bool,
         m: &Array,
         w: &Array,
         state: &Array,
         residual: &Array,
         dtype: Dtype,
     ) -> Result<(Array, Array)> {
-        if let Some(cfg) = fuse
-            && m.dtype() == dtype
-            && let Some(out) = fused::conv_next(*cfg, &[m, w, state, residual])?
-        {
-            let mut out = out.into_iter();
-            if let (Some(next), Some(window)) = (out.next(), out.next()) {
-                return Ok((next, window));
-            }
-            bail!("the output region returned too few arrays");
-        }
-        let (y, window) = static_conv(m, w, state, self.attn.sconv_scale)?;
-        let next = mlx_rs::ops::add(residual, y.as_dtype(Dtype::Float32)?)?.as_dtype(dtype)?;
+        let run = if fuse {
+            fused::conv_next
+        } else {
+            regions::conv_next
+        };
+        let [next, window] = run(self.attn.sconv_scale, dtype, &[m, w, state, residual])?;
         Ok((next, window))
     }
 
@@ -978,21 +866,15 @@ impl Layer {
         let dtype = h.dtype();
         let (b, length, hidden) = (h.shape()[0], h.shape()[1], h.shape()[2]);
         let taps = args.sconv_kernel_size;
-        // The compiled regions (`fused.rs`) serve decode-sized inputs; this layer's constants.
-        let fuse = (fused::enabled() && length as usize <= fused::DECODE_ROWS).then_some(
-            fused::SharedCfg {
-                conv_scale: self.attn.sconv_scale,
-                mix_scale: self.mlp_input.scale,
-                round_loop_mix: cx.round_loop_mix,
-            },
-        );
+        // The compiled regions (`fused.rs`) serve decode-sized inputs.
+        let fuse = fused::serves(length as usize);
         let mix_msgs = |x: &Array, message: &Array, down: &Array, gain_forget: &Array| {
-            if let Some(cfg) = fuse
-                && let Some(out) = fused::mix_messages(cfg, &[x, message, down, gain_forget])?
-            {
-                return Ok(out);
-            }
-            mix_messages(x, message, down, gain_forget, cx.round_loop_mix)
+            let run = if fuse {
+                fused::mix_messages
+            } else {
+                mix_messages
+            };
+            run(x, message, down, gain_forget, cx.round_loop_mix)
         };
         let widths = [self.attn.dkv, self.attn.dkv, hidden, hidden];
         let mut states = Vec::with_capacity(4);
@@ -1004,9 +886,7 @@ impl Layer {
         }
         let tau = self.attn.log_tau(cache.kv.offset(), length as usize)?;
         let messages = match (bank, &self.loop_ctl) {
-            (Some(bk), Some(ctl)) => {
-                Some(ctl.message.mix(&bk.blocks, &bk.partial_n, fuse.as_ref())?)
-            }
+            (Some(bk), Some(ctl)) => Some(ctl.message.mix(&bk.blocks, &bk.partial_n, fuse)?),
             (Some(_), None) => bail!(
                 "layer {} got a message bank but is not in the loop core",
                 self.idx
@@ -1030,7 +910,7 @@ impl Layer {
                 .attn_input
                 .as_ref()
                 .ok_or_else(|| anyhow!("layer {} has no attn_input", self.idx))?
-                .mix(blocks, &h_n, fuse.as_ref())?;
+                .mix(blocks, &h_n, fuse)?;
             xq = mixed.try_index((.., .., 0))?;
             if self.sliding {
                 (xk, xv) = (xq.clone(), xq.clone());
@@ -1082,6 +962,7 @@ impl Layer {
             &states[0],
             &states[1],
             tau.as_ref(),
+            fuse,
         )?;
         profile::mark(
             "qkv projection + conv + clip",
@@ -1097,7 +978,7 @@ impl Layer {
         let a = self.attn.output(&out, &p.gate)?;
         profile::mark("attn gate + o_proj", &[&a])?;
         let (residual, attn_window) = self.conv_residual(
-            fuse.as_ref(),
+            fuse,
             &a,
             &self.attn_conv,
             &states[2],
@@ -1106,7 +987,7 @@ impl Layer {
         profile::mark("attn conv + residual", &[&residual, &attn_window])?;
         let mut y = self
             .mlp_input
-            .mix(blocks, &unit_rms(&residual)?, fuse.as_ref())?
+            .mix(blocks, &unit_rms(&residual)?, fuse)?
             .try_index((.., .., 0))?;
         profile::mark("mlp_input mix", &[&y])?;
         if let (Some(m), Some(ctl)) = (&messages, &self.loop_ctl) {
@@ -1121,14 +1002,8 @@ impl Layer {
             profile::mark("loop message mix (mlp)", &[&y])?;
         }
         let m = self.mlp.forward(&norm(&y, &self.mlp_norm)?)?;
-        let (next, mlp_window) = self.conv_next(
-            fuse.as_ref(),
-            &m,
-            &self.mlp_conv,
-            &states[3],
-            &residual,
-            dtype,
-        )?;
+        let (next, mlp_window) =
+            self.conv_next(fuse, &m, &self.mlp_conv, &states[3], &residual, dtype)?;
         profile::mark("mlp conv + residual", &[&next, &mlp_window])?;
 
         cache.conv = [
@@ -1773,7 +1648,7 @@ impl Inkling2Model {
         }
         let x = self
             .final_input
-            .mix(&blocks, &unit_rms(&h.as_dtype(Dtype::Float32)?)?, None)?
+            .mix(&blocks, &unit_rms(&h.as_dtype(Dtype::Float32)?)?, false)?
             .try_index((.., .., 0))?;
         let out =
             mlx_rs::fast::rms_norm(&x, &self.norm, self.args.rms_norm_eps)?.as_dtype(h.dtype())?;

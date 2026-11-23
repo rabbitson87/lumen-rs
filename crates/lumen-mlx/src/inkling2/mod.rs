@@ -34,6 +34,8 @@ mod pixels;
 #[cfg(feature = "mlx-native")]
 mod profile;
 mod quant;
+#[cfg(feature = "mlx-native")]
+mod regions;
 mod response;
 mod safetensors_header;
 #[cfg(all(test, feature = "mlx-native"))]

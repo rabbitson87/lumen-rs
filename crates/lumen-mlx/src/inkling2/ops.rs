@@ -13,7 +13,10 @@ use anyhow::{Result, ensure};
 use mlx_rs::ops::indexing::{TryIndexOp, take_along_axis, take_axis};
 use mlx_rs::{Array, Dtype};
 
-use super::fused;
+/// A pass of at most this many rows is a decode step (one token, or a block of drafted ones): the
+/// per-shape work (compiled regions, shared mask geometry, views over copies) is kept for it, and a
+/// long prompt's chunk lengths do not fill those caches.
+pub(super) const DECODE_ROWS: usize = 16;
 
 pub(super) fn scalar(v: f32) -> Array {
     Array::from_f32(v)
@@ -81,9 +84,6 @@ pub(super) fn l2_clip(x: &Array, scale: &Array, threshold: f32) -> Result<Array>
 /// `tanh(g / gcap) * gcap * sigmoid(g) * (tanh(u / ucap) * ucap)`, in float32, in `gate`'s dtype.
 /// The sigmoid reads the raw gate, the first factor the capped one.
 pub(super) fn softcapped_swiglu(gate: &Array, up: &Array, gcap: f32, ucap: f32) -> Result<Array> {
-    if fused::enabled() {
-        return fused::softcapped_swiglu(gate, up, &scalar(gcap), &scalar(ucap));
-    }
     let dtype = gate.dtype();
     let g = f32_of(gate)?;
     let u = f32_of(up)?;
@@ -110,7 +110,7 @@ pub(super) fn next_conv_state(window: &Array, taps: usize) -> Result<Array> {
     let keep = taps as i32 - 1;
     let state = window.try_index((.., (len - keep)..len, ..))?;
     // A decode-sized window is a few rows: the view pins nothing worth a copy kernel.
-    if fused::enabled() && (len - keep) as usize <= fused::DECODE_ROWS {
+    if (len - keep) as usize <= DECODE_ROWS {
         return Ok(state);
     }
     owned(&state)
@@ -507,7 +507,7 @@ fn masked_attention(
                 q_dtype: q.dtype(),
                 bias_dtype: rel.dtype(),
             },
-            nq <= super::fused::DECODE_ROWS as i32,
+            nq <= DECODE_ROWS as i32,
         )?;
         let neg = &geo.neg;
         let rel_q =
