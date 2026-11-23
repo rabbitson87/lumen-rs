@@ -50,13 +50,20 @@ const PREFILL_CHUNK: usize = 512;
 lumen_flags::flag! {
     /// Speculative decoding for Inkling 2: the checkpoint's bundled DSpark draft head
     /// (`mtp.safetensors`) proposes a block of tokens and the model checks the block in one pass,
-    /// for greedy requests (temperature 0). Off by default: it is on only where it measured faster
-    /// than the plain loop, and a pass over a block does not round exactly like single-token steps
-    /// in bfloat16, so a continuation can differ from the plain loop's where two tokens are near
-    /// ties (hence a behavior flag). The draft head's 0.6 GB load with the first request.
+    /// for greedy requests (temperature 0); sampled requests run the plain loop. The number of
+    /// drafts checked per block follows how often recent drafts agreed, so text the draft cannot
+    /// predict does not run slower than the plain loop.
+    ///
+    /// Measured on an M3 Max (Inkling 2 Mini, 150 tokens, greedy): 25 tokens/s plain against 26
+    /// to 53 across eight workloads (a poem 26, a translation 26, prose 29, JSON 31, code 32,
+    /// random words 35, reasoning 37, a list of primes 53), none slower. It costs 0.7 GiB for the
+    /// draft head, loaded with the first greedy request (about a second). A pass over a block does
+    /// not round exactly like single-token steps in bfloat16, so a continuation can differ from
+    /// the plain loop's where the two best tokens are within a bfloat16 step or two of each other
+    /// (about 1 position in 200 here); hence a behavior flag. `=0` runs the plain loop.
     pub(crate) inkling2_draft {
         env: "LUMEN_INKLING2_DRAFT",
-        default: false,
+        default: true,
         kind: Behavior,
     }
 }
@@ -612,6 +619,7 @@ impl Inkling2Backend {
                     .draft_depth
                     .unwrap_or(0)
                     .min(draft.args().drafts_per_block()),
+                adaptive: true,
             };
             run_speculative(
                 &plan,
@@ -891,6 +899,74 @@ struct SpecPlan<'a> {
     max_new_tokens: usize,
     /// Most drafts checked per block.
     depth: usize,
+    /// Let a [`DepthController`] pick the depth per block, up to `depth`; off, every block checks
+    /// `depth` drafts (the tests that pin the loop's bookkeeping).
+    adaptive: bool,
+}
+
+/// What a decode step and a block cost on an M3 Max (Inkling 2 Mini, measured with
+/// `examples/inkling2_spec.rs`): a plain step 41 ms; a block of `k` drafts costs the draft (9 ms),
+/// a pass over `k + 1` tokens (49 + 6.1 k ms). The controller only needs their ratios.
+const STEP_MS: f64 = 41.0;
+const BLOCK_BASE_MS: f64 = 58.0;
+const BLOCK_PER_DRAFT_MS: f64 = 6.1;
+/// A draft's chance of agreeing is estimated as a running mean with this weight on the newest block.
+const AGREE_RATE: f64 = 0.15;
+/// Before anything is observed a draft is assumed to agree this often (given the ones before it did).
+const AGREE_PRIOR: f64 = 0.6;
+/// When plain steps look best, a block of one draft is tried every this many steps to see whether
+/// the text became predictable again.
+const PROBE_EVERY: usize = 6;
+
+/// Picks how many drafts to check per block from how often recent drafts agreed, so text the draft
+/// cannot predict does not run slower than the plain loop: it keeps, for each position of the
+/// block, the chance that the draft agrees given the ones before it did, and takes the depth with
+/// the most tokens per millisecond (depth 0 is a plain step).
+struct DepthController {
+    agree: Vec<f64>,
+    plain_steps: usize,
+}
+
+impl DepthController {
+    fn new(max: usize) -> Self {
+        Self {
+            agree: vec![AGREE_PRIOR; max],
+            plain_steps: 0,
+        }
+    }
+
+    fn choose(&mut self) -> usize {
+        let (mut best, mut best_rate) = (0, 1.0 / STEP_MS);
+        let (mut reach, mut tokens) = (1.0, 1.0);
+        for (i, a) in self.agree.iter().enumerate() {
+            reach *= a;
+            tokens += reach;
+            let k = i + 1;
+            let rate = tokens / (BLOCK_BASE_MS + BLOCK_PER_DRAFT_MS * k as f64);
+            if rate > best_rate {
+                (best, best_rate) = (k, rate);
+            }
+        }
+        if best > 0 {
+            self.plain_steps = 0;
+            return best;
+        }
+        self.plain_steps += 1;
+        if self.plain_steps >= PROBE_EVERY && !self.agree.is_empty() {
+            self.plain_steps = 0;
+            return 1;
+        }
+        0
+    }
+
+    /// A block checked `k` drafts and the first `agreed` of them agreed: every draft up to the
+    /// first miss was a trial of its position.
+    fn observe(&mut self, k: usize, agreed: usize) {
+        for i in 0..k.min(agreed + 1) {
+            let hit = if i < agreed { 1.0 } else { 0.0 };
+            self.agree[i] += AGREE_RATE * (hit - self.agree[i]);
+        }
+    }
 }
 
 /// The greedy decode loop with a drafter: each cycle `propose` gives the block after the newest
@@ -915,6 +991,7 @@ fn run_speculative(
     propose: &mut dyn FnMut(u32, Option<&Array>, usize, usize) -> Result<Vec<u32>>,
 ) -> Result<()> {
     let mut pending: Option<Array> = None;
+    let mut controller = DepthController::new(plan.depth);
 
     // Whether a token ends the turn: the marker, a stop from the sink, or the limit.
     enum Flow {
@@ -937,7 +1014,12 @@ fn run_speculative(
     let mut flow = emit(anchor, generated)?;
     while matches!(flow, Flow::More) {
         let remaining = plan.max_new_tokens - generated.len();
-        let k = plan.depth.min(remaining.saturating_sub(1));
+        let want = if plan.adaptive {
+            controller.choose()
+        } else {
+            plan.depth
+        };
+        let k = want.min(remaining.saturating_sub(1));
 
         let drafted_at = std::time::Instant::now();
         let block = propose(anchor, pending.take().as_ref(), k, generated.len())?;
@@ -965,6 +1047,9 @@ fn run_speculative(
         stats.cycles += 1;
         stats.drafted += k;
         stats.accepted += agreed;
+        if plan.adaptive {
+            controller.observe(k, agreed);
+        }
 
         // Emit the model's own tokens in order, until one ends the turn.
         let mut kept = 0;
@@ -1134,6 +1219,52 @@ mod tests {
     }
 
     #[test]
+    fn the_depth_controller_checks_many_drafts_when_they_agree_and_none_when_they_do_not() {
+        // Untried, a draft is assumed to agree often enough to be worth a block.
+        let mut fresh = DepthController::new(7);
+        let first = fresh.choose();
+        assert!((2..=4).contains(&first), "{first}");
+
+        // Every block agreeing all the way: the deepest block.
+        let mut sure = DepthController::new(7);
+        for _ in 0..40 {
+            sure.observe(7, 7);
+        }
+        assert_eq!(sure.choose(), 7);
+
+        // Never agreeing: plain steps, with a block of one every PROBE_EVERY steps to look again.
+        let mut lost = DepthController::new(7);
+        for _ in 0..40 {
+            lost.observe(3, 0);
+        }
+        let picks: Vec<usize> = (0..2 * PROBE_EVERY).map(|_| lost.choose()).collect();
+        assert_eq!(picks.iter().filter(|&&k| k == 1).count(), 2, "{picks:?}");
+        assert!(picks.iter().all(|&k| k <= 1), "{picks:?}");
+        assert_eq!(picks[PROBE_EVERY - 1], 1, "{picks:?}");
+
+        // Text that becomes predictable again is noticed through the probes.
+        for _ in 0..30 {
+            lost.observe(1, 1);
+        }
+        assert!(lost.choose() >= 2);
+    }
+
+    #[test]
+    fn only_the_drafts_up_to_the_first_miss_count_as_trials() {
+        let mut c = DepthController::new(7);
+        let before = c.agree.clone();
+        // 7 checked, the first 2 agreed: positions 1 and 2 hit, position 3 missed, 4 to 7 untried.
+        c.observe(7, 2);
+        assert!(c.agree[0] > before[0] && c.agree[1] > before[1]);
+        assert!(c.agree[2] < before[2]);
+        assert_eq!(&c.agree[3..], &before[3..]);
+        // Nothing checked, nothing learned.
+        let mut d = DepthController::new(7);
+        d.observe(0, 0);
+        assert_eq!(d.agree, before);
+    }
+
+    #[test]
     fn flat_messages_become_turns() {
         let messages = vec![
             ("system".to_string(), "s".to_string()),
@@ -1252,8 +1383,7 @@ mod speculative_tests {
         }
     }
 
-    /// The speculative loop with a drafter that proposes `oracle[at..at + want]`, with the entry at
-    /// block position `wrong` (if any) replaced by a token that cannot be right.
+    /// [`run_spec_case_with`] with the depth fixed: what pins the loop's bookkeeping.
     #[allow(clippy::too_many_arguments)]
     fn run_spec_case(
         model: &Inkling2Model,
@@ -1266,6 +1396,26 @@ mod speculative_tests {
         wrong: Option<usize>,
         all_wrong: bool,
     ) -> Outcome {
+        run_spec_case_with(
+            model, eos, prompt, max_new, stop_after, depth, oracle, wrong, all_wrong, false,
+        )
+    }
+
+    /// The speculative loop with a drafter that proposes `oracle[at..at + want]`, with the entry at
+    /// block position `wrong` (if any) replaced by a token that cannot be right.
+    #[allow(clippy::too_many_arguments)]
+    fn run_spec_case_with(
+        model: &Inkling2Model,
+        eos: &[u32],
+        prompt: &[u32],
+        max_new: usize,
+        stop_after: Option<usize>,
+        depth: usize,
+        oracle: &[u32],
+        wrong: Option<usize>,
+        all_wrong: bool,
+        adaptive: bool,
+    ) -> Outcome {
         let (mut cache, mut ring, logits) = prefilled(model, prompt);
         let (mut seen, mut generated) = (prompt.to_vec(), Vec::new());
         let mut stats = SpecStats::default();
@@ -1276,6 +1426,7 @@ mod speculative_tests {
             eos,
             max_new_tokens: max_new,
             depth,
+            adaptive,
         };
         let mut calls = 0usize;
         let mut taken = 0usize;
@@ -1460,6 +1611,65 @@ mod speculative_tests {
             same(&format!("stop at 7, depth {depth}"), &got, &want);
             assert_eq!(got.generated.len(), 7);
         }
+    }
+
+    #[test]
+    fn an_adaptive_loop_stops_drafting_when_the_drafts_are_wrong_and_changes_nothing_else() {
+        let model = load_replica();
+        let prompt = prompt();
+        let free = run_plain_case(&model, &[], &prompt, 30, None);
+        let fixed = run_spec_case(
+            &model,
+            &[],
+            &prompt,
+            30,
+            None,
+            7,
+            &free.generated,
+            None,
+            true,
+        );
+        let adaptive = run_spec_case_with(
+            &model,
+            &[],
+            &prompt,
+            30,
+            None,
+            7,
+            &free.generated,
+            None,
+            true,
+            true,
+        );
+        same("adaptive, all wrong", &adaptive, &free);
+        assert_eq!(adaptive.stats.accepted, 0);
+        // The same tokens, with far fewer drafts put to the check: the controller went to plain steps.
+        assert!(
+            adaptive.stats.drafted * 2 < fixed.stats.drafted,
+            "{} drafts checked against {}",
+            adaptive.stats.drafted,
+            fixed.stats.drafted
+        );
+        // And when the drafts are right it keeps asking for a full block.
+        let right = run_spec_case_with(
+            &model,
+            &[],
+            &prompt,
+            30,
+            None,
+            7,
+            &free.generated,
+            None,
+            false,
+            true,
+        );
+        same("adaptive, right", &right, &free);
+        assert_eq!(right.stats.accepted, right.stats.drafted);
+        assert!(
+            right.stats.tokens_per_cycle() > 4.0,
+            "{}",
+            right.stats.tokens_per_cycle()
+        );
     }
 
     #[test]
@@ -1654,7 +1864,9 @@ mod real_checkpoint_tests {
         let stats = b.last_run();
         println!("second: {:?}\n{stats:?}", second.visible);
         assert_eq!(stats.images_encoded, 0, "the image was encoded again");
-        assert!(stats.reused_tokens > 100, "reused {}", stats.reused_tokens);
+        // At least the whole first prompt (46 tokens: the picture and the question), and the reply when
+        // it reads back as the model wrote it.
+        assert!(stats.reused_tokens >= 46, "reused {}", stats.reused_tokens);
         assert!(
             second.visible.to_lowercase().contains("square"),
             "{}",
@@ -1750,6 +1962,92 @@ mod real_checkpoint_tests {
         assert!(
             b.last_run().reused_tokens > 0,
             "the refused requests cost the client its retained conversation"
+        );
+    }
+
+    /// Speculative decoding keeps the model's own choices, but a pass over a block rounds a little
+    /// differently from single-token steps in bfloat16, so it can pick the other of two tokens the
+    /// plain loop barely preferred. This feeds the plain loop's own continuation back in blocks of 8
+    /// (what a verify pass does) and checks that wherever the block pass disagrees with the plain
+    /// choice, the two tokens were within bfloat16 noise of each other in that pass too.
+    #[test]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
+    fn a_batched_pass_disagrees_with_single_steps_only_at_near_ties() {
+        let mut b = backend();
+        b.set_draft_depth(None);
+        let ov = SamplingOverrides::default();
+        // The largest margin in units of the bfloat16 step at the top logit (a bf16 value is only exact to
+        // one step, and the two passes can each be a step off).
+        let mut worst = 0.0f32;
+        let mut disagreements = 0;
+        let mut compared = 0;
+        for (prompt, thinking) in [
+            (
+                "Write a Python function that returns the n-th Fibonacci number using memoization, with a short docstring.",
+                false,
+            ),
+            (
+                "Explain in three sentences how a hash map handles collisions.",
+                false,
+            ),
+            (
+                "A train leaves at 3:15 pm and travels 210 km at 70 km/h. Another leaves the same station at 4:00 pm at 90 km/h on the same track in the same direction. When does the second catch up?",
+                true,
+            ),
+        ] {
+            let ids = b
+                .build_prompt(
+                    &[ChatTurn::User(prompt)],
+                    &[],
+                    &ResolvedToolChoice::Auto,
+                    thinking,
+                    None,
+                )
+                .unwrap();
+            let plain = b.generate(&ids, 150, 0.0, 1.0, &ov).unwrap();
+            let vocab = b.model.args().vocab_size;
+            // The tokens the model is fed from the anchor on, and the plain choice after each.
+            let mut fed = vec![*ids.last().unwrap()];
+            fed.extend_from_slice(&plain[..plain.len() - 1]);
+            // Block sizes a verify pass can have: the loop checks 1 to 8 tokens at a time.
+            for size in [2usize, 3, 4, 6, 8] {
+                let mut cache = b.model.make_cache();
+                b.model.advance(&ids[..ids.len() - 1], &mut cache).unwrap();
+                for (n, block) in fed.chunks(size).enumerate() {
+                    let (logits, _) = b.model.verify(block, &mut cache, &[5]).unwrap();
+                    logits.eval().unwrap();
+                    let rows = logits.as_slice::<f32>().to_vec();
+                    for (j, row) in rows.chunks(vocab).enumerate() {
+                        let want = plain[n * size + j];
+                        let got = row
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, c| a.1.total_cmp(c.1))
+                            .map(|(i, _)| i as u32)
+                            .unwrap();
+                        compared += 1;
+                        if got != want {
+                            let margin = row[got as usize] - row[want as usize];
+                            eprintln!(
+                                "position {} of {:?}... in blocks of {size}: plain {want}, block pass {got}, the block pass prefers it by {margin:.3} (of a top logit {:.1})",
+                                n * size + j,
+                                &prompt[..20],
+                                row[got as usize]
+                            );
+                            disagreements += 1;
+                            let step = 2f32.powi(row[got as usize].abs().log2().floor() as i32 - 7);
+                            worst = worst.max(margin / step);
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{disagreements} of {compared} positions differ, the largest margin {worst:.2} bfloat16 steps"
+        );
+        assert!(
+            worst <= 3.0,
+            "a disagreement that is not a near tie: the block pass prefers the other token by {worst} bfloat16 steps"
         );
     }
 

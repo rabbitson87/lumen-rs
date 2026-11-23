@@ -4103,13 +4103,23 @@ fn inkling2_chat(
     }?;
     let s = b.last_run();
     eprintln!(
-        "[inkling2] prompt={} reused={} prefill={:.0}ms generated={} decode={:.0}ms ({:.1} tok/s)",
+        "[inkling2] prompt={} reused={} prefill={:.0}ms generated={} decode={:.0}ms ({:.1} tok/s){}",
         s.prompt_tokens,
         s.reused_tokens,
         s.prefill_ms,
         s.generated_tokens,
         s.decode_ms,
         s.generated_tokens as f64 / (s.decode_ms / 1e3).max(1e-9),
+        if s.spec.cycles > 0 {
+            format!(
+                " draft: {:.2} tokens per block, {}/{} drafts agreed",
+                s.spec.tokens_per_cycle(),
+                s.spec.accepted,
+                s.spec.drafted
+            )
+        } else {
+            String::new()
+        },
     );
     Ok(reply)
 }

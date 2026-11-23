@@ -23,7 +23,7 @@ value → on.
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
-| `LUMEN_INKLING2_DRAFT` | off | Behavior | `lumen_mlx::inkling2::backend::inkling2_draft` |
+| `LUMEN_INKLING2_DRAFT` | on | Behavior | `lumen_mlx::inkling2::backend::inkling2_draft` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
 | `LUMEN_MEMORY_PLAN_RECLAIMABLE` | on | Behavior | `lumen_mlx::qwen4_exp::runner::plan_reclaimable` |
@@ -217,14 +217,21 @@ Run quantized-KV prefill (queries of more than one token) through
 
 ### `LUMEN_INKLING2_DRAFT`
 
-*Behavior, default off.*
+*Behavior, default on.*
 
 Speculative decoding for Inkling 2: the checkpoint's bundled DSpark draft head
  (`mtp.safetensors`) proposes a block of tokens and the model checks the block in one pass,
- for greedy requests (temperature 0). Off by default: it is on only where it measured faster
- than the plain loop, and a pass over a block does not round exactly like single-token steps
- in bfloat16, so a continuation can differ from the plain loop's where two tokens are near
- ties (hence a behavior flag). The draft head's 0.6 GB load with the first request.
+ for greedy requests (temperature 0); sampled requests run the plain loop. The number of
+ drafts checked per block follows how often recent drafts agreed, so text the draft cannot
+ predict does not run slower than the plain loop.
+
+ Measured on an M3 Max (Inkling 2 Mini, 150 tokens, greedy): 25 tokens/s plain against 26
+ to 53 across eight workloads (a poem 26, a translation 26, prose 29, JSON 31, code 32,
+ random words 35, reasoning 37, a list of primes 53), none slower. It costs 0.7 GiB for the
+ draft head, loaded with the first greedy request (about a second). A pass over a block does
+ not round exactly like single-token steps in bfloat16, so a continuation can differ from
+ the plain loop's where the two best tokens are within a bfloat16 step or two of each other
+ (about 1 position in 200 here); hence a behavior flag. `=0` runs the plain loop.
 
 ### `LUMEN_JOINT_PREFILL`
 

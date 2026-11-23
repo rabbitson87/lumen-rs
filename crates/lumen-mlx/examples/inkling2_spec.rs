@@ -77,13 +77,25 @@ fn main() -> Result<()> {
     };
 
     // Warm-up: the draft head's load, the shader compiles.
+    let gib = |r: std::result::Result<usize, _>| -> f64 {
+        r.map_or(f64::NAN, |b: usize| b as f64 / 1_073_741_824.0)
+    };
+    let before = gib(lumen_mlx::metal_memory::get_active_memory());
+    let started = std::time::Instant::now();
+    run(&mut backend, "Say hello.", 0)?;
+    println!("plain warm-up {:.1}s", started.elapsed().as_secs_f64());
+    let plain_active = gib(lumen_mlx::metal_memory::get_active_memory());
     let started = std::time::Instant::now();
     run(
         &mut backend,
         "Say hello.",
         *depths.iter().max().unwrap_or(&0),
     )?;
-    println!("warm-up {:.1}s", started.elapsed().as_secs_f64());
+    println!(
+        "speculative warm-up {:.1}s (the draft head's first load included); active memory {before:.2} GiB at load, {plain_active:.2} after a plain run, {:.2} with the draft head loaded",
+        started.elapsed().as_secs_f64(),
+        gib(lumen_mlx::metal_memory::get_active_memory())
+    );
 
     for prompt in &prompts {
         println!("\n=== {prompt:?}");
@@ -106,7 +118,19 @@ fn main() -> Result<()> {
                                 .zip(text.chars())
                                 .take_while(|(a, b)| a == b)
                                 .count();
-                            format!("differs from plain at char {at} of {}", p.chars().count())
+                            let around = |x: &str| -> String {
+                                x.chars()
+                                    .skip(at.saturating_sub(8))
+                                    .take(36)
+                                    .collect::<String>()
+                                    .replace('\n', "\\n")
+                            };
+                            format!(
+                                "differs from plain at char {at} of {}: plain {:?} against {:?}",
+                                p.chars().count(),
+                                around(p),
+                                around(&text)
+                            )
                         }
                     }
                     None => "no plain run to compare".to_string(),
