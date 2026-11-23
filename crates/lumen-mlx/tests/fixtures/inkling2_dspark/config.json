@@ -1,0 +1,30 @@
+{
+ "mtp_config": {
+  "hidden_size": 64,
+  "num_hidden_layers": 3,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 16,
+  "intermediate_size": 48,
+  "max_position_embeddings": 4096,
+  "torch_dtype": "bfloat16",
+  "q_bias": false,
+  "o_bias": false,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 1000000.0,
+  "local_layer_ids": [
+   0,
+   2
+  ],
+  "sliding_window_size": 12,
+  "block_size": 8,
+  "markov_rank": 8,
+  "markov_head_type": "rnn_hidden",
+  "target_layer_ids": [
+   5,
+   23,
+   41,
+   48
+  ]
+ }
+}

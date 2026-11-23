@@ -16,7 +16,7 @@ use mlx_rs::{Array, Dtype};
 
 use super::ops::{
     attn_res_mix, banded_sink_attention, dynamic_conv, dynamic_conv_scale, l2_clip, mix_messages,
-    next_conv_state, route_topk, scalar, softcap, softcapped_swiglu, static_conv,
+    next_conv_state, owned, route_topk, scalar, softcap, softcapped_swiglu, static_conv,
     static_conv_scale, unit_rms,
 };
 use super::quant::{QuantMode, QuantTable};
@@ -758,6 +758,9 @@ struct Bank {
 struct Ctx<'a> {
     args: &'a TextArgs,
     round_loop_mix: bool,
+    /// Keep each visit's convolution windows, so a pass can later be rolled back to any of its
+    /// positions ([`Inkling2Cache::rollback`]).
+    keep_windows: bool,
 }
 
 impl Layer {
@@ -940,6 +943,11 @@ impl Layer {
             Some(next_conv_state(&attn_window, taps)?),
             Some(next_conv_state(&mlp_window, taps)?),
         ];
+        cache.windows = cx.keep_windows.then(|| ConvWindows {
+            arrays: [p.k_window, p.v_window, attn_window, mlp_window],
+            rows: length as usize,
+            keep: taps - 1,
+        });
         Ok(next)
     }
 }
@@ -952,6 +960,17 @@ struct VisitCache {
     /// The `taps - 1` rows before the next chunk: k, v, the attention output and the MLP output.
     /// `None` is zeros.
     conv: [Option<Array>; 4],
+    /// The last pass's whole convolution inputs, when it was asked to keep them.
+    windows: Option<ConvWindows>,
+}
+
+/// The padded inputs of a visit's four short convolutions for one pass of `rows` tokens: the
+/// `keep` rows of state before the pass, then the pass's own rows. The state after the first `n`
+/// of the pass's tokens is `keep` rows from row `n`.
+struct ConvWindows {
+    arrays: [Array; 4],
+    rows: usize,
+    keep: usize,
 }
 
 /// The convolution states of every layer visit at one point of a sequence ([`Inkling2Cache::conv_snapshot`]).
@@ -1071,6 +1090,41 @@ impl Inkling2Cache {
         for (visit, states) in self.visits.iter_mut().zip(&conv.0) {
             visit.kv.truncate_to(len)?;
             visit.conv = states.clone();
+            visit.windows = None;
+        }
+        Ok(())
+    }
+
+    /// Takes back the last `rejected` tokens of the last pass, which must have kept its windows
+    /// (`keep_windows`, as [`Inkling2Model::verify`] does): the KV caches drop them and each
+    /// convolution state becomes the one after the pass's first `rows - rejected` tokens, cut
+    /// from the windows. Leaves the caches as if only the kept tokens had been fed (the same
+    /// states, to rounding: the windows are the very values the pass computed).
+    pub fn rollback(&mut self, rejected: usize) -> Result<()> {
+        for visit in &mut self.visits {
+            let windows = visit
+                .windows
+                .take()
+                .context("the last pass did not keep its convolution windows")?;
+            ensure!(
+                rejected < windows.rows,
+                "rolling back {rejected} of a pass of {} tokens leaves nothing",
+                windows.rows
+            );
+            let kept = windows.rows - rejected;
+            let (from, to) = (kept as i32, (kept + windows.keep) as i32);
+            let mut states: [Option<Array>; 4] = [None, None, None, None];
+            for (slot, window) in windows.arrays.iter().enumerate() {
+                // A small copy, so the state does not pin the pass's windows.
+                states[slot] = Some(owned(&window.try_index((.., from..to, ..))?)?);
+            }
+            let len = visit.kv.offset();
+            ensure!(
+                len >= rejected,
+                "the cache holds {len} tokens, fewer than the {rejected} to take back"
+            );
+            visit.kv.truncate_to(len - rejected)?;
+            visit.conv = states;
         }
         Ok(())
     }
@@ -1090,6 +1144,18 @@ impl Inkling2Cache {
 }
 
 // ---- model -----------------------------------------------------------------------------------
+
+/// What one forward pass records besides the logits, and what it is given besides the ids.
+#[derive(Default)]
+struct Pass<'a> {
+    /// The stream entering every visit and the final-norm output (the parity tests).
+    capture: Option<&'a mut Vec<Array>>,
+    /// `(ids, slots)`: for each position `k` of `ids`, the stream entering visit `ids[k]` (the
+    /// final-norm output for `ids[k] == num_visits()`) goes to `slots[k]`.
+    taps: Option<(&'a [usize], &'a mut Vec<Option<Array>>)>,
+    images: Option<&'a ImageRows>,
+    keep_windows: bool,
+}
 
 pub struct Inkling2Model {
     args: TextArgs,
@@ -1189,6 +1255,7 @@ impl Inkling2Model {
                 .map(|_| VisitCache {
                     kv: NativeKvCache::new(),
                     conv: [None, None, None, None],
+                    windows: None,
                 })
                 .collect(),
         }
@@ -1206,8 +1273,105 @@ impl Inkling2Model {
         cache: &mut Inkling2Cache,
         images: Option<&ImageRows>,
     ) -> Result<()> {
-        self.hidden(ids, cache, None, images)?.eval()?;
+        self.hidden(
+            ids,
+            cache,
+            Pass {
+                images,
+                ..Pass::default()
+            },
+        )?
+        .eval()?;
         cache.eval_state()
+    }
+
+    /// [`Self::advance_with`] that also returns the stream at the `tap_ids` for each fed token,
+    /// `[1, L, tap_ids.len() * H]` (see [`Pass`] for what an id names), evaluated. The caches
+    /// are evaluated too.
+    pub fn advance_taps(
+        &self,
+        ids: &[u32],
+        cache: &mut Inkling2Cache,
+        tap_ids: &[usize],
+        images: Option<&ImageRows>,
+    ) -> Result<Array> {
+        let (hidden, taps) = self.run_tapped(ids, cache, tap_ids, images, false)?;
+        mlx_rs::transforms::eval([&hidden, &taps])?;
+        cache.eval_state()?;
+        Ok(taps)
+    }
+
+    /// The pass that checks a block of drafted tokens: logits `[1, L, vocab]` for every position
+    /// and the taps `[1, L, tap_ids.len() * H]`, with the convolution windows kept so
+    /// [`Inkling2Cache::rollback`] can take back the positions that were not accepted. The graph
+    /// is lazy.
+    pub fn verify(
+        &self,
+        ids: &[u32],
+        cache: &mut Inkling2Cache,
+        tap_ids: &[usize],
+    ) -> Result<(Array, Array)> {
+        let (hidden, taps) = self.run_tapped(ids, cache, tap_ids, None, true)?;
+        Ok((self.logits_from_hidden(&hidden)?, taps))
+    }
+
+    fn run_tapped(
+        &self,
+        ids: &[u32],
+        cache: &mut Inkling2Cache,
+        tap_ids: &[usize],
+        images: Option<&ImageRows>,
+        keep_windows: bool,
+    ) -> Result<(Array, Array)> {
+        ensure!(!tap_ids.is_empty(), "no tap ids");
+        let mut slots: Vec<Option<Array>> = vec![None; tap_ids.len()];
+        let hidden = self.hidden(
+            ids,
+            cache,
+            Pass {
+                taps: Some((tap_ids, &mut slots)),
+                images,
+                keep_windows,
+                ..Pass::default()
+            },
+        )?;
+        let mut rows = Vec::with_capacity(slots.len());
+        for (slot, id) in slots.into_iter().zip(tap_ids) {
+            rows.push(slot.with_context(|| {
+                format!(
+                    "tap id {id} names no layer visit (0..{}) or the final norm ({})",
+                    self.schedule.len(),
+                    self.schedule.len()
+                )
+            })?);
+        }
+        let taps = if rows.len() == 1 {
+            rows.remove(0)
+        } else {
+            let refs: Vec<&Array> = rows.iter().collect();
+            mlx_rs::ops::concatenate_axis(&refs, -1)?
+        };
+        Ok((hidden, taps))
+    }
+
+    /// The head's output for `hidden` before the softcap and the vocabulary mask: what the draft
+    /// head's logits are made of.
+    pub(super) fn head_logits_raw(&self, hidden: &Array) -> Result<Array> {
+        self.lm_head.apply(hidden)
+    }
+
+    /// Rows `start..end` of the LM head's weight, dequantized to float32, `[end - start, H]`.
+    pub(super) fn head_rows_f32(&self, start: i32, end: i32) -> Result<Array> {
+        let h = &self.lm_head;
+        let rows = |a: &Array| -> Result<Array> { Ok(a.try_index(start..end)?) };
+        Ok(mlx_rs::ops::dequantize(
+            &rows(&h.weight)?,
+            &rows(&h.scales)?,
+            &rows(&h.biases)?,
+            h.group_size,
+            h.bits,
+        )?
+        .as_dtype(Dtype::Float32)?)
     }
 
     /// The embedding of each of `ids` as the stack sees it, `[1, L, H]`: looked up and
@@ -1258,7 +1422,14 @@ impl Inkling2Model {
         last_only: bool,
         images: Option<&ImageRows>,
     ) -> Result<Array> {
-        let mut hidden = self.hidden(ids, cache, None, images)?;
+        let mut hidden = self.hidden(
+            ids,
+            cache,
+            Pass {
+                images,
+                ..Pass::default()
+            },
+        )?;
         if last_only {
             let len = hidden.shape()[1];
             hidden = hidden.try_index((.., (len - 1).., ..))?;
@@ -1274,7 +1445,14 @@ impl Inkling2Model {
         cache: &mut Inkling2Cache,
     ) -> Result<(Array, Vec<Array>)> {
         let mut captured = Vec::with_capacity(self.schedule.len() + 1);
-        let hidden = self.hidden(ids, cache, Some(&mut captured), None)?;
+        let hidden = self.hidden(
+            ids,
+            cache,
+            Pass {
+                capture: Some(&mut captured),
+                ..Pass::default()
+            },
+        )?;
         Ok((self.logits_from_hidden(&hidden)?, captured))
     }
 
@@ -1289,13 +1467,7 @@ impl Inkling2Model {
         }
     }
 
-    fn hidden(
-        &self,
-        ids: &[u32],
-        cache: &mut Inkling2Cache,
-        mut capture: Option<&mut Vec<Array>>,
-        images: Option<&ImageRows>,
-    ) -> Result<Array> {
+    fn hidden(&self, ids: &[u32], cache: &mut Inkling2Cache, mut rec: Pass<'_>) -> Result<Array> {
         ensure!(!ids.is_empty(), "no token ids");
         ensure!(
             cache.visits.len() == self.schedule.len(),
@@ -1304,12 +1476,13 @@ impl Inkling2Model {
             self.schedule.len()
         );
         let mut h = self.embed_tokens(ids)?;
-        if let Some(images) = images {
+        if let Some(images) = rec.images {
             h = images.splice(&h, cache.len())?;
         }
         let cx = Ctx {
             args: &self.args,
             round_loop_mix: self.options.round_loop_mix,
+            keep_windows: rec.keep_windows,
         };
         let core_start = self.args.loop_config.core_start;
         let mut blocks: Vec<Array> = Vec::new();
@@ -1332,8 +1505,15 @@ impl Inkling2Model {
                     }
                 }
             }
-            if let Some(captured) = capture.as_deref_mut() {
+            if let Some(captured) = rec.capture.as_deref_mut() {
                 captured.push(h.clone());
+            }
+            if let Some((tap_ids, slots)) = rec.taps.as_mut() {
+                for (k, id) in tap_ids.iter().enumerate() {
+                    if *id == visit {
+                        slots[k] = Some(h.clone());
+                    }
+                }
             }
             let active = if pass > 0 { bank.as_ref() } else { None };
             h = self.layers[idx]
@@ -1346,8 +1526,15 @@ impl Inkling2Model {
             .try_index((.., .., 0))?;
         let out =
             mlx_rs::fast::rms_norm(&x, &self.norm, self.args.rms_norm_eps)?.as_dtype(h.dtype())?;
-        if let Some(captured) = capture {
+        if let Some(captured) = rec.capture {
             captured.push(out.clone());
+        }
+        if let Some((tap_ids, slots)) = rec.taps.as_mut() {
+            for (k, id) in tap_ids.iter().enumerate() {
+                if *id == self.schedule.len() {
+                    slots[k] = Some(out.clone());
+                }
+            }
         }
         Ok(out)
     }

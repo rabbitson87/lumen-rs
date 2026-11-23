@@ -22,7 +22,7 @@ use super::model::{ImageRows, Inkling2Model, LoadOptions};
 use super::ops::mix_messages;
 
 /// The committed replica. A missing fixture fails the test: a skip here would read as a pass.
-fn fixture_dir() -> PathBuf {
+pub(super) fn fixture_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/inkling2_tiny");
     assert!(
         dir.join("config.json").is_file(),
@@ -37,7 +37,8 @@ fn reference(name: &str) -> HashMap<String, Array> {
 }
 
 pub(super) fn host_f32(a: &Array) -> Vec<f32> {
-    let a = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+    // Flattened first: a transposed view read as a slice would come out in storage order.
+    let a = mlx_rs::ops::reshape(a.as_dtype(mlx_rs::Dtype::Float32).unwrap(), &[-1]).unwrap();
     a.eval().unwrap();
     a.try_as_slice::<f32>().unwrap().to_vec()
 }
@@ -73,7 +74,7 @@ fn argmax_rows(logits: &[f32], width: usize) -> Vec<usize> {
         .collect()
 }
 
-fn load_replica() -> Inkling2Model {
+pub(super) fn load_replica() -> Inkling2Model {
     Inkling2Model::load(
         &fixture_dir(),
         LoadOptions {
@@ -362,4 +363,114 @@ fn image_rows_that_do_not_fit_the_pass_are_refused() {
             .forward_with(&marked, &mut model.make_cache(), true, Some(&rows))
             .is_ok()
     );
+}
+
+/// The draft head reads the stream entering visits 5, 23 and 41 and the final-norm output. They
+/// are the reference's own residual-stream tensors (the fixture keeps one per visit), side by
+/// side on the feature axis in the order of the ids.
+#[test]
+fn taps_are_the_stream_entering_the_chosen_visits() {
+    let model = load_replica();
+    let want = reference("outputs.safetensors");
+    let ids = prompt_ids(&want);
+    let hidden = model.args().hidden_size;
+    let tap_ids = [5usize, 23, 41, model.num_visits()];
+    let taps = model
+        .advance_taps(&ids, &mut model.make_cache(), &tap_ids, None)
+        .expect("taps");
+    assert_eq!(taps.shape(), &[1, ids.len() as i32, (4 * hidden) as i32]);
+    let got = host_f32(&taps);
+    for (k, &id) in tap_ids.iter().enumerate() {
+        let expected = host_f32(&want[&format!("visit_{id:02}")]);
+        let scale = expected.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let slice: Vec<f32> = got
+            .chunks(4 * hidden)
+            .flat_map(|row| row[k * hidden..(k + 1) * hidden].iter().copied())
+            .collect();
+        let (max_abs, _) = compare(&slice, &expected, hidden);
+        assert!(max_abs <= 1e-3 * scale, "tap {id}: {max_abs} of {scale}");
+    }
+    // An id that names nothing is refused, and so is no id at all.
+    let mut cache = model.make_cache();
+    assert!(model.advance_taps(&ids, &mut cache, &[999], None).is_err());
+    assert!(
+        model
+            .advance_taps(&ids, &mut model.make_cache(), &[], None)
+            .is_err()
+    );
+}
+
+/// A verify pass of 8 tokens rolled back to its first `kept` leaves the caches where a fresh
+/// prefill of just those tokens does: the next logits agree. `kept` of 8 is a no-op, 1 keeps only
+/// the anchor.
+#[test]
+fn a_rolled_back_verify_pass_leaves_the_caches_a_shorter_prefill_would() {
+    let model = load_replica();
+    let ids = prompt_ids(&reference("outputs.safetensors"));
+    let (start, block) = (30usize, 8usize);
+    for kept in [1usize, 3, 5, 8] {
+        let mut cache = model.make_cache();
+        model.advance(&ids[..start], &mut cache).unwrap();
+        let (logits, _) = model
+            .verify(&ids[start..start + block], &mut cache, &[5, 48])
+            .unwrap();
+        logits.eval().unwrap();
+        cache.rollback(block - kept).expect("rollback");
+        assert_eq!(cache.len(), start + kept);
+
+        let mut fresh = model.make_cache();
+        model.advance(&ids[..start + kept], &mut fresh).unwrap();
+        // What follows is the next tokens of the same prompt after the kept ones; they differ from
+        // the verified block's, which is the point: nothing of the rejected tokens may remain.
+        let next: Vec<u32> = ids[start + block..start + block + 4].to_vec();
+        let a = model.forward(&next, &mut cache, false).unwrap();
+        let b = model.forward(&next, &mut fresh, false).unwrap();
+        let vocab = model.args().unpadded_vocab_size;
+        let live = |x: &Array| -> Vec<f32> {
+            host_f32(x)
+                .chunks(model.args().vocab_size)
+                .flat_map(|r| r[..vocab].iter().copied())
+                .collect()
+        };
+        let (max_abs, min_cos) = compare(&live(&a), &live(&b), vocab);
+        eprintln!("kept {kept}: max |diff| {max_abs:.2e}, min cosine {min_cos:.7}");
+        // A pass of 8 tokens and a pass of `kept` differ by the routing and reduction noise of the
+        // replica (up to ~6e-4, as the chunking tests do); a wrong conv state or a KV row left
+        // behind moves the logits by 1 or more (checked with planted faults).
+        assert!(
+            max_abs < 3e-3 && min_cos > 0.999_99,
+            "kept {kept}: {max_abs}, {min_cos}"
+        );
+    }
+}
+
+#[test]
+fn a_rollback_needs_the_windows_a_verify_pass_keeps() {
+    let model = load_replica();
+    let ids = prompt_ids(&reference("outputs.safetensors"));
+    // A plain pass keeps none.
+    let mut cache = model.make_cache();
+    model.advance(&ids[..16], &mut cache).unwrap();
+    assert!(cache.rollback(1).is_err());
+    // A verify pass keeps them, and cannot give back the whole pass or more.
+    let mut cache = model.make_cache();
+    model
+        .verify(&ids[..8], &mut cache, &[5])
+        .unwrap()
+        .0
+        .eval()
+        .unwrap();
+    assert!(cache.rollback(8).is_err());
+    assert!(cache.rollback(9).is_err());
+    let mut cache = model.make_cache();
+    model
+        .verify(&ids[..8], &mut cache, &[5])
+        .unwrap()
+        .0
+        .eval()
+        .unwrap();
+    cache.rollback(7).unwrap();
+    assert_eq!(cache.len(), 1);
+    // The windows are used up by the rollback: a second one has none to read.
+    assert!(cache.rollback(1).is_err());
 }

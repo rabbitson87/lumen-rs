@@ -19,6 +19,10 @@
 mod backend;
 mod chat;
 mod config;
+#[cfg(feature = "mlx-native")]
+mod draft;
+#[cfg(all(test, feature = "mlx-native"))]
+mod draft_tests;
 mod manifest;
 #[cfg(feature = "mlx-native")]
 mod model;
@@ -43,6 +47,8 @@ pub use chat::{
     render_prompt_with_images,
 };
 pub use config::{Inkling2Config, LayerKind, LoopConfig, MtpConfig, TextConfig, VisionConfig};
+#[cfg(feature = "mlx-native")]
+pub use draft::{DRAFT_FILE, DraftArgs, DraftContext, DraftModel, DraftOut, TapRing};
 pub use manifest::{Entry, Manifest, Part, Placement, Role};
 #[cfg(feature = "mlx-native")]
 pub use model::{ConvSnapshot, ImageRows, Inkling2Cache, Inkling2Model, LoadOptions};
