@@ -21,7 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use lumen_core::sampling::{SamplingConfig, Xorshift64, sample_from_logits};
+use lumen_core::sampling::{
+    SamplingConfig, Xorshift64, sample_distribution, sample_from_logits, sampling_distribution,
+    speculative_accept,
+};
 use mlx_rs::Array;
 use mlx_rs::ops::indexing::TryIndexOp;
 
@@ -49,18 +52,21 @@ const PREFILL_CHUNK: usize = 512;
 
 lumen_flags::flag! {
     /// Speculative decoding for Inkling 2: the checkpoint's bundled DSpark draft head
-    /// (`mtp.safetensors`) proposes a block of tokens and the model checks the block in one pass,
-    /// for greedy requests (temperature 0); sampled requests run the plain loop. The number of
-    /// drafts checked per block follows how often recent drafts agreed, so text the draft cannot
-    /// predict does not run slower than the plain loop.
+    /// (`mtp.safetensors`) proposes a block of tokens and the model checks the block in one pass.
+    /// A greedy request keeps the tokens the model would have chosen itself; a sampled one accepts
+    /// each draft with the probability the request's own sampling gives it and draws the
+    /// replacement from what is left, which is exactly the distribution plain sampling draws from.
+    /// The number of drafts checked per block follows how often recent drafts agreed, so text the
+    /// draft cannot predict does not run slower than the plain loop.
     ///
-    /// Measured on an M3 Max (Inkling 2 Mini, 150 tokens, greedy): 25 tokens/s plain against 26
-    /// to 53 across eight workloads (a poem 26, a translation 26, prose 29, JSON 31, code 32,
-    /// random words 35, reasoning 37, a list of primes 53), none slower. It costs 0.7 GiB for the
-    /// draft head, loaded with the first greedy request (about a second). A pass over a block does
-    /// not round exactly like single-token steps in bfloat16, so a continuation can differ from
-    /// the plain loop's where the two best tokens are within a bfloat16 step or two of each other
-    /// (about 1 position in 200 here); hence a behavior flag. `=0` runs the plain loop.
+    /// Measured on an M3 Max (Inkling 2 Mini, 150 tokens): 25 tokens/s plain. Greedy, over eight
+    /// workloads: 26 (a poem, a translation), 29 (prose), 31 (JSON), 32 (code), 35 (random words),
+    /// 37 (reasoning), 53 (a list of primes), none slower. Sampled at the default temperature:
+    /// 25 (prose, a poem), 26 (code), 48 (a list of primes). It costs 0.7 GiB for the draft head,
+    /// loaded with the first request (about a second). A pass over a block does not round exactly
+    /// like single-token steps in bfloat16, so a greedy continuation can differ from the plain
+    /// loop's where the two best tokens are within a bfloat16 step or two of each other (about 1
+    /// position in 200 here); hence a behavior flag. `=0` runs the plain loop.
     pub(crate) inkling2_draft {
         env: "LUMEN_INKLING2_DRAFT",
         default: true,
@@ -556,8 +562,7 @@ impl Inkling2Backend {
             prompt.ids.len(),
             self.max_context
         );
-        let speculate =
-            sampling.is_none() && self.draft_depth.unwrap_or(0) > 0 && self.ensure_draft()?;
+        let speculate = self.draft_depth.unwrap_or(0) > 0 && self.ensure_draft()?;
         let began = std::time::Instant::now();
         // The features come first, before the retained conversation is taken: an image that turns
         // out unreadable is the client's error, and must not cost it the caches.
@@ -630,6 +635,8 @@ impl Inkling2Backend {
                 &logits,
                 on_token,
                 &mut spec,
+                sampling.as_ref(),
+                &mut rng,
                 &mut |anchor, rows, want, _| {
                     if want == 0 {
                         if let Some(rows) = rows {
@@ -854,6 +861,47 @@ impl Inkling2Backend {
     }
 }
 
+/// The tokens a block commits when the request samples: `rows` are the model's logits for the
+/// anchor and the `block` of drafts (`block.len() + 1` rows of `vocab`), `recent` the tokens fed
+/// before the anchor (with the anchor and the drafts accepted so far, what the penalties look at). Each draft is accepted with the
+/// probability the model's own sampling distribution gives it, and a rejected one is replaced by a
+/// draw from that distribution without it (Leviathan and Chen with a draft distribution that
+/// puts all its mass on the draft token, which is what an argmax draft is); after the last accepted
+/// draft the model's own distribution gives the next token. The tokens committed are distributed
+/// exactly as `block.len() + 1` steps of plain sampling would draw them. The last token is the
+/// model's own, so `committed.len() - 1` drafts were accepted.
+fn sampled_block(
+    rows: &[f32],
+    vocab: usize,
+    block: &[u32],
+    recent: &[u32],
+    anchor: u32,
+    cfg: &SamplingConfig,
+    rng: &mut Xorshift64,
+) -> Vec<u32> {
+    let mut history = Vec::with_capacity(recent.len() + 1 + block.len());
+    history.extend_from_slice(recent);
+    history.push(anchor);
+    let mut committed = Vec::with_capacity(block.len() + 1);
+    for i in 0..=block.len() {
+        let mut row = rows[i * vocab..(i + 1) * vocab].to_vec();
+        let p = sampling_distribution(&mut row, &history, cfg);
+        let Some(&draft) = block.get(i) else {
+            committed.push(sample_distribution(&p, rng));
+            break;
+        };
+        let mut q = vec![0.0f32; vocab];
+        q[draft as usize] = 1.0;
+        let verdict = speculative_accept(&p, &q, draft, rng);
+        committed.push(verdict.token);
+        if !verdict.accepted {
+            break;
+        }
+        history.push(draft);
+    }
+    committed
+}
+
 /// The plain decode loop: the next token from the logits, fed back, until the end-of-turn marker
 /// (fed too, so a reply read back continues from it), a stop from `on_token`, or the limit.
 #[allow(clippy::too_many_arguments)]
@@ -988,6 +1036,8 @@ fn run_speculative(
     first_logits: &Array,
     on_token: &mut dyn FnMut(u32) -> Result<bool>,
     stats: &mut SpecStats,
+    sampling: Option<&SamplingConfig>,
+    rng: &mut Xorshift64,
     propose: &mut dyn FnMut(u32, Option<&Array>, usize, usize) -> Result<Vec<u32>>,
 ) -> Result<()> {
     let mut pending: Option<Array> = None;
@@ -1010,7 +1060,7 @@ fn run_speculative(
         })
     };
 
-    let mut anchor = pick(first_logits, seen, None, &mut Xorshift64::new(0))?;
+    let mut anchor = pick(first_logits, seen, sampling, rng)?;
     let mut flow = emit(anchor, generated)?;
     while matches!(flow, Flow::More) {
         let remaining = plan.max_new_tokens - generated.len();
@@ -1035,15 +1085,37 @@ fn run_speculative(
         ids.push(anchor);
         ids.extend_from_slice(&block[..k]);
         let (logits, taps) = plan.model.verify(&ids, cache, plan.tap_ids)?;
-        let choice = mlx_rs::ops::indexing::argmax_axis(&logits, -1, false)?;
-        mlx_rs::transforms::eval([&choice, &taps])?;
-        let chosen: Vec<u32> = choice
-            .as_dtype(mlx_rs::Dtype::Uint32)?
-            .as_slice::<u32>()
-            .to_vec();
+        // `chosen` are the tokens this block commits, in order: the drafts that were accepted and
+        // then the model's own token (a correction after a rejected draft, or the next one).
+        let chosen: Vec<u32> = match sampling {
+            None => {
+                let choice = mlx_rs::ops::indexing::argmax_axis(&logits, -1, false)?;
+                mlx_rs::transforms::eval([&choice, &taps])?;
+                let all: Vec<u32> = choice
+                    .as_dtype(mlx_rs::Dtype::Uint32)?
+                    .as_slice::<u32>()
+                    .to_vec();
+                let agreed = (0..k).take_while(|&i| block[i] == all[i]).count();
+                all[..=agreed].to_vec()
+            }
+            Some(cfg) => {
+                let flat = mlx_rs::ops::reshape(&logits, &[-1])?;
+                mlx_rs::transforms::eval([&flat, &taps])?;
+                let vocab = plan.model.args().vocab_size;
+                sampled_block(
+                    flat.as_slice::<f32>(),
+                    vocab,
+                    &block[..k],
+                    seen,
+                    anchor,
+                    cfg,
+                    rng,
+                )
+            }
+        };
         stats.verify_ms += verified_at.elapsed().as_secs_f64() * 1e3;
 
-        let agreed = (0..k).take_while(|&i| block[i] == chosen[i]).count();
+        let agreed = chosen.len() - 1;
         stats.cycles += 1;
         stats.drafted += k;
         stats.accepted += agreed;
@@ -1053,7 +1125,7 @@ fn run_speculative(
 
         // Emit the model's own tokens in order, until one ends the turn.
         let mut kept = 0;
-        for &token in &chosen[..=agreed] {
+        for &token in &chosen {
             kept += 1;
             flow = emit(token, generated)?;
             if !matches!(flow, Flow::More) {
@@ -1264,6 +1336,190 @@ mod tests {
         assert_eq!(d.agree, before);
     }
 
+    fn cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 64,
+            repeat_penalty: 1.0,
+            repeat_penalty_last_n: 64,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
+            seed: 5,
+            dry: lumen_core::dry::dry_config_from_env(),
+        }
+    }
+
+    /// The sampled block rule against plain sampling on a small made-up model: the next token's
+    /// logits depend on the token before it (a fixed table), a drafter that is right some of the
+    /// time proposes blocks of two, and the first three tokens of many speculative runs have the
+    /// distribution the product of the plain steps gives.
+    #[test]
+    fn the_sampled_block_rule_draws_what_plain_sampling_draws() {
+        const V: usize = 5;
+        // Logits of the next token given the one before; a table with some structure and no ties.
+        let table: [[f32; V]; V] = [
+            [0.2, 1.4, -0.3, 0.9, 0.0],
+            [1.1, -0.5, 0.7, 0.3, 1.6],
+            [-0.2, 0.8, 1.3, -0.9, 0.5],
+            [0.6, 0.1, -0.4, 1.2, 0.9],
+            [1.0, 0.4, 0.2, -0.6, 0.8],
+        ];
+        // A drafter that disagrees with the model: its own table.
+        let draft_table: [[f32; V]; V] = [
+            [0.0, 0.5, 1.2, 0.1, 0.3],
+            [0.9, 0.2, 0.4, 1.5, 0.0],
+            [0.3, 1.1, 0.0, 0.2, 0.6],
+            [1.4, 0.0, 0.3, 0.8, 0.1],
+            [0.2, 0.7, 0.9, 0.0, 1.3],
+        ];
+        let argmax = |row: &[f32; V]| -> u32 {
+            row.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0 as u32
+        };
+        let c = SamplingConfig {
+            temperature: 0.9,
+            top_k: 0,
+            ..cfg()
+        };
+        let probs = |prev: usize| -> Vec<f32> {
+            let mut row = table[prev].to_vec();
+            sampling_distribution(&mut row, &[], &c)
+        };
+        let (start, steps, trials) = (2usize, 3usize, 120_000usize);
+        // What plain sampling gives: the product of the steps.
+        let mut expected = vec![0.0f64; V.pow(steps as u32)];
+        for a in 0..V {
+            for b in 0..V {
+                for d in 0..V {
+                    expected[(a * V + b) * V + d] = f64::from(probs(start)[a])
+                        * f64::from(probs(a)[b])
+                        * f64::from(probs(b)[d]);
+                }
+            }
+        }
+        let mut rng = Xorshift64::new(99);
+        let mut counts = vec![0usize; expected.len()];
+        for _ in 0..trials {
+            let mut tokens: Vec<u32> = Vec::new();
+            let mut prev = start;
+            while tokens.len() < steps {
+                // A block of two drafts from the drafter's own table.
+                let d1 = argmax(&draft_table[prev]);
+                let d2 = argmax(&draft_table[d1 as usize]);
+                let mut rows = Vec::new();
+                for p in [prev, d1 as usize, d2 as usize] {
+                    rows.extend_from_slice(&table[p]);
+                }
+                let committed = sampled_block(&rows, V, &[d1, d2], &[], prev as u32, &c, &mut rng);
+                for t in committed {
+                    if tokens.len() < steps {
+                        tokens.push(t);
+                    }
+                }
+                prev = *tokens.last().unwrap() as usize;
+            }
+            counts[(tokens[0] as usize * V + tokens[1] as usize) * V + tokens[2] as usize] += 1;
+        }
+        let tv: f64 = counts
+            .iter()
+            .zip(&expected)
+            .map(|(&n, &e)| (n as f64 / trials as f64 - e).abs())
+            .sum::<f64>()
+            / 2.0;
+        eprintln!("total variation from plain sampling over {steps} tokens: {tv:.4}");
+        assert!(
+            tv < 0.02,
+            "total variation {tv:.4} from plain sampling over {steps} tokens"
+        );
+        // The drafter really is wrong a good part of the time, so the rule was exercised.
+        let mut rejected = 0;
+        for _ in 0..2_000 {
+            let d1 = argmax(&draft_table[start]);
+            let mut rows = table[start].to_vec();
+            rows.extend_from_slice(&table[d1 as usize]);
+            let committed = sampled_block(&rows, V, &[d1], &[], start as u32, &c, &mut rng);
+            rejected += usize::from(committed.len() == 1);
+        }
+        assert!(
+            rejected > 300 && rejected < 1_900,
+            "{rejected} of 2000 rejected"
+        );
+    }
+
+    /// The anchor is in the penalty window of the first position and every accepted draft is in the
+    /// window of the next: a strong repeat penalty on a token must take its probability down there.
+    #[test]
+    fn the_penalty_window_holds_the_anchor_and_the_accepted_drafts() {
+        const V: usize = 6;
+        let c = SamplingConfig {
+            repeat_penalty: 8.0,
+            top_k: 0,
+            ..cfg()
+        };
+        let row: Vec<f32> = vec![0.5, 3.0, 2.8, 2.5, 0.1, 1.0];
+        let mut rows = row.clone();
+        rows.extend_from_slice(&row);
+        let plain = |recent: &[u32]| -> Vec<f32> {
+            let mut r = row.clone();
+            sampling_distribution(&mut r, recent, &c)
+        };
+        let mut rng = Xorshift64::new(17);
+        // Position 0 after anchor 1: token 1 is penalized there.
+        let (with, without) = (plain(&[1]), plain(&[]));
+        assert!(
+            with[1] < without[1] - 0.2,
+            "the penalty does not bite: {} against {}",
+            with[1],
+            without[1]
+        );
+        let n = 30_000;
+        let hits = (0..n)
+            .filter(|_| sampled_block(&rows, V, &[], &[], 1, &c, &mut rng)[0] == 1)
+            .count();
+        assert!(
+            (hits as f32 / n as f32 - with[1]).abs() < 0.02,
+            "{hits} of {n} against {}",
+            with[1]
+        );
+        // Position 1 after the anchor 1 and the accepted draft 3: both are penalized there.
+        let after = plain(&[1, 3]);
+        let (mut second, mut seconds) = (0usize, 0usize);
+        for _ in 0..40_000 {
+            let committed = sampled_block(&rows, V, &[3], &[], 1, &c, &mut rng);
+            if committed.len() == 2 {
+                seconds += 1;
+                second += usize::from(committed[1] == 3);
+            }
+        }
+        assert!(seconds > 1_000, "{seconds}");
+        assert!(
+            (second as f32 / seconds as f32 - after[3]).abs() < 0.03,
+            "{second} of {seconds} against {}",
+            after[3]
+        );
+    }
+
+    #[test]
+    fn a_draft_the_sampling_pipeline_forbids_is_never_accepted() {
+        const V: usize = 8;
+        let c = SamplingConfig { top_k: 2, ..cfg() };
+        // Token 0 is far below the top two, so top-k leaves it no mass.
+        let row: Vec<f32> = vec![-9.0, 5.0, 4.0, 1.0, 0.0, 0.5, 0.2, 0.1];
+        let mut rows = row.clone();
+        rows.extend_from_slice(&row);
+        let mut rng = Xorshift64::new(3);
+        for _ in 0..500 {
+            let committed = sampled_block(&rows, V, &[0], &[], 1, &c, &mut rng);
+            assert_eq!(committed.len(), 1, "a forbidden draft was accepted");
+            assert!(committed[0] == 1 || committed[0] == 2, "{committed:?}");
+        }
+    }
+
     #[test]
     fn flat_messages_become_turns() {
         let messages = vec![
@@ -1397,7 +1653,7 @@ mod speculative_tests {
         all_wrong: bool,
     ) -> Outcome {
         run_spec_case_with(
-            model, eos, prompt, max_new, stop_after, depth, oracle, wrong, all_wrong, false,
+            model, eos, prompt, max_new, stop_after, depth, oracle, wrong, all_wrong, false, None,
         )
     }
 
@@ -1415,6 +1671,7 @@ mod speculative_tests {
         wrong: Option<usize>,
         all_wrong: bool,
         adaptive: bool,
+        sampling: Option<&SamplingConfig>,
     ) -> Outcome {
         let (mut cache, mut ring, logits) = prefilled(model, prompt);
         let (mut seen, mut generated) = (prompt.to_vec(), Vec::new());
@@ -1442,6 +1699,8 @@ mod speculative_tests {
                 Ok(stop_after == Some(calls))
             },
             &mut stats,
+            sampling,
+            &mut Xorshift64::new(11),
             &mut |_anchor, rows, want, at| {
                 if let Some(rows) = rows {
                     taken += rows.shape()[1] as usize;
@@ -1640,6 +1899,7 @@ mod speculative_tests {
             None,
             true,
             true,
+            None,
         );
         same("adaptive, all wrong", &adaptive, &free);
         assert_eq!(adaptive.stats.accepted, 0);
@@ -1662,6 +1922,7 @@ mod speculative_tests {
             None,
             false,
             true,
+            None,
         );
         same("adaptive, right", &right, &free);
         assert_eq!(right.stats.accepted, right.stats.drafted);
@@ -1670,6 +1931,108 @@ mod speculative_tests {
             "{}",
             right.stats.tokens_per_cycle()
         );
+    }
+
+    fn cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 64,
+            repeat_penalty: 1.0,
+            repeat_penalty_last_n: 64,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
+            seed: 5,
+            dry: lumen_core::dry::dry_config_from_env(),
+        }
+    }
+
+    /// A sampled request on the tiny replica: the bookkeeping is the plain loop's whatever the
+    /// drafter says and whatever the draws are, and one seed gives one reply.
+    #[test]
+    fn a_sampled_speculative_loop_keeps_the_books_and_is_reproducible() {
+        let model = load_replica();
+        let prompt = prompt();
+        let free = run_plain_case(&model, &[], &prompt, 30, None);
+        // Nearly greedy, so that the sampled continuation follows the plain one the oracle proposes
+        // and its drafts are accepted a fair share of the time; the draws still go through the
+        // sampled rule.
+        let c = SamplingConfig {
+            temperature: 0.02,
+            top_k: 8,
+            ..cfg()
+        };
+        for wrong in [None, Some(1usize)] {
+            let a = run_spec_case_with(
+                &model,
+                &[],
+                &prompt,
+                30,
+                None,
+                7,
+                &free.generated,
+                wrong,
+                false,
+                false,
+                Some(&c),
+            );
+            assert_eq!(a.generated.len(), 30);
+            assert_eq!(
+                a.cache_len,
+                prompt.len() + 29,
+                "every token but the last is fed"
+            );
+            assert_eq!(a.ring_end, a.cache_len);
+            assert_eq!(a.seen.len(), a.cache_len);
+            assert_eq!(&a.seen[prompt.len()..], &a.generated[..29]);
+            assert!(
+                a.generated.iter().all(|&t| t < 250),
+                "a token past the live vocabulary"
+            );
+            let b = run_spec_case_with(
+                &model,
+                &[],
+                &prompt,
+                30,
+                None,
+                7,
+                &free.generated,
+                wrong,
+                false,
+                false,
+                Some(&c),
+            );
+            assert_eq!(a.generated, b.generated, "the same seed, the same reply");
+            assert!(
+                a.stats.accepted > 0 && a.stats.accepted < a.stats.drafted,
+                "{:?}",
+                a.stats
+            );
+        }
+        // The marker and a stop end the turn as they do when drafts are checked by argmax.
+        let eos = [free.generated[3]];
+        let sampled = run_spec_case_with(
+            &model,
+            &eos,
+            &prompt,
+            30,
+            None,
+            7,
+            &free.generated,
+            None,
+            false,
+            false,
+            Some(&c),
+        );
+        if let Some(at) = sampled.generated.iter().position(|t| *t == eos[0]) {
+            assert_eq!(sampled.generated.len(), at + 1, "nothing after the marker");
+            assert_eq!(
+                sampled.cache_len,
+                prompt.len() + at + 1,
+                "the marker is fed"
+            );
+        }
     }
 
     #[test]
@@ -2049,6 +2412,50 @@ mod real_checkpoint_tests {
             worst <= 3.0,
             "a disagreement that is not a near tie: the block pass prefers the other token by {worst} bfloat16 steps"
         );
+    }
+
+    /// A sampled request is drafted too, the draws stay reproducible per seed, and the answer to a
+    /// question with one right answer is right whatever the draws.
+    #[test]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
+    fn a_sampled_request_is_drafted_and_reproducible() {
+        let mut b = backend();
+        b.set_draft_depth(Some(7));
+        let ov = SamplingOverrides {
+            seed: Some(21),
+            ..Default::default()
+        };
+        let turns = [ChatTurn::User(
+            "List the first 20 prime numbers, separated by commas.",
+        )];
+        let ask = |b: &mut Inkling2Backend| {
+            b.clear_retained();
+            let reply = b
+                .chat(
+                    &turns,
+                    &[],
+                    &[],
+                    &ResolvedToolChoice::Auto,
+                    300,
+                    0.7,
+                    1.0,
+                    false,
+                    &ov,
+                    &mut |_| Ok(()),
+                )
+                .expect("chat");
+            (reply.visible, b.last_run())
+        };
+        let (first, stats) = ask(&mut b);
+        println!("{first:?}\n{stats:?}");
+        assert!(
+            first.contains("2, 3, 5, 7, 11, 13, 17, 19, 23, 29"),
+            "{first}"
+        );
+        assert!(stats.spec.cycles > 0, "the request was not drafted");
+        assert!(stats.spec.accepted > 0, "no draft was ever accepted");
+        let (again, _) = ask(&mut b);
+        assert_eq!(first, again, "the same seed, the same reply");
     }
 
     #[test]

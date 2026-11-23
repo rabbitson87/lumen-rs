@@ -4,10 +4,12 @@
 //!
 //! ```text
 //! cargo run --release -p lumen-mlx --features mlx-native --example inkling2_spec -- \
-//!     <model_dir> [--depths 0,7,3] [--max N] [--think] [--repeat R] "<prompt 1>" "<prompt 2>" ...
+//!     <model_dir> [--depths 0,7,3] [--max N] [--temp T] [--think] [--repeat R] "<prompt 1>" ...
 //! ```
 //!
-//! Depth 0 is the plain loop. Every depth runs from cold caches (the retained conversation is
+//! Depth 0 is the plain loop. With `--temp` above 0 the requests are sampled (0.7 is the server's
+//! default, which the model reads as 1), the replies cannot be compared with the plain loop's and
+//! the tokens per block and the speed are what is reported. Every depth runs from cold caches (the retained conversation is
 //! cleared between runs), the replies are compared with the plain loop's, and a depth is
 //! reported once per prompt (the first run of a process also pays the draft head's load and the
 //! shader compiles, so a warm-up run goes first and is not reported).
@@ -36,6 +38,7 @@ fn main() -> Result<()> {
         .collect();
     let max_new: usize = value("--max").and_then(|s| s.parse().ok()).unwrap_or(200);
     let repeat: usize = value("--repeat").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let temperature: f32 = value("--temp").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let think = if let Some(at) = args.iter().position(|a| a == "--think") {
         args.remove(at);
         true
@@ -64,7 +67,7 @@ fn main() -> Result<()> {
             &[],
             &ResolvedToolChoice::Auto,
             max_new,
-            0.0,
+            temperature,
             1.0,
             think,
             &ov,
@@ -104,36 +107,40 @@ fn main() -> Result<()> {
             for &depth in &depths {
                 let (text, s) = run(&mut backend, prompt, depth)?;
                 let tps = s.generated_tokens as f64 / (s.decode_ms / 1e3).max(1e-9);
-                let same = match &plain {
-                    None if depth == 0 => {
-                        plain = Some(text.clone());
-                        "plain".to_string()
-                    }
-                    Some(p) => {
-                        if *p == text {
-                            "same as plain".to_string()
-                        } else {
-                            let at = p
-                                .chars()
-                                .zip(text.chars())
-                                .take_while(|(a, b)| a == b)
-                                .count();
-                            let around = |x: &str| -> String {
-                                x.chars()
-                                    .skip(at.saturating_sub(8))
-                                    .take(36)
-                                    .collect::<String>()
-                                    .replace('\n', "\\n")
-                            };
-                            format!(
-                                "differs from plain at char {at} of {}: plain {:?} against {:?}",
-                                p.chars().count(),
-                                around(p),
-                                around(&text)
-                            )
+                let same = if temperature > 0.0 {
+                    "sampled".to_string()
+                } else {
+                    match &plain {
+                        None if depth == 0 => {
+                            plain = Some(text.clone());
+                            "plain".to_string()
                         }
+                        Some(p) => {
+                            if *p == text {
+                                "same as plain".to_string()
+                            } else {
+                                let at = p
+                                    .chars()
+                                    .zip(text.chars())
+                                    .take_while(|(a, b)| a == b)
+                                    .count();
+                                let around = |x: &str| -> String {
+                                    x.chars()
+                                        .skip(at.saturating_sub(8))
+                                        .take(36)
+                                        .collect::<String>()
+                                        .replace('\n', "\\n")
+                                };
+                                format!(
+                                    "differs from plain at char {at} of {}: plain {:?} against {:?}",
+                                    p.chars().count(),
+                                    around(p),
+                                    around(&text)
+                                )
+                            }
+                        }
+                        None => "no plain run to compare".to_string(),
                     }
-                    None => "no plain run to compare".to_string(),
                 };
                 let sp = s.spec;
                 if sp.cycles > 0 {
