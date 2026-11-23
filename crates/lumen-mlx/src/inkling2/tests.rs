@@ -510,14 +510,25 @@ fn a_bad_tap_or_token_id_is_refused_before_anything_runs() {
     assert_eq!(cache.len(), 0);
 }
 
-/// The compiled regions (`fused.rs`) run the plain ops' arithmetic in the same order and dtypes:
-/// the same prefill, single-token steps and verify block with them on and off give the same
-/// logits (they came out bit-identical; the bound allows float noise on another GPU).
+/// The compiled regions (`fused.rs`) run the plain ops' arithmetic in the same order and dtypes.
+/// Token by token (every pass a single row, the same kernels both ways) the logits come out bit
+/// for bit; over a prefill and a verify block the loop controllers' projections run row by row in
+/// the compiled region (the kernel a single-token step runs) and as one matrix product in the plain
+/// ops, so the sums are in another order and the logits agree to float noise.
 #[test]
 fn the_compiled_regions_give_the_logits_the_plain_ops_give() {
     let model = load_replica();
     let ids = prompt_ids(&reference("outputs.safetensors"));
-    let run = |fused_on: bool| -> Vec<Vec<f32>> {
+    let by_token = |fused_on: bool| -> Vec<Vec<f32>> {
+        super::fused::fuse::with(fused_on, || {
+            let mut cache = model.make_cache();
+            ids[..10]
+                .iter()
+                .map(|&t| host_f32(&model.forward(&[t], &mut cache, true).unwrap()))
+                .collect()
+        })
+    };
+    let in_blocks = |fused_on: bool| -> Vec<Vec<f32>> {
         super::fused::fuse::with(fused_on, || {
             let mut cache = model.make_cache();
             let mut out = vec![host_f32(
@@ -531,25 +542,29 @@ fn the_compiled_regions_give_the_logits_the_plain_ops_give() {
             out
         })
     };
-    let (plain, fused) = (run(false), run(true));
-    assert_eq!(plain.len(), fused.len());
-    for (step, (p, f)) in plain.iter().zip(&fused).enumerate() {
-        assert_eq!(p.len(), f.len());
-        let (mut worst, mut scale) = (0.0f32, 0.0f32);
-        for (a, b) in p.iter().zip(f) {
-            assert_eq!(
-                a.is_finite(),
-                b.is_finite(),
-                "step {step}: a masked id differs"
-            );
-            if a.is_finite() {
-                worst = worst.max((a - b).abs());
-                scale = scale.max(a.abs());
+    for (label, bound, plain, fused) in [
+        ("token by token", 1e-6, by_token(false), by_token(true)),
+        ("in blocks", 1e-4, in_blocks(false), in_blocks(true)),
+    ] {
+        assert_eq!(plain.len(), fused.len());
+        for (step, (p, f)) in plain.iter().zip(&fused).enumerate() {
+            assert_eq!(p.len(), f.len());
+            let (mut worst, mut scale) = (0.0f32, 0.0f32);
+            for (a, b) in p.iter().zip(f) {
+                assert_eq!(
+                    a.is_finite(),
+                    b.is_finite(),
+                    "{label}, step {step}: a masked id differs"
+                );
+                if a.is_finite() {
+                    worst = worst.max((a - b).abs());
+                    scale = scale.max(a.abs());
+                }
             }
+            assert!(
+                worst <= bound * scale.max(1.0),
+                "{label}, step {step}: the compiled regions differ from the plain ops by {worst} of {scale}"
+            );
         }
-        assert!(
-            worst <= 1e-6 * scale.max(1.0),
-            "step {step}: the compiled regions differ from the plain ops by {worst} of {scale}"
-        );
     }
 }

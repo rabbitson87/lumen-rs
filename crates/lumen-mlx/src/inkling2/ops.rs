@@ -37,8 +37,25 @@ pub(super) fn dynamic_conv_scale(taps: usize) -> f32 {
 /// config's `rms_norm_eps`.
 pub(super) fn unit_rms(x: &Array) -> Result<Array> {
     let width = *x.shape().last().expect("rank >= 1");
-    let ones = mlx_rs::ops::ones::<f32>(&[width])?;
-    Ok(mlx_rs::fast::rms_norm(x, &ones, 1e-6)?)
+    Ok(mlx_rs::fast::rms_norm(x, &unit_weight(width)?, 1e-6)?)
+}
+
+thread_local! {
+    /// The all-ones weight of [`unit_rms`] by width: made once, not as a fill kernel per call.
+    static UNIT_WEIGHTS: std::cell::RefCell<std::collections::HashMap<i32, Array>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn unit_weight(width: i32) -> Result<Array> {
+    UNIT_WEIGHTS.with(|cache| {
+        if let Some(ones) = cache.borrow().get(&width) {
+            return Ok(ones.clone());
+        }
+        let ones = mlx_rs::ops::ones::<f32>(&[width])?;
+        ones.eval()?;
+        cache.borrow_mut().insert(width, ones.clone());
+        Ok(ones)
+    })
 }
 
 /// `_softcap`: `tanh(x / cap) * cap`.
@@ -206,6 +223,43 @@ pub(super) fn mix_messages(
     gain_forget: &Array,
     round_bf16: bool,
 ) -> Result<Array> {
+    mix_messages_with(x, message, down, gain_forget, round_bf16, false)
+}
+
+/// [`mix_messages`] with the two projections run one row at a time: each is the matrix-vector
+/// product a one-token step runs, so a block of rows gets from every row what a single step gets
+/// (the matrix kernel a multi-row product takes is slower here and rounds differently). For
+/// decode-sized inputs; the batched form stays for prefill, where the rows are many.
+pub(super) fn mix_messages_by_row(
+    x: &Array,
+    message: &Array,
+    down: &Array,
+    gain_forget: &Array,
+    round_bf16: bool,
+) -> Result<Array> {
+    mix_messages_with(x, message, down, gain_forget, round_bf16, true)
+}
+
+fn mix_messages_with(
+    x: &Array,
+    message: &Array,
+    down: &Array,
+    gain_forget: &Array,
+    round_bf16: bool,
+    by_row: bool,
+) -> Result<Array> {
+    // `a @ w` with the rows of `a` (axis 1) taken together, or one at a time.
+    let project = |a: &Array, w: &Array| -> Result<Array> {
+        let rows = a.shape()[1];
+        if !by_row || rows == 1 {
+            return Ok(mlx_rs::ops::matmul(a, w)?);
+        }
+        let parts = (0..rows)
+            .map(|r| Ok(mlx_rs::ops::matmul(a.try_index((.., r..r + 1, ..))?, w)?))
+            .collect::<Result<Vec<Array>>>()?;
+        let refs: Vec<&Array> = parts.iter().collect();
+        Ok(mlx_rs::ops::concatenate_axis(&refs, 1)?)
+    };
     let (n, b, length, hidden) = {
         let s = x.shape();
         (s[0], s[1], s[2], s[3])
@@ -224,12 +278,9 @@ pub(super) fn mix_messages(
     // One batched matmul over the halves: a single [rows, 2H] x [2H, r] product gets a row-count
     // dependent kernel, so prefill chunking would change the result.
     let down = mlx_rs::ops::reshape(down, &[2 * n, hidden, rank])?;
-    let low = mlx_rs::ops::reshape(mlx_rs::ops::matmul(&z, &down)?, &[n, 2, rows, rank])?;
+    let low = mlx_rs::ops::reshape(project(&z, &down)?, &[n, 2, rows, rank])?;
     let low = through_bf16(mlx_rs::ops::sum_axis(&low, 1, false)?)?;
-    let gates = mlx_rs::ops::reshape(
-        mlx_rs::ops::matmul(&low, gain_forget)?,
-        &[n, b, length, 2 * hidden],
-    )?;
+    let gates = mlx_rs::ops::reshape(project(&low, gain_forget)?, &[n, b, length, 2 * hidden])?;
     let gain = mlx_rs::ops::tanh(gates.try_index((.., .., .., ..hidden))?)?;
     let forget = mlx_rs::ops::tanh(gates.try_index((.., .., .., hidden..))?)?;
     let kept = mlx_rs::ops::multiply(mlx_rs::ops::subtract(scalar(1.0), &forget)?, x)?;

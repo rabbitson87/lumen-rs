@@ -2653,6 +2653,19 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "inkling2-mix-projects-the-first-row-for-every-row",
+        symptom: "the loop controllers' row-by-row projection took row 0 for every row of a block, so the second and later tokens of a verify pass were mixed with the first token's gates and a drafted block was checked against wrong logits",
+        revert: &[Mutation {
+            path: MLX,
+            find: "a.try_index((.., r..r + 1, ..))?",
+            replace: "a.try_index((.., 0..1, ..))? /* defect: always row 0 */",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2806,6 +2819,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "inkling2-fused-residual-forgets-the-stream")
         | (_, "inkling2-fused-mix-doubles-the-softmax-scale")
         | (_, "inkling2-fused-output-subtracts-the-mlp") => "inkling2/fused.rs",
+        (_, "inkling2-mix-projects-the-first-row-for-every-row") => "inkling2/ops.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)

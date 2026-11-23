@@ -351,7 +351,7 @@ pub(super) fn conv_next(cfg: SharedCfg, args: &[&Array]) -> Result<Option<Vec<Ar
 
 /// Arguments `[x, message, down, gain_forget]`: the loop controllers' mix.
 fn mix_messages_inner(a: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
-    Ok(vec![ex(super::ops::mix_messages(
+    Ok(vec![ex(super::ops::mix_messages_by_row(
         &a[0],
         &a[1],
         &a[2],
