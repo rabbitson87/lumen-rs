@@ -13,6 +13,11 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::Value;
 
+/// The most passes of the core this port takes. The checkpoint runs 3; every pass is a layer visit
+/// with a cache entry, so a number that is not a loop count (a corrupt config) is refused before
+/// the schedule is built from it.
+const MAX_PASSES: usize = 32;
+
 /// The `loop_config` block: `core_start..core_end` run `num_passes` times per token.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct LoopArgs {
@@ -154,6 +159,11 @@ impl TextArgs {
             self.sconv_kernel_size >= 2,
             "sconv_kernel_size must be at least 2"
         );
+        // The global layers divide the position by this floor.
+        ensure!(
+            self.log_scaling_n_floor >= 1,
+            "log_scaling_n_floor must be at least 1"
+        );
         ensure!(
             self.num_experts_per_tok >= 1 && self.num_experts_per_tok <= self.n_routed_experts,
             "num_experts_per_tok {} is not within 1..={}",
@@ -226,12 +236,12 @@ impl TextArgs {
             || core.end > n
             || !core.start.is_multiple_of(block)
             || !core.end.is_multiple_of(block)
-            || passes < 2
+            || !(2..=MAX_PASSES).contains(&passes)
         {
             bail!(
                 "unsupported loop_config: core {}..{} with {passes} passes in {n} layers of \
                  blocks of {block} (the core must start and end on a block boundary, start above \
-                 0, with at least 2 passes)",
+                 0, with 2 to {MAX_PASSES} passes)",
                 core.start,
                 core.end
             );
@@ -297,6 +307,24 @@ mod tests {
                 "{field}: {err:#}"
             );
         }
+    }
+
+    /// RED before: a pass count nobody means (a damaged config) sized the schedule's allocation,
+    /// and a floor of 0 reached the position scaling as a division by zero.
+    #[test]
+    fn a_pass_count_that_is_no_loop_and_a_zero_floor_are_refused() {
+        let err =
+            edited(|v| v["text_config"]["loop_config"]["num_passes"] = Value::from(1u64 << 60))
+                .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unsupported loop_config"),
+            "{err:#}"
+        );
+        let err = edited(|v| v["text_config"]["log_scaling_n_floor"] = Value::from(0)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("log_scaling_n_floor"),
+            "{err:#}"
+        );
     }
 
     #[test]

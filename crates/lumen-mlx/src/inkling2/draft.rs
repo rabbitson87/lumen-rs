@@ -255,7 +255,12 @@ impl TapRing {
             Some(old) => mlx_rs::ops::concatenate_axis(&[old, rows], 1)?,
             None => rows.clone(),
         };
-        self.rows = Some(newest(&joined, keep)?);
+        let kept = newest(&joined, keep)?;
+        // Started now: left lazy, the ring would hold the chain of every push before it, each link
+        // pinning the whole pass's taps (the rejected positions of a verify pass, a prefill chunk's
+        // 2048 rows) until the request ends.
+        mlx_rs::transforms::async_eval([&kept])?;
+        self.rows = Some(kept);
         self.end += n;
         Ok(())
     }

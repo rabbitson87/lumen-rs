@@ -597,7 +597,9 @@ pub fn speculative_accept(p: &[f32], q: &[f32], draft: u32, rng: &mut Xorshift64
     } else {
         (pp / qq).min(1.0)
     };
-    if rng.next_f32() <= accept_p {
+    // `next_f32` is in [0, 1): strict, so a draft the distribution forbids (`accept_p == 0`) is
+    // never taken, and one it always allows (`accept_p == 1`) always is.
+    if rng.next_f32() < accept_p {
         return SpecAccept {
             accepted: true,
             token: draft,
@@ -842,6 +844,20 @@ mod tests {
             let out = speculative_accept(&p, &q, 0, &mut rng);
             assert!(out.accepted && out.token == 0);
         }
+    }
+
+    /// RED before: the test was `<=`, so the one draw in 2^24 that is exactly 0.0 took a draft the
+    /// distribution forbids.
+    #[test]
+    fn spec_accept_never_takes_a_draft_the_distribution_forbids() {
+        // A state whose first draw is exactly 0.0 (found by inverting the generator's steps).
+        const ZERO_FIRST: u64 = 0x98d7_6a16_4d99_a710;
+        assert_eq!(Xorshift64::new(ZERO_FIRST).next_f32(), 0.0);
+        let p = vec![0.0_f32, 1.0];
+        let q = vec![0.5_f32, 0.5];
+        let out = speculative_accept(&p, &q, 0, &mut Xorshift64::new(ZERO_FIRST));
+        assert!(!out.accepted, "p[draft] = 0 is never accepted");
+        assert_eq!(out.token, 1);
     }
 
     #[test]

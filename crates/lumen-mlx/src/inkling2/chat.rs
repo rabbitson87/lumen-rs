@@ -187,11 +187,13 @@ pub fn render_prompt_with_images(
                 }
                 for call in tool_calls.iter() {
                     let Value::Object(args) = call.arguments else {
-                        bail!(
+                        // The client's to fix: a 400, not a 500 it would retry.
+                        return Err(crate::chat_io::UnsupportedRequest(format!(
                             "tool call arguments of {:?} must be an object, not a JSON string or \
                              another value",
                             call.name
-                        );
+                        ))
+                        .into());
                     };
                     out.push_str(MESSAGE_MODEL);
                     out.push_content(call.name);
@@ -742,6 +744,12 @@ mod tests {
         ];
         let err = render_prompt(&turns, &[], DEFAULT_EFFORT).unwrap_err();
         assert!(err.to_string().contains("must be an object"), "{err}");
+        // RED before: a plain error, which the server answers 500 and a client retries.
+        assert!(
+            err.downcast_ref::<crate::chat_io::UnsupportedRequest>()
+                .is_some(),
+            "a client error"
+        );
     }
 
     #[test]

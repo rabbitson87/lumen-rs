@@ -37,6 +37,7 @@ use super::vision::VisionTower;
 use crate::SamplingOverrides;
 use crate::chat_io::{
     BackendStreamEvent, ChatTurn, ParsedResponse, ResolvedToolChoice, StopCause, ToolDef,
+    tool_result_order,
 };
 use crate::text_tokenizer::{TextTokenizer, TokenizeStats};
 
@@ -302,9 +303,11 @@ impl Inkling2Backend {
             .map_err(|e| anyhow!("encode: {e}"))
     }
 
+    /// Token ids as text for `/v1/completions`: the control tokens (the end of the turn among
+    /// them) are left out, as the other backends do.
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
         self.tokenizer
-            .decode(tokens, false)
+            .decode(tokens, true)
             .map_err(|e| anyhow!("decode: {e}"))
     }
 
@@ -319,8 +322,9 @@ impl Inkling2Backend {
         thinking: bool,
         named: Option<Effort>,
     ) -> Result<Vec<u32>> {
+        let (turns, _) = in_call_order(turns, &[]);
         Ok(self
-            .prompt_with_images(turns, &[], tools, tool_choice, thinking, named)?
+            .prompt_with_images(&turns, &[], tools, tool_choice, thinking, named)?
             .ids)
     }
 
@@ -448,6 +452,20 @@ impl Inkling2Backend {
         Ok(matches!(self.draft, Some(Some(_))))
     }
 
+    /// Whether the draft head can be used. One that cannot be read (a damaged or mismatched
+    /// `mtp.safetensors`) is an accelerator lost, not a reason to fail every request: it is said
+    /// once and the plain loop serves from then on.
+    fn draft_ready(&mut self) -> bool {
+        match self.ensure_draft() {
+            Ok(ready) => ready,
+            Err(e) => {
+                eprintln!("[inkling2] the draft head is unusable, decoding without it: {e:#}");
+                self.draft = Some(None);
+                false
+            }
+        }
+    }
+
     /// The cost of the last request.
     pub fn last_run(&self) -> RunStats {
         self.last_run
@@ -459,8 +477,9 @@ impl Inkling2Backend {
     }
 
     /// One chat turn: renders the prompt, generates, and reads the reply. `on_event` gets the
-    /// reply as it is read (reasoning and text deltas, the start of a tool call); an `Err` whose
-    /// message is `stop sequence` from it ends the turn there, as for the other backends.
+    /// reply as it is read (reasoning and text deltas, the start of a tool call); an `Err` from it
+    /// ends the turn there (a stop sequence matched, or the client is gone), as for the other
+    /// backends.
     pub fn chat(
         &mut self,
         turns: &[ChatTurn<'_>],
@@ -474,14 +493,16 @@ impl Inkling2Backend {
         ov: &SamplingOverrides,
         on_event: &mut dyn FnMut(BackendStreamEvent<'_>) -> Result<()>,
     ) -> Result<ParsedResponse> {
+        let (turns, images) = in_call_order(turns, images);
         let prompt = self.prompt_with_images(
-            turns,
-            images,
+            &turns,
+            &images,
             tools,
             tool_choice,
             thinking,
             named_effort(ov),
         )?;
+        let max_new_tokens = reply_budget(self.max_context, prompt.ids.len(), max_new_tokens);
         let sources: Vec<&[u8]> = images.iter().flatten().map(Vec::as_slice).collect();
         let mut parser = ResponseParser::new(self.markers);
         // The loop below needs `&mut self` for the caches, so the decode closure holds its own
@@ -493,6 +514,10 @@ impl Inkling2Backend {
                 .map_err(|e| anyhow!("decode: {e}"))
         };
         let sampling = sampling_config(temperature, top_p, ov);
+        // Any error the sink returns ends the turn: it has what it needs (a stop sequence matched)
+        // or the client is gone, and the server tells those from a failure by its own record, never
+        // by the message. Only the sink's errors do: the parser's own (a decode failure) are real.
+        let sink_failed = std::cell::Cell::new(false);
         let mut stopped_by_sink = false;
         let generated = self.generate_with(
             &prompt,
@@ -500,13 +525,18 @@ impl Inkling2Backend {
             max_new_tokens,
             sampling,
             ov,
-            &mut |token| match parser.push(token, &decode, on_event) {
-                Ok(()) => Ok(parser.is_done()),
-                Err(e) if e.to_string() == "stop sequence" => {
-                    stopped_by_sink = true;
-                    Ok(true)
+            &mut |token| {
+                let pushed = parser.push(token, &decode, &mut |event| {
+                    on_event(event).inspect_err(|_| sink_failed.set(true))
+                });
+                match pushed {
+                    Ok(()) => Ok(parser.is_done()),
+                    Err(_) if sink_failed.get() => {
+                        stopped_by_sink = true;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             },
         )?;
         let response = if stopped_by_sink {
@@ -537,7 +567,7 @@ impl Inkling2Backend {
         self.generate_with(
             &Prompt::plain(prompt),
             &[],
-            max_new_tokens,
+            reply_budget(self.max_context, prompt.len(), max_new_tokens),
             sampling,
             ov,
             &mut |t| Ok(eos.contains(&t)),
@@ -557,12 +587,12 @@ impl Inkling2Backend {
     ) -> Result<Vec<u32>> {
         ensure!(!prompt.ids.is_empty(), "an empty prompt");
         ensure!(
-            prompt.ids.len() + max_new_tokens.min(1) <= self.max_context,
-            "a prompt of {} tokens is past this backend's context of {}",
+            prompt.ids.len() < self.max_context,
+            "a prompt of {} tokens leaves no room to reply in this backend's context of {}",
             prompt.ids.len(),
             self.max_context
         );
-        let speculate = self.draft_depth.unwrap_or(0) > 0 && self.ensure_draft()?;
+        let speculate = self.draft_depth.unwrap_or(0) > 0 && self.draft_ready();
         let began = std::time::Instant::now();
         // The features come first, before the retained conversation is taken: an image that turns
         // out unreadable is the client's error, and must not cost it the caches.
@@ -1177,6 +1207,44 @@ fn pick(
     }
 }
 
+/// How many tokens a reply may run: what the client asked for (`0` is the server's "until the model
+/// ends its turn"), and never more than the context has room for after the prompt. A reply that
+/// fills the context ends there as a length cut, not past `max_context` where the caches grow
+/// without a bound.
+fn reply_budget(max_context: usize, prompt_len: usize, asked: usize) -> usize {
+    let room = max_context.saturating_sub(prompt_len);
+    if asked == 0 { room } else { asked.min(room) }
+}
+
+/// `turns` with each run of tool results in the order of the calls they answer, and `images` (the
+/// encoded images of each turn) moved along with them. The template pairs a result with a call by
+/// position, so results a client sent in the order they finished would be read as answers to the
+/// wrong calls. Borrowed when nothing moves.
+fn in_call_order<'t, 'a>(
+    turns: &'t [ChatTurn<'a>],
+    images: &'t [Vec<Vec<u8>>],
+) -> (
+    std::borrow::Cow<'t, [ChatTurn<'a>]>,
+    std::borrow::Cow<'t, [Vec<Vec<u8>>]>,
+) {
+    use std::borrow::Cow;
+    let Some(order) = tool_result_order(turns) else {
+        return (Cow::Borrowed(turns), Cow::Borrowed(images));
+    };
+    let moved = order.iter().map(|&i| turns[i].clone()).collect();
+    let images = if images.is_empty() {
+        Cow::Borrowed(images)
+    } else {
+        Cow::Owned(
+            order
+                .iter()
+                .map(|&i| images.get(i).cloned().unwrap_or_default())
+                .collect(),
+        )
+    };
+    (Cow::Owned(moved), images)
+}
+
 /// The effort a request names: its `reasoning_effort` as spelled, when a level can be read from
 /// it.
 pub fn named_effort(ov: &SamplingOverrides) -> Option<Effort> {
@@ -1232,6 +1300,70 @@ pub fn turns_from_pairs(messages: &[(String, String)]) -> Result<Vec<ChatTurn<'_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RED before: a `max_tokens` of 0 (the server's "until the model ends its turn") gave an empty
+    /// reply, and a large one was bounded by nothing but the memory the caches could grow into.
+    #[test]
+    fn a_reply_is_bounded_by_what_the_context_has_room_for_and_zero_is_that_room() {
+        assert_eq!(reply_budget(1000, 100, 50), 50);
+        assert_eq!(reply_budget(1000, 100, 0), 900);
+        assert_eq!(reply_budget(1000, 100, 200_000), 900);
+        assert_eq!(reply_budget(1000, 999, 0), 1);
+        assert_eq!(reply_budget(1000, 1000, 0), 0);
+    }
+
+    /// RED before: tool results sent in the order they finished were read as the answers to other
+    /// calls, and what a tool turn carries (its images) has to move with it.
+    #[test]
+    fn tool_results_follow_their_calls_and_take_their_images_along() {
+        let args = serde_json::json!({});
+        let calls = [
+            crate::chat_io::AssistantToolCall {
+                id: "a",
+                name: "f",
+                arguments: &args,
+            },
+            crate::chat_io::AssistantToolCall {
+                id: "b",
+                name: "f",
+                arguments: &args,
+            },
+        ];
+        let result = |id| ChatTurn::Tool {
+            tool_call_id: id,
+            name: None,
+            content: id,
+        };
+        let turns = [
+            ChatTurn::User("q"),
+            ChatTurn::Assistant {
+                text: "",
+                tool_calls: &calls,
+            },
+            result("b"),
+            result("a"),
+        ];
+        let images = vec![vec![], vec![], vec![vec![2u8]], vec![vec![1u8]]];
+        let (ordered, moved) = in_call_order(&turns, &images);
+        let contents: Vec<&str> = ordered
+            .iter()
+            .filter_map(|t| match t {
+                ChatTurn::Tool { content, .. } => Some(*content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contents, ["a", "b"]);
+        assert_eq!(
+            moved[2],
+            vec![vec![1u8]],
+            "a's picture sits with a's result"
+        );
+        assert_eq!(moved[3], vec![vec![2u8]]);
+        // In order already: nothing is copied.
+        let (same, same_images) = in_call_order(&turns[..2], &images[..2]);
+        assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(same_images, std::borrow::Cow::Borrowed(_)));
+    }
 
     #[test]
     fn a_point_is_reusable_when_its_tokens_are_a_proper_prefix_of_the_new_prompt() {
@@ -2481,7 +2613,8 @@ mod real_checkpoint_tests {
                 &mut |_| {
                     pieces += 1;
                     if pieces >= 3 {
-                        Err(anyhow!("stop sequence"))
+                        // The server's own wording: the engine's sinks do not say "stop sequence".
+                        Err(anyhow!("__lumen_stop_sequence__"))
                     } else {
                         Ok(())
                     }

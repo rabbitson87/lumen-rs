@@ -474,3 +474,38 @@ fn a_rollback_needs_the_windows_a_verify_pass_keeps() {
     // The windows are used up by the rollback: a second one has none to read.
     assert!(cache.rollback(1).is_err());
 }
+
+/// RED before: a refused rollback had already taken the first visit's windows, so the corrected
+/// one that followed failed with "did not keep its convolution windows".
+#[test]
+fn a_refused_rollback_leaves_the_caches_as_they_were() {
+    let model = load_replica();
+    let ids = prompt_ids(&reference("outputs.safetensors"));
+    let mut cache = model.make_cache();
+    model
+        .verify(&ids[..8], &mut cache, &[5])
+        .unwrap()
+        .0
+        .eval()
+        .unwrap();
+    assert!(cache.rollback(8).is_err());
+    assert!(cache.rollback(9).is_err());
+    assert_eq!(cache.len(), 8, "the refusals changed nothing");
+    cache.rollback(7).expect("the windows are still there");
+    assert_eq!(cache.len(), 1);
+}
+
+/// RED before: a tap id past the final norm was found after the pass, which had advanced every
+/// cache; a token id past the vocabulary was handed to a lookup that does not check it.
+#[test]
+fn a_bad_tap_or_token_id_is_refused_before_anything_runs() {
+    let model = load_replica();
+    let ids = prompt_ids(&reference("outputs.safetensors"));
+    let mut cache = model.make_cache();
+    assert!(model.verify(&ids[..4], &mut cache, &[999]).is_err());
+    assert_eq!(cache.len(), 0, "the pass did not run");
+    let mut cache = model.make_cache();
+    assert!(model.advance(&[u32::MAX], &mut cache).is_err());
+    assert!(model.advance(&[1 << 30], &mut cache).is_err());
+    assert_eq!(cache.len(), 0);
+}

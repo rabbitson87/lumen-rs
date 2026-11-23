@@ -116,7 +116,7 @@ pub const FAMILIES: &[FamilyInfo] = &[
         family: ModelFamily::Inkling2,
         label: "Inkling 2",
         backend: "mlx-native",
-        notes: "Thinking Machines' looped mixture-of-experts (Mini: 26.4B total, 3.4B active; the middle 12 layers run three times per token). Chat with reasoning and tool calls, and image input (any size up to about 2,560 x 2,560 pixels; one token per 40-pixel block); no response_format yet. Greedy requests (temperature 0) decode with the bundled draft head, 1.1 to 2.1 times faster.",
+        notes: "Thinking Machines' looped mixture-of-experts (Mini: 26.4B total, 3.4B active; the middle 12 layers run three times per token). Chat with reasoning and tool calls, and image input (any size up to about 2,560 x 2,560 pixels; one token per 40-pixel block); no response_format yet. Requests decode with the bundled draft head: greedy ones 1.1 to 2.1 times faster, sampled ones from the plain speed up to about 1.9 times (the more predictable the text, the more it gains).",
     },
     FamilyInfo {
         family: ModelFamily::Gemma4,
@@ -282,7 +282,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         label: "Inkling 2 Mini — 26.4B-A3.4B looped MoE (oQ4e)",
         approx_size_gb: 17,
         min_ram_gb: 24,
-        notes: "**A looped reasoning MoE: 26.4B parameters, 3.4B active, its middle 12 layers run three times per token.** 4.9 bits per weight, ~16 GB of RAM for the weights plus 192 KB per token of context (64K tokens at most). Chat with reasoning (`reasoning_effort`: none, minimal, low, medium, high, xhigh, max, or a number up to 0.99), tool calls and image input (a picture costs one token per 40-pixel block, no resizing; the 0.6 GB vision tower loads with the first image); reuses the previous turn's state, so a follow-up feeds only the new tokens, pictures included. Greedy requests (temperature 0) decode with the bundled draft head, which measured 1.1 to 2.1 times the plain speed on an M3 Max (it adds 0.7 GB; `LUMEN_INKLING2_DRAFT=0` turns it off); sampled requests do not use it yet. Not yet: `response_format` and a forced `tool_choice`. Decode ~22-25 tok/s on an M3 Max.",
+        notes: "**A looped reasoning MoE: 26.4B parameters, 3.4B active, its middle 12 layers run three times per token.** 4.9 bits per weight, ~16 GB of RAM for the weights plus 192 KB per token of context (64K tokens at most). Chat with reasoning (`reasoning_effort`: none, minimal, low, medium, high, xhigh, max, or a number up to 0.99), tool calls and image input (a picture costs one token per 40-pixel block, no resizing; the 0.6 GB vision tower loads with the first image); reuses the previous turn's state, so a follow-up feeds only the new tokens, pictures included. Requests decode with the bundled draft head, which measured 1.1 to 2.1 times the plain speed for greedy ones and the plain speed up to about 1.9 times for sampled ones on an M3 Max (it adds 0.7 GB; `LUMEN_INKLING2_DRAFT=0` turns it off). Not yet: `response_format` and a forced `tool_choice`. Decode ~22-25 tok/s on an M3 Max.",
     },
 ];
 

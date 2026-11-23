@@ -196,33 +196,46 @@ pub struct AssistantToolCall<'a> {
 /// that turn's call ids; a result whose id names none of them keeps its place
 /// among the others after the rest. Only `Tool` turns move, and only within
 /// their run, so anything indexed by the other turns (their images) still
-/// lines up. Borrowed when nothing moves.
+/// lines up; what is indexed by a `Tool` turn moves with it, by
+/// [`tool_result_order`]. Borrowed when nothing moves.
 pub fn tool_results_in_call_order<'t, 'a>(
     turns: &'t [ChatTurn<'a>],
 ) -> std::borrow::Cow<'t, [ChatTurn<'a>]> {
-    let mut sorted: Option<Vec<ChatTurn<'a>>> = None;
+    match tool_result_order(turns) {
+        None => std::borrow::Cow::Borrowed(turns),
+        Some(order) => std::borrow::Cow::Owned(order.iter().map(|&i| turns[i].clone()).collect()),
+    }
+}
+
+/// [`tool_results_in_call_order`] as a permutation: position `p` of the ordered turns holds
+/// `turns[order[p]]`. `None` when nothing moves. For what is indexed by turn alongside them (a
+/// `Tool` turn's images), which has to move with its turn.
+pub fn tool_result_order(turns: &[ChatTurn<'_>]) -> Option<Vec<usize>> {
+    let mut order: Vec<usize> = (0..turns.len()).collect();
     for (i, turn) in turns.iter().enumerate() {
         let ChatTurn::Assistant { tool_calls, .. } = turn else {
             continue;
         };
-        let run = i + 1
-            ..i + 1
-                + turns[i + 1..]
-                    .iter()
-                    .take_while(|t| matches!(t, ChatTurn::Tool { .. }))
-                    .count();
-        let rank = |t: &ChatTurn<'_>| match t {
+        let end = i
+            + 1
+            + turns[i + 1..]
+                .iter()
+                .take_while(|t| matches!(t, ChatTurn::Tool { .. }))
+                .count();
+        let rank = |j: &usize| match &turns[*j] {
             ChatTurn::Tool { tool_call_id, .. } => tool_calls
                 .iter()
                 .position(|c| c.id == *tool_call_id)
                 .unwrap_or(usize::MAX),
             _ => usize::MAX,
         };
-        if !turns[run.clone()].is_sorted_by_key(rank) {
-            sorted.get_or_insert_with(|| turns.to_vec())[run].sort_by_key(rank);
-        }
+        order[i + 1..end].sort_by_key(rank);
     }
-    sorted.map_or(std::borrow::Cow::Borrowed(turns), std::borrow::Cow::Owned)
+    order
+        .iter()
+        .enumerate()
+        .any(|(at, &from)| at != from)
+        .then_some(order)
 }
 
 /// What a chat request renders its prompt from: the flat `(role, content)`
@@ -965,6 +978,36 @@ mod tool_result_order {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The permutation is what the ordered turns are built from, so what is indexed by turn can
+    /// follow: position `p` holds `turns[order[p]]`, and nothing moves outside a run of results.
+    #[test]
+    fn the_order_is_the_permutation_the_ordered_turns_come_from() {
+        let args = serde_json::json!({});
+        let calls = [call("a", &args), call("b", &args), call("c", &args)];
+        let turns = [
+            ChatTurn::User("q"),
+            ChatTurn::Assistant {
+                text: "",
+                tool_calls: &calls,
+            },
+            result("c"),
+            result("a"),
+            result("b"),
+            ChatTurn::User("next"),
+        ];
+        let order = super::tool_result_order(&turns).expect("results out of order");
+        assert_eq!(order, [0, 1, 3, 4, 2, 5]);
+        let ordered = tool_results_in_call_order(&turns);
+        for (at, &from) in order.iter().enumerate() {
+            assert_eq!(format!("{:?}", ordered[at]), format!("{:?}", turns[from]));
+        }
+        assert_eq!(
+            super::tool_result_order(&turns[..4]),
+            Some(vec![0, 1, 3, 2])
+        );
+        assert_eq!(super::tool_result_order(&turns[..3]), None);
     }
 
     #[test]

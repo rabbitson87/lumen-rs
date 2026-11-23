@@ -90,7 +90,11 @@ pub struct ChatCompletionRequest {
     /// `"minimal"` / `"none"` / `"low"` / `"medium"` / `"high"`. Any value
     /// other than `minimal`/`none` enables thinking on supported families
     /// (Gemma 4, Qwen 3.5).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "effort_spelling"
+    )]
     pub reasoning_effort: Option<String>,
     /// vLLM / SGLang convention for chat-template-controlled thinking
     /// toggles (Qwen3, DeepSeek-R1, …). Sent as `extra_body` from the
@@ -280,16 +284,36 @@ impl ChatCompletionRequest {
             }
         }
         if let Some(eff) = self.reasoning_effort.as_deref() {
-            return !matches!(
-                eff.trim().to_ascii_lowercase().as_str(),
-                "minimal" | "none" | "off" | "disabled" | ""
-            );
+            let eff = eff.trim().to_ascii_lowercase();
+            // A number is a level (Inkling 2 reads one up to 0.99): 0 is no reasoning.
+            let zero = eff.parse::<f32>().is_ok_and(|level| level <= 0.0);
+            return !zero && !matches!(eff.as_str(), "minimal" | "none" | "off" | "disabled" | "");
         }
         if self.thinking {
             return true;
         }
         backend_default_on
     }
+}
+
+/// `reasoning_effort` as the text the rest of the server reads. A number (`0.5`) is a level, as the
+/// OpenAI field never is but Inkling 2's template takes one, and is kept as its spelling.
+fn effort_spelling<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Spelling {
+        Text(String),
+        Number(serde_json::Number),
+    }
+    Ok(
+        Option::<Spelling>::deserialize(deserializer)?.map(|value| match value {
+            Spelling::Text(text) => text,
+            Spelling::Number(number) => number.to_string(),
+        }),
+    )
 }
 
 /// Detect imatrix-AWQ-quantized builds by id substring. The Lumen-shipped
@@ -2192,6 +2216,26 @@ mod tool_calling_serde {
             let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
             assert!(!req.enable_thinking(), "expected off for {v:?}");
         }
+    }
+
+    #[test]
+    fn a_numeric_reasoning_effort_is_a_level_and_zero_is_none() {
+        let level = |v: serde_json::Value| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "x",
+                "messages": [],
+                "reasoning_effort": v,
+            }))
+            .expect("a number is accepted")
+        };
+        let half = level(serde_json::json!(0.5));
+        assert_eq!(half.reasoning_effort.as_deref(), Some("0.5"));
+        assert!(half.enable_thinking());
+        let zero = level(serde_json::json!(0));
+        assert_eq!(zero.reasoning_effort.as_deref(), Some("0"));
+        assert!(!zero.enable_thinking());
+        let none = level(serde_json::Value::Null);
+        assert_eq!(none.reasoning_effort, None);
     }
 
     #[test]

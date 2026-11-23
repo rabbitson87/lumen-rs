@@ -2457,6 +2457,123 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "inkling2-reply-ignores-the-context-room",
+        symptom: "a reply was bounded by what the client asked for and nothing else, and a `max_tokens` of 0 (the server's \"until the model ends its turn\") was an empty reply: a long reply grew the caches past the context the model has, and an unbounded setting answered with nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let room = max_context.saturating_sub(prompt_len);",
+            replace: "let room = { let _ = (max_context, prompt_len); usize::MAX }; // defect: the context's room is not counted",
+        }],
+        guards: &[mlx(
+            "inkling2::backend::tests::a_reply_is_bounded_by_what_the_context_has_room_for_and_zero_is_that_room",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-tool-images-stay-behind",
+        symptom: "when tool results were put in the order of their calls the pictures a tool result carried stayed where they were, so each picture was described as the answer to another call",
+        revert: &[Mutation {
+            path: MLX,
+            find: ".map(|&i| images.get(i).cloned().unwrap_or_default())",
+            replace: ".map(|_| images.first().cloned().unwrap_or_default()) // defect: the images do not follow their turns",
+        }],
+        guards: &[mlx(
+            "inkling2::backend::tests::tool_results_follow_their_calls_and_take_their_images_along",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-tool-results-arrive-unordered",
+        symptom: "tool results a client sent in the order they finished were rendered in that order, and the template pairs a result with a call by position, so the model read each result as the answer to another call",
+        revert: &[Mutation {
+            path: MLX,
+            find: "order[i + 1..end].sort_by_key(rank);",
+            replace: "let _ = (&rank, end); // defect: the run is not sorted",
+        }],
+        guards: &[mlx(
+            "chat_io::tool_result_order::the_order_is_the_permutation_the_ordered_turns_come_from",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-refused-rollback-drops-the-windows",
+        symptom: "a rollback that was refused (more rejected than the pass had) had already taken the first layer visit's convolution windows, so the corrected rollback that followed failed and the request with it",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        for visit in &self.visits {\n            let windows = visit\n                .windows\n                .as_ref()\n                .context(\"the last pass did not keep its convolution windows\")?;\n            ensure!(\n                rejected < windows.rows,\n                \"rolling back {rejected} of a pass of {} tokens leaves nothing\",\n                windows.rows\n            );\n",
+            replace: "        for visit in &mut self.visits {\n            let windows = visit\n                .windows\n                .as_ref()\n                .context(\"the last pass did not keep its convolution windows\")?;\n            let rows = windows.rows;\n            if rejected >= rows {\n                visit.windows = None; // defect: consumed before it is refused\n            }\n            ensure!(\n                rejected < rows,\n                \"rolling back {rejected} of a pass of {rows} tokens leaves nothing\"\n            );\n",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::a_refused_rollback_leaves_the_caches_as_they_were",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-tap-id-found-after-the-pass",
+        symptom: "a tap id past the final norm was refused only after the pass had run, so a request that failed on it had already advanced every layer visit's cache",
+        revert: &[Mutation {
+            path: MLX,
+            find: ".find(|&&id| id > self.schedule.len())",
+            replace: ".find(|&&id| id > usize::MAX - 1) /* defect: checked after the pass */",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::a_bad_tap_or_token_id_is_refused_before_anything_runs",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-token-id-unchecked",
+        symptom: "a token id past the vocabulary went to an embedding lookup that does not check bounds on the GPU, so it read whatever memory lay past the table",
+        revert: &[Mutation {
+            path: MLX,
+            find: "ids.iter().all(|&t| (t as usize) < vocab),",
+            replace: "{ let _ = vocab; true }, // defect: no bound",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::a_bad_tap_or_token_id_is_refused_before_anything_runs",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-pass-count-unbounded",
+        symptom: "a damaged config naming a huge number of passes sized the layer schedule's allocation from it and ran out of memory (or overflowed) while loading",
+        revert: &[Mutation {
+            path: MLX,
+            find: "|| !(2..=MAX_PASSES).contains(&passes)",
+            replace: "|| passes < 2 // defect: no upper bound",
+        }],
+        guards: &[mlx(
+            "inkling2::text_config::tests::a_pass_count_that_is_no_loop_and_a_zero_floor_are_refused",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-accept-takes-a-forbidden-draft",
+        symptom: "the speculative accept test compared with `<=` against a draw in [0, 1), so the one draw in 2^24 that is exactly 0 took a draft the request's own sampling gave no probability at all",
+        revert: &[Mutation {
+            path: CORE,
+            find: "if rng.next_f32() < accept_p {",
+            replace: "if rng.next_f32() <= accept_p { // defect: inclusive",
+        }],
+        guards: &[core(
+            "sampling::tests::spec_accept_never_takes_a_draft_the_distribution_forbids",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-effort-number-rejected",
+        symptom: "`reasoning_effort` was read as text only, so a client sending the level as a number (`0.5`, which Inkling 2's template takes and its model card documents) got a 400 from the request parser",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        skip_serializing_if = \"Option::is_none\",\n        deserialize_with = \"effort_spelling\"\n",
+            replace: "        skip_serializing_if = \"Option::is_none\"\n",
+        }],
+        guards: &[srv(
+            "types::tool_calling_serde::a_numeric_reasoning_effort_is_a_level_and_zero_is_none",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2596,6 +2713,15 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "inkling2-speculative-ring-misses-the-cycles-rows") => "inkling2/backend.rs",
         (_, "inkling2-sampled-drafts-always-accepted") => "inkling2/backend.rs",
         (_, "inkling2-sampled-penalty-window-drops-the-anchor") => "inkling2/backend.rs",
+        (_, "inkling2-reply-ignores-the-context-room")
+        | (_, "inkling2-tool-images-stay-behind") => "inkling2/backend.rs",
+        (_, "inkling2-tool-results-arrive-unordered") => "chat_io.rs",
+        (_, "inkling2-refused-rollback-drops-the-windows")
+        | (_, "inkling2-tap-id-found-after-the-pass")
+        | (_, "inkling2-token-id-unchecked") => "inkling2/model.rs",
+        (_, "inkling2-pass-count-unbounded") => "inkling2/text_config.rs",
+        (_, "inkling2-accept-takes-a-forbidden-draft") => "sampling.rs",
+        (_, "inkling2-effort-number-rejected") => "types.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)

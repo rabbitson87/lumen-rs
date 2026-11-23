@@ -1101,16 +1101,29 @@ impl Inkling2Cache {
     /// from the windows. Leaves the caches as if only the kept tokens had been fed (the same
     /// states, to rounding: the windows are the very values the pass computed).
     pub fn rollback(&mut self, rejected: usize) -> Result<()> {
-        for visit in &mut self.visits {
+        // Every visit is checked before any is changed: a refused rollback leaves the caches as
+        // they were, windows included.
+        for visit in &self.visits {
             let windows = visit
                 .windows
-                .take()
+                .as_ref()
                 .context("the last pass did not keep its convolution windows")?;
             ensure!(
                 rejected < windows.rows,
                 "rolling back {rejected} of a pass of {} tokens leaves nothing",
                 windows.rows
             );
+            ensure!(
+                visit.kv.offset() >= rejected,
+                "the cache holds {} tokens, fewer than the {rejected} to take back",
+                visit.kv.offset()
+            );
+        }
+        for visit in &mut self.visits {
+            let windows = visit
+                .windows
+                .take()
+                .context("the last pass did not keep its convolution windows")?;
             let kept = windows.rows - rejected;
             let (from, to) = (kept as i32, (kept + windows.keep) as i32);
             let mut states: [Option<Array>; 4] = [None, None, None, None];
@@ -1119,10 +1132,6 @@ impl Inkling2Cache {
                 states[slot] = Some(owned(&window.try_index((.., from..to, ..))?)?);
             }
             let len = visit.kv.offset();
-            ensure!(
-                len >= rejected,
-                "the cache holds {len} tokens, fewer than the {rejected} to take back"
-            );
             visit.kv.truncate_to(len - rejected)?;
             visit.conv = states;
         }
@@ -1214,15 +1223,17 @@ impl Inkling2Model {
         let final_input = AttnResQuery::load(&mut bag, "model.final_input.query", 1, h)?;
         let norm = bag.get_shaped("model.norm.weight", &[h])?;
         let lm_head = QLinear::load(&mut bag, &quant, "lm_head", vocab, h)?;
-        let vocab_bias = if args.unpadded_vocab_size < args.vocab_size {
-            let mut bias = vec![0.0f32; args.unpadded_vocab_size];
-            bias.resize(args.vocab_size, f32::NEG_INFINITY);
-            let a = Array::from_slice(&bias, &[vocab]);
-            bag.used.push(a.clone());
-            Some(a)
-        } else {
-            None
-        };
+        // 0 is "not set", as in the reference.
+        let vocab_bias =
+            if args.unpadded_vocab_size > 0 && args.unpadded_vocab_size < args.vocab_size {
+                let mut bias = vec![0.0f32; args.unpadded_vocab_size];
+                bias.resize(args.vocab_size, f32::NEG_INFINITY);
+                let a = Array::from_slice(&bias, &[vocab]);
+                bag.used.push(a.clone());
+                Some(a)
+            } else {
+                None
+            };
         bag.materialize().context("read the weights into memory")?;
         Ok(Self {
             args,
@@ -1342,6 +1353,14 @@ impl Inkling2Model {
         keep_windows: bool,
     ) -> Result<(Array, Array)> {
         ensure!(!tap_ids.is_empty(), "no tap ids");
+        // Before the pass: one that fails after it has run leaves every cache advanced.
+        if let Some(id) = tap_ids.iter().find(|&&id| id > self.schedule.len()) {
+            bail!(
+                "tap id {id} names no layer visit (0..{}) or the final norm ({})",
+                self.schedule.len(),
+                self.schedule.len()
+            );
+        }
         let mut slots: Vec<Option<Array>> = vec![None; tap_ids.len()];
         let hidden = self.hidden(
             ids,
@@ -1395,6 +1414,12 @@ impl Inkling2Model {
     /// The embedding of each of `ids` as the stack sees it, `[1, L, H]`: looked up and
     /// normalized.
     pub(super) fn embed_tokens(&self, ids: &[u32]) -> Result<Array> {
+        // The lookup does not check bounds on the GPU: an id past the table reads other memory.
+        let vocab = self.args.vocab_size;
+        ensure!(
+            ids.iter().all(|&t| (t as usize) < vocab),
+            "a token id is past the vocabulary of {vocab}"
+        );
         let ids_i32: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
         let ids = Array::from_slice(&ids_i32, &[1, ids_i32.len() as i32]);
         let embedded = self.embed.lookup(&ids)?;
@@ -1475,10 +1500,13 @@ impl Inkling2Model {
     }
 
     fn logits_from_hidden(&self, hidden: &Array) -> Result<Array> {
-        let logits = softcap(
-            &self.lm_head.apply(hidden)?.as_dtype(Dtype::Float32)?,
-            self.args.final_logit_softcapping,
-        )?;
+        let logits = self.lm_head.apply(hidden)?.as_dtype(Dtype::Float32)?;
+        // A cap of 0 is "no cap", as for the draft head; dividing by it would give NaN.
+        let logits = if self.args.final_logit_softcapping > 0.0 {
+            softcap(&logits, self.args.final_logit_softcapping)?
+        } else {
+            logits
+        };
         match &self.vocab_bias {
             Some(bias) => Ok(mlx_rs::ops::add(&logits, bias)?),
             None => Ok(logits),
