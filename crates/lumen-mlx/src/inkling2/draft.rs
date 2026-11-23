@@ -229,6 +229,11 @@ impl TapRing {
         Self { rows: None, end: 0 }
     }
 
+    /// An empty ring that stops at position `end`: nothing is known about the positions before.
+    pub fn starting_at(end: usize) -> Self {
+        Self { rows: None, end }
+    }
+
     /// Positions held (`end - len()..end`).
     pub fn len(&self) -> usize {
         self.rows.as_ref().map_or(0, |r| r.shape()[1] as usize)

@@ -23,6 +23,7 @@ value → on.
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
+| `LUMEN_INKLING2_DRAFT` | off | Behavior | `lumen_mlx::inkling2::backend::inkling2_draft` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
 | `LUMEN_MEMORY_PLAN_RECLAIMABLE` | on | Behavior | `lumen_mlx::qwen4_exp::runner::plan_reclaimable` |
@@ -213,6 +214,17 @@ Run quantized-KV prefill (queries of more than one token) through
  bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
  at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
  `=0` restores the quantized matmuls.
+
+### `LUMEN_INKLING2_DRAFT`
+
+*Behavior, default off.*
+
+Speculative decoding for Inkling 2: the checkpoint's bundled DSpark draft head
+ (`mtp.safetensors`) proposes a block of tokens and the model checks the block in one pass,
+ for greedy requests (temperature 0). Off by default: it is on only where it measured faster
+ than the plain loop, and a pass over a block does not round exactly like single-token steps
+ in bfloat16, so a continuation can differ from the plain loop's where two tokens are near
+ ties (hence a behavior flag). The draft head's 0.6 GB load with the first request.
 
 ### `LUMEN_JOINT_PREFILL`
 

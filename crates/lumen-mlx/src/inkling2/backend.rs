@@ -23,8 +23,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, ensure};
 use lumen_core::sampling::{SamplingConfig, Xorshift64, sample_from_logits};
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::TryIndexOp;
 
 use super::chat::{Effort, IMAGE_TOKEN, render_prompt_with_images};
+use super::draft::{DraftModel, TapRing};
 use super::model::{ConvSnapshot, ImageRows, Inkling2Cache, Inkling2Model, LoadOptions};
 use super::pixels::{prepare, token_count};
 use super::response::{Markers, ResponseParser};
@@ -45,6 +47,23 @@ use crate::text_tokenizer::{TextTokenizer, TokenizeStats};
 /// both the fastest and nearly the lowest.
 const PREFILL_CHUNK: usize = 512;
 
+lumen_flags::flag! {
+    /// Speculative decoding for Inkling 2: the checkpoint's bundled DSpark draft head
+    /// (`mtp.safetensors`) proposes a block of tokens and the model checks the block in one pass,
+    /// for greedy requests (temperature 0). Off by default: it is on only where it measured faster
+    /// than the plain loop, and a pass over a block does not round exactly like single-token steps
+    /// in bfloat16, so a continuation can differ from the plain loop's where two tokens are near
+    /// ties (hence a behavior flag). The draft head's 0.6 GB load with the first request.
+    pub(crate) inkling2_draft {
+        env: "LUMEN_INKLING2_DRAFT",
+        default: false,
+        kind: Behavior,
+    }
+}
+
+/// Drafts a block proposes and the model checks, when the flag turns speculation on.
+const DEFAULT_DRAFT_DEPTH: usize = 7;
+
 /// The longest prompt plus reply served. Every one of the 48 layer visits keeps a KV cache, so a
 /// token costs 192 KiB (the 8 visits of the global layers 5, 11, 17, 23 hold all tokens, the 40
 /// local ones only the window, but this backend keeps them all): 64K tokens are 12 GiB.
@@ -63,6 +82,31 @@ pub struct RunStats {
     /// long that took, the tower's first load included.
     pub images_encoded: usize,
     pub image_ms: f64,
+    /// The speculative loop's work, all zero when the request ran the plain loop.
+    pub spec: SpecStats,
+}
+
+/// What the speculative decode loop did in one request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpecStats {
+    /// Draft blocks proposed and checked.
+    pub cycles: usize,
+    /// Drafts put to the check, and how many of them the model agreed with.
+    pub drafted: usize,
+    pub accepted: usize,
+    pub draft_ms: f64,
+    pub verify_ms: f64,
+}
+
+impl SpecStats {
+    /// Tokens a cycle gives on average: the model's own next token plus the drafts it agreed with.
+    pub fn tokens_per_cycle(&self) -> f64 {
+        if self.cycles == 0 {
+            0.0
+        } else {
+            (self.cycles + self.accepted) as f64 / self.cycles as f64
+        }
+    }
 }
 
 /// What a token of a prompt is, for telling prompts apart: the token, and for an image token a hash
@@ -121,6 +165,18 @@ struct Retained {
     cache: Inkling2Cache,
     /// Lengths the caches can go back to, ascending, with their convolution states.
     points: Vec<(usize, ConvSnapshot)>,
+    /// The draft head's context taps of the newest positions, when the request that left these
+    /// caches speculated; it ends where the caches do.
+    taps: Option<TapRing>,
+}
+
+/// What a request starts from: caches (retained or fresh), the points they can go back to, how
+/// many prompt tokens they hold, and the taps that go with them.
+struct Resume {
+    cache: Inkling2Cache,
+    points: Vec<(usize, ConvSnapshot)>,
+    start: usize,
+    taps: Option<TapRing>,
 }
 
 pub struct Inkling2Backend {
@@ -137,6 +193,11 @@ pub struct Inkling2Backend {
     image_token: Option<u32>,
     /// The vision tower, read from the checkpoint the first time an image has to be encoded.
     tower: Option<VisionTower>,
+    /// The draft head, read the first time speculation is asked for; `Some(None)` once it is
+    /// known the checkpoint has none.
+    draft: Option<Option<DraftModel>>,
+    /// Drafts to check per block; `None` or 0 is the plain loop.
+    draft_depth: Option<usize>,
 }
 
 /// The longest recorded point the caches can go back to for a prompt `new`: its tokens are a
@@ -198,6 +259,8 @@ impl Inkling2Backend {
             dir: dir.to_path_buf(),
             image_token,
             tower: None,
+            draft: None,
+            draft_depth: inkling2_draft::get().then_some(DEFAULT_DRAFT_DEPTH),
         })
     }
 
@@ -343,6 +406,35 @@ impl Inkling2Backend {
         self.build_prompt(turns, tools, tool_choice, thinking, named_effort(ov))
     }
 
+    /// Sets how many drafts the speculative loop checks per block (`None` or 0: the plain loop),
+    /// whatever the flag said at load. For measuring both in one process.
+    pub fn set_draft_depth(&mut self, depth: Option<usize>) {
+        self.draft_depth = depth;
+    }
+
+    pub fn draft_depth(&self) -> Option<usize> {
+        self.draft_depth
+    }
+
+    /// The draft head, read from the checkpoint the first time it is needed. Whether the
+    /// checkpoint has one.
+    fn ensure_draft(&mut self) -> Result<bool> {
+        if self.draft.is_none() {
+            let loaded = DraftModel::load(&self.dir, &self.model)
+                .with_context(|| format!("load the draft head from {}", self.dir.display()))?;
+            if let Some(d) = &loaded {
+                let visits = self.model.num_visits();
+                ensure!(
+                    d.args().target_layer_ids.iter().all(|&id| id <= visits),
+                    "the draft reads layer visits {:?}, the model has {visits}",
+                    d.args().target_layer_ids
+                );
+            }
+            self.draft = Some(loaded);
+        }
+        Ok(matches!(self.draft, Some(Some(_))))
+    }
+
     /// The cost of the last request.
     pub fn last_run(&self) -> RunStats {
         self.last_run
@@ -457,13 +549,20 @@ impl Inkling2Backend {
             prompt.ids.len(),
             self.max_context
         );
+        let speculate =
+            sampling.is_none() && self.draft_depth.unwrap_or(0) > 0 && self.ensure_draft()?;
         let began = std::time::Instant::now();
         // The features come first, before the retained conversation is taken: an image that turns
         // out unreadable is the client's error, and must not cost it the caches.
         let hint = self.reusable_start(&prompt.keys);
         let image_began = std::time::Instant::now();
         let mut rows = self.image_rows(prompt, sources, hint)?;
-        let (mut cache, mut points, start) = self.take_reusable(&prompt.keys);
+        let Resume {
+            mut cache,
+            mut points,
+            start,
+            taps,
+        } = self.take_reusable(&prompt.keys);
         if start != hint {
             // The caches could not be taken back after all: the images before `start` are fed too.
             rows = self.image_rows(prompt, sources, start)?;
@@ -474,30 +573,78 @@ impl Inkling2Backend {
             .iter()
             .filter(|&&(at, len)| at + len > start)
             .count();
-        let logits = self.prefill(&prompt.ids, start, &mut cache, &mut points, rows.as_ref())?;
+        let mut ring = taps
+            .filter(|_| speculate)
+            .unwrap_or_else(|| TapRing::starting_at(start));
+        let logits = if speculate {
+            self.prefill_taps(
+                &prompt.ids,
+                start,
+                &mut cache,
+                &mut points,
+                rows.as_ref(),
+                &mut ring,
+            )?
+        } else {
+            self.prefill(&prompt.ids, start, &mut cache, &mut points, rows.as_ref())?
+        };
         let prefill_ms = began.elapsed().as_secs_f64() * 1e3;
         let decode_began = std::time::Instant::now();
 
         let mut rng = Xorshift64::new(crate::resolve_sampling_seed(ov));
         let mut seen: Vec<u32> = prompt.ids.clone();
         let mut generated: Vec<u32> = Vec::new();
-        let mut logits = logits;
-        while generated.len() < max_new_tokens {
-            let token = pick(&logits, &seen, sampling.as_ref(), &mut rng)?;
-            generated.push(token);
-            let stop = on_token(token)?;
-            if self.eos.contains(&token) {
-                // The end of the turn is part of what a reply read back will contain.
-                self.model.advance(&[token], &mut cache)?;
-                seen.push(token);
-                break;
-            }
-            if stop || generated.len() >= max_new_tokens {
-                break;
-            }
-            logits = self.model.forward(&[token], &mut cache, true)?;
-            logits.eval()?;
-            seen.push(token);
+        let mut spec = SpecStats::default();
+        if speculate {
+            let draft = self
+                .draft
+                .as_ref()
+                .and_then(Option::as_ref)
+                .context("no draft head")?;
+            let mut context = draft.context_from(&ring)?;
+            let plan = SpecPlan {
+                model: &self.model,
+                tap_ids: &draft.args().target_layer_ids,
+                keep: draft.args().context_rows,
+                eos: &self.eos,
+                max_new_tokens,
+                depth: self
+                    .draft_depth
+                    .unwrap_or(0)
+                    .min(draft.args().drafts_per_block()),
+            };
+            run_speculative(
+                &plan,
+                &mut cache,
+                &mut ring,
+                &mut seen,
+                &mut generated,
+                &logits,
+                on_token,
+                &mut spec,
+                &mut |anchor, rows, want, _| {
+                    if want == 0 {
+                        if let Some(rows) = rows {
+                            draft.extend(&mut context, rows)?;
+                        }
+                        return Ok(Vec::new());
+                    }
+                    Ok(draft.draft(&mut context, rows, anchor, &self.model)?.tokens)
+                },
+            )?;
+        } else {
+            run_plain(
+                &self.model,
+                &self.eos,
+                &mut cache,
+                &mut seen,
+                &mut generated,
+                logits,
+                max_new_tokens,
+                sampling.as_ref(),
+                &mut rng,
+                on_token,
+            )?;
         }
         points.push((cache.len(), cache.conv_snapshot()?));
         self.last_run = RunStats {
@@ -508,13 +655,18 @@ impl Inkling2Backend {
             decode_ms: decode_began.elapsed().as_secs_f64() * 1e3,
             images_encoded,
             image_ms,
+            spec,
         };
         let mut keys = prompt.keys.clone();
         keys.extend(seen[prompt.ids.len()..].iter().map(|&t| (t, 0)));
+        if speculate {
+            ring.eval()?;
+        }
         self.retained = Some(Retained {
             keys,
             cache,
             points,
+            taps: speculate.then_some(ring),
         });
         Ok(generated)
     }
@@ -594,12 +746,14 @@ impl Inkling2Backend {
     }
 
     /// The retained caches taken back to the longest point `prompt` shares with them, or fresh
-    /// caches. Returns the caches, the points still valid, and how many prompt tokens they hold.
-    fn take_reusable(
-        &mut self,
-        prompt: &[Key],
-    ) -> (Inkling2Cache, Vec<(usize, ConvSnapshot)>, usize) {
-        let fresh = |model: &Inkling2Model| (model.make_cache(), Vec::new(), 0);
+    /// caches, with the points still valid, how many prompt tokens they hold and their taps.
+    fn take_reusable(&mut self, prompt: &[Key]) -> Resume {
+        let fresh = |model: &Inkling2Model| Resume {
+            cache: model.make_cache(),
+            points: Vec::new(),
+            start: 0,
+            taps: None,
+        };
         let Some(mut kept) = self.retained.take() else {
             return fresh(&self.model);
         };
@@ -616,7 +770,16 @@ impl Inkling2Backend {
             return fresh(&self.model);
         }
         kept.points.truncate(at + 1);
-        (kept.cache, kept.points, len)
+        // The taps go back with the caches; if they cannot, the draft starts from what is fed next.
+        let taps = kept
+            .taps
+            .and_then(|mut t| t.truncate_to(len).ok().map(|()| t));
+        Resume {
+            cache: kept.cache,
+            points: kept.points,
+            start: len,
+            taps,
+        }
     }
 
     /// Feeds `prompt[start..]` and returns the logits of its last token. Records the points a
@@ -644,6 +807,196 @@ impl Inkling2Backend {
         points.push((prompt.len(), cache.conv_snapshot()?));
         Ok(logits)
     }
+}
+
+impl Inkling2Backend {
+    /// [`Self::prefill`] that also keeps the draft head's taps of the fed positions in `ring`.
+    fn prefill_taps(
+        &self,
+        prompt: &[u32],
+        start: usize,
+        cache: &mut Inkling2Cache,
+        points: &mut Vec<(usize, ConvSnapshot)>,
+        images: Option<&ImageRows>,
+        ring: &mut TapRing,
+    ) -> Result<Array> {
+        let draft = self
+            .draft
+            .as_ref()
+            .and_then(Option::as_ref)
+            .context("no draft head")?;
+        let (tap_ids, keep) = (&draft.args().target_layer_ids, draft.args().context_rows);
+        let last = prompt.len() - 1;
+        if last > start {
+            for chunk in prompt[start..last].chunks(PREFILL_CHUNK) {
+                let taps = self.model.advance_taps(chunk, cache, tap_ids, images)?;
+                ring.push(&taps, keep)?;
+            }
+            points.push((last, cache.conv_snapshot()?));
+        }
+        let (logits, taps) =
+            self.model
+                .forward_taps(&prompt[last..], cache, true, tap_ids, images, false)?;
+        logits.eval()?;
+        taps.eval()?;
+        cache.eval_state()?;
+        ring.push(&taps, keep)?;
+        points.push((prompt.len(), cache.conv_snapshot()?));
+        Ok(logits)
+    }
+}
+
+/// The plain decode loop: the next token from the logits, fed back, until the end-of-turn marker
+/// (fed too, so a reply read back continues from it), a stop from `on_token`, or the limit.
+#[allow(clippy::too_many_arguments)]
+fn run_plain(
+    model: &Inkling2Model,
+    eos: &[u32],
+    cache: &mut Inkling2Cache,
+    seen: &mut Vec<u32>,
+    generated: &mut Vec<u32>,
+    mut logits: Array,
+    max_new_tokens: usize,
+    sampling: Option<&SamplingConfig>,
+    rng: &mut Xorshift64,
+    on_token: &mut dyn FnMut(u32) -> Result<bool>,
+) -> Result<()> {
+    while generated.len() < max_new_tokens {
+        let token = pick(&logits, seen, sampling, rng)?;
+        generated.push(token);
+        let stop = on_token(token)?;
+        if eos.contains(&token) {
+            model.advance(&[token], cache)?;
+            seen.push(token);
+            break;
+        }
+        if stop || generated.len() >= max_new_tokens {
+            break;
+        }
+        logits = model.forward(&[token], cache, true)?;
+        logits.eval()?;
+        seen.push(token);
+    }
+    Ok(())
+}
+
+/// What the speculative loop needs besides its state.
+struct SpecPlan<'a> {
+    model: &'a Inkling2Model,
+    /// The layer visits whose stream the draft head reads.
+    tap_ids: &'a [usize],
+    /// Rows of taps the ring keeps.
+    keep: usize,
+    eos: &'a [u32],
+    max_new_tokens: usize,
+    /// Most drafts checked per block.
+    depth: usize,
+}
+
+/// The greedy decode loop with a drafter: each cycle `propose` gives the block after the newest
+/// token, the model checks `[that token, drafts...]` in one pass, and the tokens it would itself
+/// have chosen are the ones kept (the leading drafts it agrees with, and its own choice after
+/// them). The positions after the last kept one are rolled back. Ends where the plain loop does:
+/// at the end-of-turn marker (fed), a stop from `on_token`, or the limit.
+///
+/// `propose(anchor, rows, want, generated)` returns `want` drafts (or more) for the block after
+/// `anchor`, the newest token, with `rows` the taps of the positions fed since the last call and
+/// `generated` the number of tokens so far; with `want == 0` it only takes in `rows`.
+#[allow(clippy::too_many_arguments)]
+fn run_speculative(
+    plan: &SpecPlan<'_>,
+    cache: &mut Inkling2Cache,
+    ring: &mut TapRing,
+    seen: &mut Vec<u32>,
+    generated: &mut Vec<u32>,
+    first_logits: &Array,
+    on_token: &mut dyn FnMut(u32) -> Result<bool>,
+    stats: &mut SpecStats,
+    propose: &mut dyn FnMut(u32, Option<&Array>, usize, usize) -> Result<Vec<u32>>,
+) -> Result<()> {
+    let mut pending: Option<Array> = None;
+
+    // Whether a token ends the turn: the marker, a stop from the sink, or the limit.
+    enum Flow {
+        More,
+        Done { marker: bool },
+    }
+    let mut emit = |token: u32, generated: &mut Vec<u32>| -> Result<Flow> {
+        generated.push(token);
+        let stop = on_token(token)?;
+        Ok(if plan.eos.contains(&token) {
+            Flow::Done { marker: true }
+        } else if stop || generated.len() >= plan.max_new_tokens {
+            Flow::Done { marker: false }
+        } else {
+            Flow::More
+        })
+    };
+
+    let mut anchor = pick(first_logits, seen, None, &mut Xorshift64::new(0))?;
+    let mut flow = emit(anchor, generated)?;
+    while matches!(flow, Flow::More) {
+        let remaining = plan.max_new_tokens - generated.len();
+        let k = plan.depth.min(remaining.saturating_sub(1));
+
+        let drafted_at = std::time::Instant::now();
+        let block = propose(anchor, pending.take().as_ref(), k, generated.len())?;
+        ensure!(
+            block.len() >= k,
+            "the drafter gave {} tokens for {k}",
+            block.len()
+        );
+        stats.draft_ms += drafted_at.elapsed().as_secs_f64() * 1e3;
+
+        let verified_at = std::time::Instant::now();
+        let mut ids = Vec::with_capacity(k + 1);
+        ids.push(anchor);
+        ids.extend_from_slice(&block[..k]);
+        let (logits, taps) = plan.model.verify(&ids, cache, plan.tap_ids)?;
+        let choice = mlx_rs::ops::indexing::argmax_axis(&logits, -1, false)?;
+        mlx_rs::transforms::eval([&choice, &taps])?;
+        let chosen: Vec<u32> = choice
+            .as_dtype(mlx_rs::Dtype::Uint32)?
+            .as_slice::<u32>()
+            .to_vec();
+        stats.verify_ms += verified_at.elapsed().as_secs_f64() * 1e3;
+
+        let agreed = (0..k).take_while(|&i| block[i] == chosen[i]).count();
+        stats.cycles += 1;
+        stats.drafted += k;
+        stats.accepted += agreed;
+
+        // Emit the model's own tokens in order, until one ends the turn.
+        let mut kept = 0;
+        for &token in &chosen[..=agreed] {
+            kept += 1;
+            flow = emit(token, generated)?;
+            if !matches!(flow, Flow::More) {
+                break;
+            }
+        }
+        // The pass fed `[anchor, drafts...]`; what stays is the anchor and the kept tokens but the
+        // last, which is the next anchor and not fed yet.
+        let rejected = ids.len() - kept;
+        if rejected > 0 {
+            cache.rollback(rejected)?;
+        }
+        let rows = taps.try_index((.., ..kept as i32, ..))?;
+        ring.push(&rows, plan.keep)?;
+        pending = Some(rows);
+        seen.push(anchor);
+        seen.extend_from_slice(&chosen[..kept - 1]);
+        anchor = chosen[kept - 1];
+    }
+    if let Flow::Done { marker: true } = flow {
+        // The end of the turn is part of what a reply read back will contain.
+        let taps = plan
+            .model
+            .advance_taps(&[anchor], cache, plan.tap_ids, None)?;
+        ring.push(&taps, plan.keep)?;
+        seen.push(anchor);
+    }
+    Ok(())
 }
 
 /// The next token from `[1, 1, vocab]` logits: the largest, or a draw under `sampling`.
@@ -816,6 +1169,322 @@ mod tests {
 /// LUMEN_INKLING2_MODEL_DIR=~/.slotstream/models/Inkling-2-Mini-oQ4e-mtp \
 ///   cargo test -p lumen-mlx --features mlx-native --lib inkling2::backend -- --ignored --test-threads=1
 /// ```
+/// The speculative loop against the plain one on the tiny replica, with a drafter that is told the
+/// plain continuation and corrupts it where a case wants: the kept tokens, the rollback, the end of
+/// the turn and the limits must come out as the plain loop's, whatever the drafter says.
+#[cfg(test)]
+mod speculative_tests {
+    use super::*;
+    use crate::inkling2::tests::{fixture_dir, load_replica};
+
+    const TAPS: [usize; 4] = [5, 23, 41, 48];
+    const KEEP: usize = 11;
+
+    struct Outcome {
+        generated: Vec<u32>,
+        seen: Vec<u32>,
+        cache_len: usize,
+        ring_end: usize,
+        stats: SpecStats,
+    }
+
+    fn prompt() -> Vec<u32> {
+        let want =
+            Array::load_safetensors(fixture_dir().join("reference").join("outputs.safetensors"))
+                .expect("reference");
+        want["ids"].as_slice::<i32>()[..30]
+            .iter()
+            .map(|&t| t as u32)
+            .collect()
+    }
+
+    /// The prompt fed, as the backend feeds it: all but the last token, then the last one for logits.
+    fn prefilled(model: &Inkling2Model, prompt: &[u32]) -> (Inkling2Cache, TapRing, Array) {
+        let mut cache = model.make_cache();
+        let mut ring = TapRing::new();
+        let last = prompt.len() - 1;
+        let taps = model
+            .advance_taps(&prompt[..last], &mut cache, &TAPS, None)
+            .unwrap();
+        ring.push(&taps, KEEP).unwrap();
+        let (logits, taps) = model
+            .forward_taps(&prompt[last..], &mut cache, true, &TAPS, None, false)
+            .unwrap();
+        logits.eval().unwrap();
+        taps.eval().unwrap();
+        ring.push(&taps, KEEP).unwrap();
+        (cache, ring, logits)
+    }
+
+    /// Runs the plain loop and returns its outcome, stopping after `stop_after` tokens when given.
+    fn run_plain_case(
+        model: &Inkling2Model,
+        eos: &[u32],
+        prompt: &[u32],
+        max_new: usize,
+        stop_after: Option<usize>,
+    ) -> Outcome {
+        let (mut cache, _ring, logits) = prefilled(model, prompt);
+        let (mut seen, mut generated) = (prompt.to_vec(), Vec::new());
+        let mut calls = 0usize;
+        run_plain(
+            model,
+            eos,
+            &mut cache,
+            &mut seen,
+            &mut generated,
+            logits,
+            max_new,
+            None,
+            &mut Xorshift64::new(1),
+            &mut |_| {
+                calls += 1;
+                Ok(stop_after == Some(calls))
+            },
+        )
+        .unwrap();
+        Outcome {
+            cache_len: cache.len(),
+            ring_end: cache.len(),
+            generated,
+            seen,
+            stats: SpecStats::default(),
+        }
+    }
+
+    /// The speculative loop with a drafter that proposes `oracle[at..at + want]`, with the entry at
+    /// block position `wrong` (if any) replaced by a token that cannot be right.
+    #[allow(clippy::too_many_arguments)]
+    fn run_spec_case(
+        model: &Inkling2Model,
+        eos: &[u32],
+        prompt: &[u32],
+        max_new: usize,
+        stop_after: Option<usize>,
+        depth: usize,
+        oracle: &[u32],
+        wrong: Option<usize>,
+        all_wrong: bool,
+    ) -> Outcome {
+        let (mut cache, mut ring, logits) = prefilled(model, prompt);
+        let (mut seen, mut generated) = (prompt.to_vec(), Vec::new());
+        let mut stats = SpecStats::default();
+        let plan = SpecPlan {
+            model,
+            tap_ids: &TAPS,
+            keep: KEEP,
+            eos,
+            max_new_tokens: max_new,
+            depth,
+        };
+        let mut calls = 0usize;
+        let mut taken = 0usize;
+        run_speculative(
+            &plan,
+            &mut cache,
+            &mut ring,
+            &mut seen,
+            &mut generated,
+            &logits,
+            &mut |_| {
+                calls += 1;
+                Ok(stop_after == Some(calls))
+            },
+            &mut stats,
+            &mut |_anchor, rows, want, at| {
+                if let Some(rows) = rows {
+                    taken += rows.shape()[1] as usize;
+                }
+                let mut block: Vec<u32> = (0..want.max(1))
+                    .map(|i| oracle.get(at + i).copied().unwrap_or(0))
+                    .collect();
+                for (i, t) in block.iter_mut().enumerate() {
+                    if all_wrong || wrong == Some(i) {
+                        *t = (*t + 1) % 250;
+                    }
+                }
+                Ok(block)
+            },
+        )
+        .unwrap();
+        // From the second cycle on, the drafter is handed the taps of the positions just fed.
+        assert!(
+            stats.cycles <= 1 || taken > 0,
+            "the drafter was never handed the taps of a fed position"
+        );
+        Outcome {
+            cache_len: cache.len(),
+            ring_end: ring.end(),
+            generated,
+            seen,
+            stats,
+        }
+    }
+
+    fn same(label: &str, got: &Outcome, want: &Outcome) {
+        assert_eq!(got.generated, want.generated, "{label}: the tokens");
+        assert_eq!(got.seen, want.seen, "{label}: the tokens fed");
+        assert_eq!(got.cache_len, want.cache_len, "{label}: the cache length");
+        assert_eq!(
+            got.ring_end, got.cache_len,
+            "{label}: the taps end where the cache does"
+        );
+    }
+
+    #[test]
+    fn a_drafter_that_is_right_wrong_or_half_right_changes_nothing_but_speed() {
+        let model = load_replica();
+        let prompt = prompt();
+        let free = run_plain_case(&model, &[], &prompt, 30, None);
+        for depth in [3usize, 7] {
+            // Right: every draft is kept and a cycle gives depth + 1 tokens.
+            let right = run_spec_case(
+                &model,
+                &[],
+                &prompt,
+                30,
+                None,
+                depth,
+                &free.generated,
+                None,
+                false,
+            );
+            same(&format!("right, depth {depth}"), &right, &free);
+            assert_eq!(right.stats.accepted, right.stats.drafted, "depth {depth}");
+            assert!(
+                right.stats.tokens_per_cycle() > depth as f64 * 0.5,
+                "depth {depth}"
+            );
+            // Wrong at one position of the block: the tokens before it are kept, the rest rolled back.
+            for at in [0usize, 2, 6] {
+                let case = run_spec_case(
+                    &model,
+                    &[],
+                    &prompt,
+                    30,
+                    None,
+                    depth,
+                    &free.generated,
+                    Some(at),
+                    false,
+                );
+                same(&format!("wrong at {at}, depth {depth}"), &case, &free);
+            }
+            // Wrong everywhere: one token a cycle, every draft rolled back.
+            let wrong = run_spec_case(
+                &model,
+                &[],
+                &prompt,
+                30,
+                None,
+                depth,
+                &free.generated,
+                None,
+                true,
+            );
+            same(&format!("all wrong, depth {depth}"), &wrong, &free);
+            assert_eq!(wrong.stats.accepted, 0);
+            assert_eq!(
+                wrong.stats.cycles, 29,
+                "the first token comes from the prefill"
+            );
+        }
+    }
+
+    #[test]
+    fn the_limit_the_marker_and_a_stop_end_the_turn_where_the_plain_loop_ends_it() {
+        let model = load_replica();
+        let prompt = prompt();
+        let free = run_plain_case(&model, &[], &prompt, 30, None);
+        // The limit, inside a block.
+        for limit in [1usize, 5, 8] {
+            let want = run_plain_case(&model, &[], &prompt, limit, None);
+            let got = run_spec_case(
+                &model,
+                &[],
+                &prompt,
+                limit,
+                None,
+                7,
+                &free.generated,
+                None,
+                false,
+            );
+            same(&format!("limit {limit}"), &got, &want);
+            assert_eq!(got.generated.len(), limit);
+        }
+        // The marker in the middle of an accepted block: it is the last token and it is fed.
+        for marker_at in [3usize, 10] {
+            let eos = [free.generated[marker_at]];
+            let want = run_plain_case(&model, &eos, &prompt, 30, None);
+            assert_eq!(
+                want.generated.len(),
+                marker_at + 1,
+                "the plain loop stops at the marker"
+            );
+            {
+                let depth = 7usize;
+                let got = run_spec_case(
+                    &model,
+                    &eos,
+                    &prompt,
+                    30,
+                    None,
+                    depth,
+                    &free.generated,
+                    None,
+                    false,
+                );
+                same(
+                    &format!("marker at {marker_at}, depth {depth}"),
+                    &got,
+                    &want,
+                );
+            }
+        }
+        // A stop from the sink after the 7th token: not fed, as in the plain loop.
+        let want = run_plain_case(&model, &[], &prompt, 30, Some(7));
+        {
+            let depth = 3usize;
+            let got = run_spec_case(
+                &model,
+                &[],
+                &prompt,
+                30,
+                Some(7),
+                depth,
+                &free.generated,
+                None,
+                false,
+            );
+            same(&format!("stop at 7, depth {depth}"), &got, &want);
+            assert_eq!(got.generated.len(), 7);
+        }
+    }
+
+    #[test]
+    fn the_drafter_is_asked_for_nothing_when_a_cycle_has_one_token_left() {
+        let model = load_replica();
+        let prompt = prompt();
+        let free = run_plain_case(&model, &[], &prompt, 30, None);
+        // With 2 tokens allowed, the first comes from the prefill and the second from one cycle
+        // that checks no draft at all (its one token is the limit).
+        let got = run_spec_case(
+            &model,
+            &[],
+            &prompt,
+            2,
+            None,
+            7,
+            &free.generated,
+            None,
+            false,
+        );
+        assert_eq!((got.stats.cycles, got.stats.drafted), (1, 0));
+        assert_eq!(got.generated.len(), 2);
+    }
+}
+
 #[cfg(test)]
 mod real_checkpoint_tests {
     use super::*;

@@ -1301,18 +1301,36 @@ impl Inkling2Model {
         Ok(taps)
     }
 
+    /// [`Self::forward_with`] that also returns the stream at the `tap_ids` for each fed token,
+    /// `[1, L, tap_ids.len() * H]` (the taps are not cut to the last position with `last_only`).
+    /// With `keep_windows` the pass keeps its convolution windows, so
+    /// [`Inkling2Cache::rollback`] can take back positions of it. The graph is lazy.
+    pub fn forward_taps(
+        &self,
+        ids: &[u32],
+        cache: &mut Inkling2Cache,
+        last_only: bool,
+        tap_ids: &[usize],
+        images: Option<&ImageRows>,
+        keep_windows: bool,
+    ) -> Result<(Array, Array)> {
+        let (mut hidden, taps) = self.run_tapped(ids, cache, tap_ids, images, keep_windows)?;
+        if last_only {
+            let len = hidden.shape()[1];
+            hidden = hidden.try_index((.., (len - 1).., ..))?;
+        }
+        Ok((self.logits_from_hidden(&hidden)?, taps))
+    }
+
     /// The pass that checks a block of drafted tokens: logits `[1, L, vocab]` for every position
-    /// and the taps `[1, L, tap_ids.len() * H]`, with the convolution windows kept so
-    /// [`Inkling2Cache::rollback`] can take back the positions that were not accepted. The graph
-    /// is lazy.
+    /// and the taps `[1, L, tap_ids.len() * H]`, with the convolution windows kept.
     pub fn verify(
         &self,
         ids: &[u32],
         cache: &mut Inkling2Cache,
         tap_ids: &[usize],
     ) -> Result<(Array, Array)> {
-        let (hidden, taps) = self.run_tapped(ids, cache, tap_ids, None, true)?;
-        Ok((self.logits_from_hidden(&hidden)?, taps))
+        self.forward_taps(ids, cache, false, tap_ids, None, true)
     }
 
     fn run_tapped(
