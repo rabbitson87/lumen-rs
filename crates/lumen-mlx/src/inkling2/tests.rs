@@ -509,3 +509,47 @@ fn a_bad_tap_or_token_id_is_refused_before_anything_runs() {
     assert!(model.advance(&[1 << 30], &mut cache).is_err());
     assert_eq!(cache.len(), 0);
 }
+
+/// The compiled regions (`fused.rs`) run the plain ops' arithmetic in the same order and dtypes:
+/// the same prefill, single-token steps and verify block with them on and off give the same
+/// logits (they came out bit-identical; the bound allows float noise on another GPU).
+#[test]
+fn the_compiled_regions_give_the_logits_the_plain_ops_give() {
+    let model = load_replica();
+    let ids = prompt_ids(&reference("outputs.safetensors"));
+    let run = |fused_on: bool| -> Vec<Vec<f32>> {
+        super::fused::fuse::with(fused_on, || {
+            let mut cache = model.make_cache();
+            let mut out = vec![host_f32(
+                &model.forward(&ids[..8], &mut cache, true).unwrap(),
+            )];
+            for &t in &ids[8..12] {
+                out.push(host_f32(&model.forward(&[t], &mut cache, true).unwrap()));
+            }
+            let (logits, _) = model.verify(&ids[12..16], &mut cache, &[5]).unwrap();
+            out.push(host_f32(&logits));
+            out
+        })
+    };
+    let (plain, fused) = (run(false), run(true));
+    assert_eq!(plain.len(), fused.len());
+    for (step, (p, f)) in plain.iter().zip(&fused).enumerate() {
+        assert_eq!(p.len(), f.len());
+        let (mut worst, mut scale) = (0.0f32, 0.0f32);
+        for (a, b) in p.iter().zip(f) {
+            assert_eq!(
+                a.is_finite(),
+                b.is_finite(),
+                "step {step}: a masked id differs"
+            );
+            if a.is_finite() {
+                worst = worst.max((a - b).abs());
+                scale = scale.max(a.abs());
+            }
+        }
+        assert!(
+            worst <= 1e-6 * scale.max(1.0),
+            "step {step}: the compiled regions differ from the plain ops by {worst} of {scale}"
+        );
+    }
+}

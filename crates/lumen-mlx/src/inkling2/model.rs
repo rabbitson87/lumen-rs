@@ -14,6 +14,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use mlx_rs::ops::indexing::{TryIndexOp, take_axis};
 use mlx_rs::{Array, Dtype};
 
+use super::fused;
 use super::ops::{
     attn_res_mix, banded_sink_attention, dynamic_conv, dynamic_conv_scale, l2_clip, mix_messages,
     next_conv_state, owned, route_topk, scalar, softcap, softcapped_swiglu, static_conv,
@@ -283,7 +284,26 @@ impl AttnResQuery {
         })
     }
 
-    fn mix(&self, blocks: &[Array], partial_n: &Array) -> Result<Array> {
+    /// `fuse` is the layer's shared constants when the compiled mix may serve this call.
+    fn mix(
+        &self,
+        blocks: &[Array],
+        partial_n: &Array,
+        fuse: Option<&fused::SharedCfg>,
+    ) -> Result<Array> {
+        if let Some(cfg) = fuse
+            && partial_n.shape()[1] as usize <= fused::DECODE_ROWS
+        {
+            let mut args: Vec<&Array> = vec![partial_n, &self.query];
+            args.extend(blocks);
+            let cfg = fused::SharedCfg {
+                mix_scale: self.scale,
+                ..*cfg
+            };
+            if let Some(out) = fused::attn_res_mix(cfg, &args)? {
+                return Ok(out);
+            }
+        }
         attn_res_mix(blocks, partial_n, &self.query, self.scale)
     }
 }
@@ -505,6 +525,15 @@ impl Attention {
                     }
                     _ => bail!("a local layer takes either one input or all three"),
                 };
+                if let Some(done) = self.project_fused(
+                    fused::project_local,
+                    self.sconv_scale,
+                    &[&q, &k, &v, &r, k_state, v_state, k_conv, v_conv],
+                    tau,
+                    (&gate, &sink),
+                )? {
+                    return Ok(done);
+                }
                 let (k, k_window) = static_conv(&k, k_conv, k_state, self.sconv_scale)?;
                 let (v, v_window) = static_conv(&v, v_conv, v_state, self.sconv_scale)?;
                 (q, k, v, r, gate, sink, k_window, v_window)
@@ -528,6 +557,15 @@ impl Attention {
                 let (q, r, gate, sink) = (next()?, next()?, next()?, next()?);
                 let kp = k_proj.apply(xk)?;
                 let vp = v_proj.apply(xv)?;
+                if let Some(done) = self.project_fused(
+                    fused::project_global,
+                    self.dconv_scale,
+                    &[&q, &r, &kp, &vp, k_state, v_state, k_static, v_static],
+                    tau,
+                    (&gate, &sink),
+                )? {
+                    return Ok(done);
+                }
                 let (k, k_window) = dynamic_conv(
                     &kp.try_index((.., .., ..dkv))?,
                     &kp.try_index((.., .., dkv..))?,
@@ -588,6 +626,54 @@ impl Attention {
             k_window,
             v_window,
         })
+    }
+
+    /// The compiled projection region (`fused.rs`) for decode-sized inputs: `lead` are the pieces
+    /// the region starts from (q, k, v, r with their states and taps, or the global layer's), after
+    /// which come the layer's scales and relative projection and the position scaling. `None` when
+    /// the region does not serve this call (the plain ops do).
+    fn project_fused(
+        &self,
+        region: fn(fused::ProjCfg, &[&Array]) -> Result<Option<Vec<Array>>>,
+        conv_scale: f32,
+        lead: &[&Array],
+        tau: Option<&Array>,
+        (gate, sink): (&Array, &Array),
+    ) -> Result<Option<Projected>> {
+        if !fused::enabled() || lead[0].shape()[1] as usize > fused::DECODE_ROWS {
+            return Ok(None);
+        }
+        let cfg = fused::ProjCfg {
+            heads: self.dims.heads as i32,
+            kv_heads: self.dims.kv_heads as i32,
+            head_dim: self.dims.head_dim as i32,
+            d_rel: self.d_rel,
+            dkv: self.dkv,
+            qk_clip: self.qk_clip,
+            rel_clip: self.rel_clip,
+            conv_scale,
+        };
+        let mut args: Vec<&Array> = lead.to_vec();
+        args.extend([&self.q_scale, &self.r_scale, &self.rel_proj]);
+        args.extend(tau);
+        let Some(out) = region(cfg, &args)? else {
+            return Ok(None);
+        };
+        let mut out = out.into_iter();
+        let mut next = || {
+            out.next()
+                .ok_or_else(|| anyhow!("the projection region returned too few arrays"))
+        };
+        Ok(Some(Projected {
+            q: next()?,
+            k: next()?,
+            v: next()?,
+            rel: next()?,
+            gate: gate.clone(),
+            sink: sink.clone(),
+            k_window: next()?,
+            v_window: next()?,
+        }))
     }
 
     fn attend(&self, p: &Projected, kv: &mut NativeKvCache) -> Result<Array> {
@@ -821,6 +907,63 @@ impl Layer {
         })
     }
 
+    /// The convolution of an attention or MLP output and the residual it joins, in float32: `h`
+    /// plus the output, or the output alone at a block boundary (`h` is `None`). Returns the
+    /// residual and the convolution's padded input window.
+    fn conv_residual(
+        &self,
+        fuse: Option<&fused::SharedCfg>,
+        x: &Array,
+        w: &Array,
+        state: &Array,
+        h: Option<&Array>,
+    ) -> Result<(Array, Array)> {
+        if let Some(cfg) = fuse {
+            let mut args: Vec<&Array> = vec![x, w, state];
+            args.extend(h);
+            if let Some(out) = fused::conv_residual(*cfg, &args)? {
+                let mut out = out.into_iter();
+                if let (Some(residual), Some(window)) = (out.next(), out.next()) {
+                    return Ok((residual, window));
+                }
+                bail!("the residual region returned too few arrays");
+            }
+        }
+        let (y, window) = static_conv(x, w, state, self.attn.sconv_scale)?;
+        let y = y.as_dtype(Dtype::Float32)?;
+        let residual = match h {
+            Some(h) => mlx_rs::ops::add(h.as_dtype(Dtype::Float32)?, y)?,
+            None => y,
+        };
+        Ok((residual, window))
+    }
+
+    /// The MLP output's convolution added to `residual`, in the layer's `dtype`: the visit's
+    /// output and the convolution's padded input window.
+    fn conv_next(
+        &self,
+        fuse: Option<&fused::SharedCfg>,
+        m: &Array,
+        w: &Array,
+        state: &Array,
+        residual: &Array,
+        dtype: Dtype,
+    ) -> Result<(Array, Array)> {
+        if let Some(cfg) = fuse
+            && m.dtype() == dtype
+            && let Some(out) = fused::conv_next(*cfg, &[m, w, state, residual])?
+        {
+            let mut out = out.into_iter();
+            if let (Some(next), Some(window)) = (out.next(), out.next()) {
+                return Ok((next, window));
+            }
+            bail!("the output region returned too few arrays");
+        }
+        let (y, window) = static_conv(m, w, state, self.attn.sconv_scale)?;
+        let next = mlx_rs::ops::add(residual, y.as_dtype(Dtype::Float32)?)?.as_dtype(dtype)?;
+        Ok((next, window))
+    }
+
     /// One visit: `h` is the partial block sum `[B, L, H]`; `blocks` the completed blocks, extended
     /// at a block boundary; `bank` the previous loop pass's messages.
     fn forward(
@@ -835,6 +978,22 @@ impl Layer {
         let dtype = h.dtype();
         let (b, length, hidden) = (h.shape()[0], h.shape()[1], h.shape()[2]);
         let taps = args.sconv_kernel_size;
+        // The compiled regions (`fused.rs`) serve decode-sized inputs; this layer's constants.
+        let fuse = (fused::enabled() && length as usize <= fused::DECODE_ROWS).then_some(
+            fused::SharedCfg {
+                conv_scale: self.attn.sconv_scale,
+                mix_scale: self.mlp_input.scale,
+                round_loop_mix: cx.round_loop_mix,
+            },
+        );
+        let mix_msgs = |x: &Array, message: &Array, down: &Array, gain_forget: &Array| {
+            if let Some(cfg) = fuse
+                && let Some(out) = fused::mix_messages(cfg, &[x, message, down, gain_forget])?
+            {
+                return Ok(out);
+            }
+            mix_messages(x, message, down, gain_forget, cx.round_loop_mix)
+        };
         let widths = [self.attn.dkv, self.attn.dkv, hidden, hidden];
         let mut states = Vec::with_capacity(4);
         for (slot, width) in widths.into_iter().enumerate() {
@@ -845,7 +1004,9 @@ impl Layer {
         }
         let tau = self.attn.log_tau(cache.kv.offset(), length as usize)?;
         let messages = match (bank, &self.loop_ctl) {
-            (Some(bk), Some(ctl)) => Some(ctl.message.mix(&bk.blocks, &bk.partial_n)?),
+            (Some(bk), Some(ctl)) => {
+                Some(ctl.message.mix(&bk.blocks, &bk.partial_n, fuse.as_ref())?)
+            }
             (Some(_), None) => bail!(
                 "layer {} got a message bank but is not in the loop core",
                 self.idx
@@ -869,7 +1030,7 @@ impl Layer {
                 .attn_input
                 .as_ref()
                 .ok_or_else(|| anyhow!("layer {} has no attn_input", self.idx))?
-                .mix(blocks, &h_n)?;
+                .mix(blocks, &h_n, fuse.as_ref())?;
             xq = mixed.try_index((.., .., 0))?;
             if self.sliding {
                 (xk, xv) = (xq.clone(), xq.clone());
@@ -883,12 +1044,11 @@ impl Layer {
             let x = mlx_rs::ops::stack_axis(&[&xq, &xk, &xv], 0)?;
             let message =
                 mlx_rs::ops::transpose_axes(&m.try_index((.., .., ..3, ..))?, &[2, 0, 1, 3])?;
-            let mixed = mix_messages(
+            let mixed = mix_msgs(
                 &x,
                 &message,
                 &ctl.down.try_index(..3)?,
                 &ctl.gain_forget.try_index(..3)?,
-                cx.round_loop_mix,
             )?;
             (xq, xk, xv) = (
                 mixed.try_index(0)?,
@@ -936,33 +1096,39 @@ impl Layer {
         // -- the residual and the MLP --
         let a = self.attn.output(&out, &p.gate)?;
         profile::mark("attn gate + o_proj", &[&a])?;
-        let (a, attn_window) = static_conv(&a, &self.attn_conv, &states[2], self.attn.sconv_scale)?;
-        let residual = if self.is_boundary {
-            a.as_dtype(Dtype::Float32)?
-        } else {
-            mlx_rs::ops::add(h.as_dtype(Dtype::Float32)?, a.as_dtype(Dtype::Float32)?)?
-        };
+        let (residual, attn_window) = self.conv_residual(
+            fuse.as_ref(),
+            &a,
+            &self.attn_conv,
+            &states[2],
+            (!self.is_boundary).then_some(h),
+        )?;
         profile::mark("attn conv + residual", &[&residual, &attn_window])?;
         let mut y = self
             .mlp_input
-            .mix(blocks, &unit_rms(&residual)?)?
+            .mix(blocks, &unit_rms(&residual)?, fuse.as_ref())?
             .try_index((.., .., 0))?;
         profile::mark("mlp_input mix", &[&y])?;
         if let (Some(m), Some(ctl)) = (&messages, &self.loop_ctl) {
             let message = mlx_rs::ops::expand_dims(&m.try_index((.., .., 3))?, 0)?;
-            let mixed = mix_messages(
+            let mixed = mix_msgs(
                 &mlx_rs::ops::expand_dims(&y, 0)?,
                 &message,
                 &ctl.down.try_index(3..)?,
                 &ctl.gain_forget.try_index(3..)?,
-                cx.round_loop_mix,
             )?;
             y = mixed.try_index(0)?;
             profile::mark("loop message mix (mlp)", &[&y])?;
         }
         let m = self.mlp.forward(&norm(&y, &self.mlp_norm)?)?;
-        let (m, mlp_window) = static_conv(&m, &self.mlp_conv, &states[3], self.attn.sconv_scale)?;
-        let next = mlx_rs::ops::add(&residual, m.as_dtype(Dtype::Float32)?)?.as_dtype(dtype)?;
+        let (next, mlp_window) = self.conv_next(
+            fuse.as_ref(),
+            &m,
+            &self.mlp_conv,
+            &states[3],
+            &residual,
+            dtype,
+        )?;
         profile::mark("mlp conv + residual", &[&next, &mlp_window])?;
 
         cache.conv = [
@@ -1607,7 +1773,7 @@ impl Inkling2Model {
         }
         let x = self
             .final_input
-            .mix(&blocks, &unit_rms(&h.as_dtype(Dtype::Float32)?)?)?
+            .mix(&blocks, &unit_rms(&h.as_dtype(Dtype::Float32)?)?, None)?
             .try_index((.., .., 0))?;
         let out =
             mlx_rs::fast::rms_norm(&x, &self.norm, self.args.rms_norm_eps)?.as_dtype(h.dtype())?;

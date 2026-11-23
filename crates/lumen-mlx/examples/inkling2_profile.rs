@@ -121,6 +121,12 @@ fn main() -> Result<()> {
         args.remove(at);
         return launch_floor(11_600);
     }
+    let block = if let Some(at) = args.iter().position(|a| a == "--block") {
+        args.remove(at);
+        true
+    } else {
+        false
+    };
     let mut flag_value = |name: &str| -> Option<String> {
         let at = args.iter().position(|a| a == name)?;
         let value = args.get(at + 1).cloned();
@@ -162,6 +168,42 @@ fn main() -> Result<()> {
     let mut next = argmax(&row[row.len() - model.args().vocab_size..][..live]);
     let mut generated = Vec::new();
 
+    if block {
+        // What a pass over k + 1 tokens costs (the speculative loop's verify pass), each followed
+        // by a rollback of all but one token, so the cache grows by one per round.
+        let tap_ids = [5usize];
+        for k in [0usize, 1, 2, 3, 4, 6, 8] {
+            let ids = vec![next; k + 1];
+            let mut times = Vec::new();
+            let (mut prims, mut dispatches) = (0u64, 0u64);
+            lumen_mlx::inkling2::stage_reset();
+            for round in 0..24 {
+                let (_, d0) = mlx_rs::metal::cmd_buffer_stats().unwrap_or_default();
+                let (p0, _) = mlx_rs::metal::eval_gpu_stats().unwrap_or_default();
+                let t = Instant::now();
+                let (logits, _) = model.verify(&ids, &mut cache, &tap_ids)?;
+                logits.eval()?;
+                if round >= 4 {
+                    times.push(t.elapsed().as_secs_f64() * 1e3);
+                    let (_, d1) = mlx_rs::metal::cmd_buffer_stats().unwrap_or_default();
+                    let (p1, _) = mlx_rs::metal::eval_gpu_stats().unwrap_or_default();
+                    prims = p1.saturating_sub(p0);
+                    dispatches = d1.saturating_sub(d0);
+                }
+                cache.rollback(k)?;
+            }
+            println!(
+                "verify pass over {} tokens: {:.2} ms (median of {}); {prims} primitives, {dispatches} dispatches",
+                k + 1,
+                median(times.clone()),
+                times.len()
+            );
+            if let Some(report) = lumen_mlx::inkling2::stage_report() {
+                println!("{report}");
+            }
+        }
+        return Ok(());
+    }
     let mut recorded: Vec<Step> = Vec::new();
     let (mut cpu_start, mut wall_start) = (0u64, Instant::now());
     for step in 0..warm + steps {

@@ -24,6 +24,7 @@ value → on.
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
 | `LUMEN_INKLING2_DRAFT` | on | Behavior | `lumen_mlx::inkling2::backend::inkling2_draft` |
+| `LUMEN_INKLING2_FUSE` | on | Optimization | `lumen_mlx::inkling2::fused::fuse` |
 | `LUMEN_INKLING2_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::inkling2::profile::stage_sync` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
@@ -236,6 +237,13 @@ Speculative decoding for Inkling 2: the checkpoint's bundled DSpark draft head
  like single-token steps in bfloat16, so a greedy continuation can differ from the plain
  loop's where the two best tokens are within a bfloat16 step or two of each other (about 1
  position in 200 here); hence a behavior flag. `=0` runs the plain loop.
+
+### `LUMEN_INKLING2_FUSE`
+
+*Optimization, default on.*
+
+Serve the compiled (fused) forms of the Inkling 2 elementwise helpers: the length-1 decode
+ step makes a third of the kernel dispatches. `=0` restores the plain composed ops.
 
 ### `LUMEN_INKLING2_STAGE_SYNC`
 

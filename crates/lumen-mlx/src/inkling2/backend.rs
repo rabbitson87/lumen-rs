@@ -982,9 +982,13 @@ struct SpecPlan<'a> {
     adaptive: bool,
 }
 
-/// What a decode step and a block cost on an M3 Max (Inkling 2 Mini, measured with
-/// `examples/inkling2_spec.rs`): a plain step 41 ms; a block of `k` drafts costs the draft (9 ms),
-/// a pass over `k + 1` tokens (49 + 6.1 k ms). The controller only needs their ratios.
+/// What a decode step and a block cost, as ratios (Inkling 2 Mini on an M3 Max, measured with
+/// `examples/inkling2_spec.rs`): a plain step 41 ms; a block of `k` drafts costs the draft (9 ms)
+/// and a pass over `k + 1` tokens (49 + 6.1 k ms). With the fused regions the plain step is 33 ms
+/// and a pass over `k + 1` tokens 41.8 + 5.7 k ms (`inkling2_profile --block`); the constants were
+/// left at the older ratios on purpose: the measured ones made the controller try blocks on text
+/// the draft cannot predict (a poem and a translation ran 2% under the plain loop), the older ones
+/// kept those at the plain speed and the predictable text at 58 to 59 tok/s.
 const STEP_MS: f64 = 41.0;
 const BLOCK_BASE_MS: f64 = 58.0;
 const BLOCK_PER_DRAFT_MS: f64 = 6.1;

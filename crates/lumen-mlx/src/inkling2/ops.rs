@@ -13,6 +13,8 @@ use anyhow::{Result, ensure};
 use mlx_rs::ops::indexing::{TryIndexOp, take_along_axis, take_axis};
 use mlx_rs::{Array, Dtype};
 
+use super::fused;
+
 pub(super) fn scalar(v: f32) -> Array {
     Array::from_f32(v)
 }
@@ -49,6 +51,15 @@ pub(super) fn softcap(x: &Array, cap: f32) -> Result<Array> {
 /// `_l2_clip`: scale `x` by `scale`, then shrink each last-axis row to norm `threshold` if it is
 /// longer. Computed in float32, returned in `x`'s dtype.
 pub(super) fn l2_clip(x: &Array, scale: &Array, threshold: f32) -> Result<Array> {
+    if fused::enabled() {
+        return fused::l2_clip(x, scale, &scalar(threshold));
+    }
+    l2_clip_plain(x, scale, threshold)
+}
+
+/// [`l2_clip`] as plain ops: what the fused forms are checked against and what the compiled
+/// regions of `fused.rs` are traced from.
+pub(super) fn l2_clip_plain(x: &Array, scale: &Array, threshold: f32) -> Result<Array> {
     let xf = mlx_rs::ops::multiply(f32_of(x)?, scale)?;
     let squares = mlx_rs::ops::multiply(&xf, &xf)?;
     let norm = mlx_rs::ops::sqrt(mlx_rs::ops::sum_axis(&squares, -1, true)?)?;
@@ -62,6 +73,9 @@ pub(super) fn l2_clip(x: &Array, scale: &Array, threshold: f32) -> Result<Array>
 /// `tanh(g / gcap) * gcap * sigmoid(g) * (tanh(u / ucap) * ucap)`, in float32, in `gate`'s dtype.
 /// The sigmoid reads the raw gate, the first factor the capped one.
 pub(super) fn softcapped_swiglu(gate: &Array, up: &Array, gcap: f32, ucap: f32) -> Result<Array> {
+    if fused::enabled() {
+        return fused::softcapped_swiglu(gate, up, &scalar(gcap), &scalar(ucap));
+    }
     let dtype = gate.dtype();
     let g = f32_of(gate)?;
     let u = f32_of(up)?;
@@ -86,7 +100,12 @@ pub(super) fn owned(a: &Array) -> Result<Array> {
 pub(super) fn next_conv_state(window: &Array, taps: usize) -> Result<Array> {
     let len = window.shape()[1];
     let keep = taps as i32 - 1;
-    owned(&window.try_index((.., (len - keep)..len, ..))?)
+    let state = window.try_index((.., (len - keep)..len, ..))?;
+    // A decode-sized window is a few rows: the view pins nothing worth a copy kernel.
+    if fused::enabled() && (len - keep) as usize <= fused::DECODE_ROWS {
+        return Ok(state);
+    }
+    owned(&state)
 }
 
 /// `_static_conv`: a depthwise causal convolution with fixed taps. `w` is `[channels, taps]` and

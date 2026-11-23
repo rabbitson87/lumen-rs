@@ -23,6 +23,8 @@ mod config;
 mod draft;
 #[cfg(all(test, feature = "mlx-native"))]
 mod draft_tests;
+#[cfg(feature = "mlx-native")]
+mod fused;
 mod manifest;
 #[cfg(feature = "mlx-native")]
 mod model;

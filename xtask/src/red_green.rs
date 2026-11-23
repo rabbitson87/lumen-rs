@@ -2588,6 +2588,71 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "inkling2-fused-projection-halves-the-conv-scale",
+        symptom: "the compiled projection region scaled the short convolution's residual by another factor than the plain ops do, so every decode step's k and v (and with them every reply) drifted a little, with nothing to crash on",
+        revert: &[Mutation {
+            path: MLX,
+            find: "ex(super::ops::static_conv(&a[1], &a[6], &a[4], cfg.conv_scale))?;",
+            replace: "ex(super::ops::static_conv(&a[1], &a[6], &a[4], cfg.conv_scale * 0.5))?; // defect: the wrong residual scale",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-fused-projection-ignores-the-position-scaling",
+        symptom: "the compiled projection region of a global layer dropped the long-position scaling of q and the relative state, so a reply past the log-scaling floor attended with the wrong sharpness",
+        revert: &[Mutation {
+            path: MLX,
+            find: "(&a[0], k, v, &a[1]), (&a[8], &a[9], &a[10]), a.get(11))?;",
+            replace: "(&a[0], k, v, &a[1]), (&a[8], &a[9], &a[10]), a.get(99))?; // defect: no tau",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-fused-residual-forgets-the-stream",
+        symptom: "the compiled residual region returned the convolution's output alone where a non-boundary layer adds it to the stream, so every layer after the first lost what it was given",
+        revert: &[Mutation {
+            path: MLX,
+            find: "Some(h) => mlx_rs::ops::add(h.as_dtype(Dtype::Float32)?, y32)?,",
+            replace: "Some(_) => y32, // defect: the stream is not added",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-fused-mix-doubles-the-softmax-scale",
+        symptom: "the compiled attention-residual mix scaled its dots by another factor than the plain mix, so the depth sources were weighed wrongly in every layer",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        shared().mix_scale,\n",
+            replace: "        shared().mix_scale * 2.0, // defect: the wrong scale\n",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-fused-output-subtracts-the-mlp",
+        symptom: "the compiled output region subtracted the MLP's convolved output from the residual instead of adding it",
+        revert: &[Mutation {
+            path: MLX,
+            find: "mlx_rs::ops::add(&a[3], y.as_dtype(Dtype::Float32)?)?.as_dtype(a[0].dtype())?;",
+            replace: "mlx_rs::ops::subtract(&a[3], y.as_dtype(Dtype::Float32)?)?.as_dtype(a[0].dtype())?; // defect: subtracted",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2736,6 +2801,11 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "inkling2-pass-count-unbounded") => "inkling2/text_config.rs",
         (_, "inkling2-accept-takes-a-forbidden-draft") => "sampling.rs",
         (_, "inkling2-effort-number-rejected") => "types.rs",
+        (_, "inkling2-fused-projection-halves-the-conv-scale")
+        | (_, "inkling2-fused-projection-ignores-the-position-scaling")
+        | (_, "inkling2-fused-residual-forgets-the-stream")
+        | (_, "inkling2-fused-mix-doubles-the-softmax-scale")
+        | (_, "inkling2-fused-output-subtracts-the-mlp") => "inkling2/fused.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)
