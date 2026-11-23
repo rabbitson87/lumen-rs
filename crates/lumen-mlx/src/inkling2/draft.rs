@@ -206,14 +206,15 @@ pub struct DraftModel {
     markov: MarkovHead,
 }
 
-/// What one draft cycle computes, for the parity tests; the tokens are what the backend uses.
+/// What one draft cycle computes, for the parity tests; the tokens are what the backend uses. `n`
+/// is the number of tokens proposed: the block's `drafts`, or fewer when fewer were asked for.
 pub struct DraftOut {
     pub tokens: Vec<u32>,
-    /// `[1, drafts, H]`: the block's normalized output past the anchor.
+    /// `[1, n, H]`: the block's normalized output past the anchor, for the first `n` positions.
     pub hidden: Array,
-    /// `[1, drafts, vocab]`: the target head's output for it.
+    /// `[1, n, vocab]`: the target head's output for it.
     pub base_logits: Array,
-    /// `[1, drafts, vocab]`: after the Markov head, the softcap and the vocabulary mask.
+    /// `[1, n, vocab]`: after the Markov head, the softcap and the vocabulary mask.
     pub step_logits: Array,
 }
 
@@ -689,9 +690,11 @@ impl DraftModel {
 
     /// [`Self::propose`] for the first `count` tokens. The block itself is always computed whole
     /// (its positions attend to each other), but the Markov head runs left to right and each
-    /// token depends only on those before it, so stopping after `count` steps gives exactly the
-    /// first `count` tokens of the full block and skips the steps nobody reads: each is a pass
-    /// over the folded head and over the whole vocabulary.
+    /// token depends only on those before it, so stopping after `count` steps gives the first
+    /// `count` tokens of the full block (the head runs over `count` rows instead of the block's:
+    /// a different row count can pick another kernel and round a bf16 logit differently, which
+    /// can only move a near tie, and the target verifies every token) and skips the steps
+    /// nobody reads: each is a pass over the folded head and over the whole vocabulary.
     pub fn propose_up_to(
         &self,
         ctx: &DraftContext,
@@ -758,8 +761,12 @@ impl DraftModel {
             let gated = mlx_rs::ops::multiply(silu(&layer.gate.apply(&x)?)?, layer.up.apply(&x)?)?;
             h = mlx_rs::ops::add(&h, layer.down.apply(&gated)?)?;
         }
-        let hidden =
-            mlx_rs::fast::rms_norm(&h, &self.norm, a.rms_norm_eps)?.try_index((.., 1.., ..))?;
+        // Only the rows of the tokens asked for go through the target's head.
+        let hidden = mlx_rs::fast::rms_norm(&h, &self.norm, a.rms_norm_eps)?.try_index((
+            ..,
+            1..1 + wanted,
+            ..,
+        ))?;
         let base_logits = target.head_logits_raw(&hidden)?;
 
         // The Markov head, left to right: each position adds a transition from the token before.
