@@ -335,6 +335,15 @@ impl DraftContext {
         self.total
     }
 
+    /// Evaluates the keys and values of every layer (for timing the extension on its own).
+    pub fn eval(&self) -> Result<()> {
+        for (k, v) in self.rings.iter().flatten() {
+            k.eval()?;
+            v.eval()?;
+        }
+        Ok(())
+    }
+
     /// The keys and values layer `l` attends to, `[1, kv_heads, rows, head_dim]` each.
     #[cfg(test)]
     pub(super) fn ring(&self, l: usize) -> Option<(&Array, &Array)> {
@@ -650,10 +659,22 @@ impl DraftModel {
         anchor: u32,
         target: &Inkling2Model,
     ) -> Result<DraftOut> {
+        self.draft_up_to(ctx, rows, anchor, target, usize::MAX)
+    }
+
+    /// [`Self::draft`] for the first `count` proposed tokens only (at most the block's).
+    pub fn draft_up_to(
+        &self,
+        ctx: &mut DraftContext,
+        rows: Option<&Array>,
+        anchor: u32,
+        target: &Inkling2Model,
+        count: usize,
+    ) -> Result<DraftOut> {
         if let Some(rows) = rows {
             self.extend(ctx, rows)?;
         }
-        self.propose(ctx, anchor, target)
+        self.propose_up_to(ctx, anchor, target, count)
     }
 
     /// The block after `anchor` (see [`Self::draft`]): `block_size - 1` proposed tokens.
@@ -663,7 +684,23 @@ impl DraftModel {
         anchor: u32,
         target: &Inkling2Model,
     ) -> Result<DraftOut> {
+        self.propose_up_to(ctx, anchor, target, usize::MAX)
+    }
+
+    /// [`Self::propose`] for the first `count` tokens. The block itself is always computed whole
+    /// (its positions attend to each other), but the Markov head runs left to right and each
+    /// token depends only on those before it, so stopping after `count` steps gives exactly the
+    /// first `count` tokens of the full block and skips the steps nobody reads: each is a pass
+    /// over the folded head and over the whole vocabulary.
+    pub fn propose_up_to(
+        &self,
+        ctx: &DraftContext,
+        anchor: u32,
+        target: &Inkling2Model,
+        count: usize,
+    ) -> Result<DraftOut> {
         let a = &self.args;
+        ensure!(count >= 1, "a draft proposes at least one token");
         ensure!(ctx.total > 0, "the draft has no context rows yet");
         let last = ctx
             .last_row
@@ -671,6 +708,7 @@ impl DraftModel {
             .context("the draft context has no newest row")?;
         let (heads, kvh, hd) = (a.num_heads as i32, a.num_kv_heads as i32, a.head_dim as i32);
         let drafts = a.drafts_per_block() as i32;
+        let wanted = count.min(a.drafts_per_block()) as i32;
         let block = a.block_size as i32;
         let total = ctx.total as i32;
 
@@ -741,7 +779,7 @@ impl DraftModel {
         let mut state = mlx_rs::ops::zeros_dtype(&[1, rank], hidden.dtype())?;
         let mut prev = Array::from_slice(&[anchor as i32], &[1]);
         let (mut tokens, mut steps) = (Vec::new(), Vec::new());
-        for s in 0..drafts {
+        for s in 0..wanted {
             let inputs = mlx_rs::ops::concatenate_axis(
                 &[
                     &state,
@@ -791,9 +829,9 @@ impl DraftModel {
         let ids = mlx_rs::ops::concatenate_axis(&tokens.iter().collect::<Vec<_>>(), 0)?;
         ids.eval()?;
         let tokens: Vec<u32> = ids.as_dtype(Dtype::Uint32)?.as_slice::<u32>().to_vec();
-        if tokens.len() != drafts as usize {
+        if tokens.len() != wanted as usize {
             bail!(
-                "the draft proposed {} tokens, expected {drafts}",
+                "the draft proposed {} tokens, expected {wanted}",
                 tokens.len()
             );
         }

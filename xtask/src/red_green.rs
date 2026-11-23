@@ -2679,6 +2679,19 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "inkling2-draft-head-skips-its-first-position",
+        symptom: "a draft asked for a few tokens ran the Markov head from the second position, so the tokens it proposed were the full block's second onward and the target rejected them (the replies stay right; the drafting stops paying)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "for s in 0..wanted {",
+            replace: "for s in 1..=wanted { // defect: from the second position",
+        }],
+        guards: &[mlx(
+            "inkling2::draft_tests::a_draft_asked_for_fewer_tokens_proposes_the_start_of_the_full_block",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2834,6 +2847,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "inkling2-fused-output-subtracts-the-mlp") => "inkling2/fused.rs",
         (_, "inkling2-mix-projects-the-first-row-for-every-row")
         | (_, "inkling2-mask-geometry-keyed-on-the-shape-alone") => "inkling2/ops.rs",
+        (_, "inkling2-draft-head-skips-its-first-position") => "inkling2/draft.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)

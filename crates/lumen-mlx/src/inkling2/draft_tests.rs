@@ -225,3 +225,32 @@ fn a_draft_needs_context_and_rows_of_the_right_width() {
     let batched = Array::zeros::<f32>(&[2, 3, 4 * 64]).unwrap();
     assert!(draft.extend(&mut ctx, &batched).is_err());
 }
+
+/// A draft asked for fewer tokens stops the Markov head early and proposes exactly the first
+/// tokens of the full block (RED if the head's state or the previous token were not carried the
+/// same way: the prefix would differ).
+#[test]
+fn a_draft_asked_for_fewer_tokens_proposes_the_start_of_the_full_block() {
+    let (target, draft) = load();
+    let want = cycles();
+    let rows = want["0.taps"].clone();
+    let anchor = int(&want["0.anchor"])[0] as u32;
+    let mut ctx = draft.empty_context();
+    draft.extend(&mut ctx, &rows).unwrap();
+    let full = draft.propose(&ctx, anchor, &target).unwrap().tokens;
+    assert_eq!(full.len(), draft.args().drafts_per_block());
+    for count in 1..=full.len() {
+        let some = draft
+            .propose_up_to(&ctx, anchor, &target, count)
+            .unwrap()
+            .tokens;
+        assert_eq!(some, full[..count], "{count} tokens");
+    }
+    // Asking for more than a block gives the block; asking for none is refused.
+    let more = draft
+        .propose_up_to(&ctx, anchor, &target, 99)
+        .unwrap()
+        .tokens;
+    assert_eq!(more, full);
+    assert!(draft.propose_up_to(&ctx, anchor, &target, 0).is_err());
+}

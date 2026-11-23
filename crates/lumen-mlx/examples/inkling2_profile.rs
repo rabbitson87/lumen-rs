@@ -23,8 +23,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
-use lumen_mlx::inkling2::{Inkling2Model, LoadOptions};
+use lumen_mlx::inkling2::{DraftModel, Inkling2Model, LoadOptions, TapRing};
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::TryIndexOp;
 use tokenizers::Tokenizer;
 
 fn host_f32(a: &Array) -> Result<Vec<f32>> {
@@ -127,6 +128,12 @@ fn main() -> Result<()> {
     } else {
         false
     };
+    let draft_mode = if let Some(at) = args.iter().position(|a| a == "--draft") {
+        args.remove(at);
+        true
+    } else {
+        false
+    };
     let mut flag_value = |name: &str| -> Option<String> {
         let at = args.iter().position(|a| a == name)?;
         let value = args.get(at + 1).cloned();
@@ -168,6 +175,55 @@ fn main() -> Result<()> {
     let mut next = argmax(&row[row.len() - model.args().vocab_size..][..live]);
     let mut generated = Vec::new();
 
+    if draft_mode {
+        // The draft head's cycle: extending its context with a few new rows of taps, and proposing
+        // a block after an anchor. Each is timed and counted over many rounds.
+        let draft = DraftModel::load(&dir, &model)?.context("this checkpoint has no draft head")?;
+        let tap_ids = draft.args().target_layer_ids.clone();
+        let keep = draft.args().context_rows;
+        let mut cache = model.make_cache();
+        let taps = model.advance_taps(&ids, &mut cache, &tap_ids, None)?;
+        let mut ring = TapRing::new();
+        ring.push(&taps, keep)?;
+        let mut context = draft.context_from(&ring)?;
+        let rows = taps.try_index((.., ..5, ..))?;
+        for (what, count) in [
+            ("extend with 5 rows", 0usize),
+            ("propose 1 token", 1),
+            ("propose 2 tokens", 2),
+            ("propose 4 tokens", 4),
+            ("propose 7 tokens", 7),
+        ] {
+            let repeat = count > 0;
+            let mut times = Vec::new();
+            let (mut prims, mut dispatches) = (0u64, 0u64);
+            lumen_mlx::inkling2::stage_reset();
+            for round in 0..30 {
+                let (_, d0) = mlx_rs::metal::cmd_buffer_stats().unwrap_or_default();
+                let (p0, _) = mlx_rs::metal::eval_gpu_stats().unwrap_or_default();
+                let t = Instant::now();
+                if repeat {
+                    draft.propose_up_to(&context, next, &model, count)?;
+                } else {
+                    draft.extend(&mut context, &rows)?;
+                    context.eval()?;
+                }
+                if round >= 6 {
+                    times.push(t.elapsed().as_secs_f64() * 1e3);
+                    let (_, d1) = mlx_rs::metal::cmd_buffer_stats().unwrap_or_default();
+                    let (p1, _) = mlx_rs::metal::eval_gpu_stats().unwrap_or_default();
+                    prims = p1.saturating_sub(p0);
+                    dispatches = d1.saturating_sub(d0);
+                }
+            }
+            println!(
+                "draft {what}: {:.2} ms (median of {}); {prims} primitives, {dispatches} dispatches",
+                median(times.clone()),
+                times.len()
+            );
+        }
+        return Ok(());
+    }
     if block {
         // What a pass over k + 1 tokens costs (the speculative loop's verify pass), each followed
         // by a rollback of all but one token, so the cache grows by one per round.

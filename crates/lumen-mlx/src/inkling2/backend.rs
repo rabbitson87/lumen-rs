@@ -674,7 +674,9 @@ impl Inkling2Backend {
                         }
                         return Ok(Vec::new());
                     }
-                    Ok(draft.draft(&mut context, rows, anchor, &self.model)?.tokens)
+                    Ok(draft
+                        .draft_up_to(&mut context, rows, anchor, &self.model, want)?
+                        .tokens)
                 },
             )?;
         } else {
