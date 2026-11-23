@@ -415,7 +415,10 @@ fn full_cache_matches_its_recording() {
     check(
         digests(&[("full", 0, 0, FULL)], |_, _| NativeKvCache::new()),
         &[
-            ("full", false, 0x27b1ca76b702ebf0),
+            // Re-recorded for a deliberate change: a legacy-path rewind now cuts the buffers
+            // (`truncate_to`, commit 8d53f40), and the digest folds the buffers in. The
+            // step-prealloc digest below is the one recorded before.
+            ("full", false, 0x9ce83e10a3e5c421),
             ("full", true, 0xf074133e39cc9bff),
         ],
     );
