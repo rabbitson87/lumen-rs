@@ -2590,40 +2590,40 @@ static DEFECTS: &[Defect] = &[
     },
     Defect {
         name: "inkling2-fused-projection-halves-the-conv-scale",
-        symptom: "the compiled projection region scaled the short convolution's residual by another factor than the plain ops do, so every decode step's k and v (and with them every reply) drifted a little, with nothing to crash on",
+        symptom: "the projection region scaled the short convolution's residual by another factor than the reference does, so every step's k and v (and with them every reply) drifted a little, with nothing to crash on",
         revert: &[Mutation {
             path: MLX,
-            find: "ex(super::ops::static_conv(&a[1], &a[6], &a[4], cfg.conv_scale))?;",
-            replace: "ex(super::ops::static_conv(&a[1], &a[6], &a[4], cfg.conv_scale * 0.5))?; // defect: the wrong residual scale",
+            find: "static_conv(k, k_conv, k_state, cfg.conv_scale)?;",
+            replace: "static_conv(k, k_conv, k_state, cfg.conv_scale * 0.5)?; // defect: the wrong residual scale",
         }],
         guards: &[mlx(
-            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+            "inkling2::tests::every_layer_visit_matches_the_reference",
         )],
         ..PLAIN
     },
     Defect {
         name: "inkling2-fused-projection-ignores-the-position-scaling",
-        symptom: "the compiled projection region of a global layer dropped the long-position scaling of q and the relative state, so a reply past the log-scaling floor attended with the wrong sharpness",
+        symptom: "the projection region dropped the long-position scaling of q and the relative state, so a reply past the log-scaling floor attended with the wrong sharpness",
         revert: &[Mutation {
             path: MLX,
-            find: "(&a[0], k, v, &a[1]), (&a[8], &a[9], &a[10]), a.get(11))?;",
-            replace: "(&a[0], k, v, &a[1]), (&a[8], &a[9], &a[10]), a.get(99))?; // defect: no tau",
+            find: "[q_scale, r_scale, rel_proj, tau] => (q_scale, r_scale, rel_proj, Some(tau)),",
+            replace: "[q_scale, r_scale, rel_proj, _] => (q_scale, r_scale, rel_proj, None::<&&Array>), // defect: no tau",
         }],
         guards: &[mlx(
-            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+            "inkling2::tests::every_layer_visit_matches_the_reference",
         )],
         ..PLAIN
     },
     Defect {
         name: "inkling2-fused-residual-forgets-the-stream",
-        symptom: "the compiled residual region returned the convolution's output alone where a non-boundary layer adds it to the stream, so every layer after the first lost what it was given",
+        symptom: "the residual region returned the convolution's output alone where a non-boundary layer adds it to the stream, so every layer after the first lost what it was given",
         revert: &[Mutation {
             path: MLX,
-            find: "Some(h) => mlx_rs::ops::add(h.as_dtype(Dtype::Float32)?, y32)?,",
-            replace: "Some(_) => y32, // defect: the stream is not added",
+            find: "Some(h) => mlx_rs::ops::add(h.as_dtype(Dtype::Float32)?, y)?,",
+            replace: "Some(_) => y, // defect: the stream is not added",
         }],
         guards: &[mlx(
-            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+            "inkling2::tests::every_layer_visit_matches_the_reference",
         )],
         ..PLAIN
     },
@@ -2632,8 +2632,8 @@ static DEFECTS: &[Defect] = &[
         symptom: "the compiled attention-residual mix scaled its dots by another factor than the plain mix, so the depth sources were weighed wrongly in every layer",
         revert: &[Mutation {
             path: MLX,
-            find: "        shared().mix_scale,\n",
-            replace: "        shared().mix_scale * 2.0, // defect: the wrong scale\n",
+            find: "            float_of(single(key)?),\n        )?])",
+            replace: "            float_of(single(key)?) * 2.0, // defect: the wrong scale\n        )?])",
         }],
         guards: &[mlx(
             "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
@@ -2642,14 +2642,14 @@ static DEFECTS: &[Defect] = &[
     },
     Defect {
         name: "inkling2-fused-output-subtracts-the-mlp",
-        symptom: "the compiled output region subtracted the MLP's convolved output from the residual instead of adding it",
+        symptom: "the output region subtracted the MLP's convolved output from the residual instead of adding it",
         revert: &[Mutation {
             path: MLX,
-            find: "mlx_rs::ops::add(&a[3], y.as_dtype(Dtype::Float32)?)?.as_dtype(a[0].dtype())?;",
-            replace: "mlx_rs::ops::subtract(&a[3], y.as_dtype(Dtype::Float32)?)?.as_dtype(a[0].dtype())?; // defect: subtracted",
+            find: "mlx_rs::ops::add(residual, y.as_dtype(Dtype::Float32)?)?.as_dtype(dtype)?;",
+            replace: "mlx_rs::ops::subtract(residual, y.as_dtype(Dtype::Float32)?)?.as_dtype(dtype)?; // defect: subtracted",
         }],
         guards: &[mlx(
-            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+            "inkling2::tests::every_layer_visit_matches_the_reference",
         )],
         ..PLAIN
     },
@@ -2707,40 +2707,69 @@ static DEFECTS: &[Defect] = &[
     },
     Defect {
         name: "inkling2-fused-swiglu-skips-the-cap",
-        symptom: "the compiled swiglu used the raw gate where the plain one uses the capped gate, so every expert's activation was a little off in each of the 48 visits and the replies drifted without an error",
+        symptom: "the swiglu used the raw gate where the reference uses the capped gate, so every expert's activation was a little off in each of the 48 visits and the replies drifted without an error",
         revert: &[Mutation {
             path: MLX,
             find: "mlx_rs::ops::multiply(&capped_gate, mlx_rs::ops::sigmoid(&g)?)?,",
             replace: "mlx_rs::ops::multiply(&g, mlx_rs::ops::sigmoid(&g)?)?, /* defect: the raw gate */",
         }],
         guards: &[mlx(
-            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+            "inkling2::tests::every_layer_visit_matches_the_reference",
         )],
         ..PLAIN
     },
     Defect {
         name: "inkling2-fused-residual-doubles-the-boundary",
-        symptom: "the compiled residual region doubled the stream at a block boundary (the layers where the residual is the convolution's output alone), so every block started from twice what it should",
+        symptom: "the residual region doubled the stream at a block boundary (the layers where the residual is the convolution's output alone), so every block started from twice what it should",
         revert: &[Mutation {
             path: MLX,
-            find: "None => y32,",
-            replace: "None => mlx_rs::ops::add(&y32, &y32)?, /* defect: doubled */",
+            find: "None => y,",
+            replace: "None => mlx_rs::ops::add(&y, &y)?, /* defect: doubled */",
         }],
         guards: &[mlx(
-            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+            "inkling2::tests::every_layer_visit_matches_the_reference",
         )],
         ..PLAIN
     },
     Defect {
         name: "inkling2-fused-projection-convolves-v-with-the-k-state",
-        symptom: "the compiled projection region convolved the values with the keys' state, so a local layer's values mixed in the wrong history after the first token",
+        symptom: "the projection region convolved the values with the keys' state, so a local layer's values mixed in the wrong history after the first token",
         revert: &[Mutation {
             path: MLX,
-            find: "static_conv(&a[2], &a[7], &a[5], cfg.conv_scale)",
-            replace: "static_conv(&a[2], &a[7], &a[4], cfg.conv_scale) /* defect: the k state */",
+            find: "static_conv(v, v_conv, v_state, cfg.conv_scale)?;",
+            replace: "static_conv(v, v_conv, k_state, cfg.conv_scale)?; /* defect: the k state */",
         }],
         guards: &[mlx(
-            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+            "inkling2::tests::prefill_then_single_token_decode_matches_the_reference",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "compile-constants-left-out-of-the-key",
+        symptom: "a compiled region was handed no constants to key its graphs on, so a second model whose layers differ only in a number baked into the trace (a clip threshold) was served the first model's graph and computed with its constants, with nothing to crash on",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                    constants.len(),\n",
+            replace: "                    0, // defect: the constants are not part of the key\n",
+        }],
+        guards: &[
+            mlx(
+                "keyed_compile::imp::tests::a_call_with_other_constants_is_traced_again_and_one_with_the_same_is_replayed",
+            ),
+            mlx("inkling2::tests::a_model_with_other_constants_is_served_graphs_of_its_own"),
+        ],
+        ..PLAIN
+    },
+    Defect {
+        name: "compile-regions-share-one-identity",
+        symptom: "every compiled function was named by the same number, so regions that took the same shapes and dtypes were told apart by nothing and one replayed the other's graph",
+        revert: &[Mutation {
+            path: MLX,
+            find: "id: NEXT_ID.fetch_add(1, Ordering::Relaxed),",
+            replace: "id: NEXT_ID.load(Ordering::Relaxed), // defect: one identity for all",
+        }],
+        guards: &[mlx(
+            "keyed_compile::imp::tests::two_compiled_functions_never_share_an_identity",
         )],
         ..PLAIN
     },
@@ -2895,12 +2924,14 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "inkling2-fused-projection-halves-the-conv-scale")
         | (_, "inkling2-fused-projection-ignores-the-position-scaling")
         | (_, "inkling2-fused-residual-forgets-the-stream")
-        | (_, "inkling2-fused-mix-doubles-the-softmax-scale")
         | (_, "inkling2-fused-output-subtracts-the-mlp")
-        | (_, "inkling2-fused-swiglu-skips-the-cap")
         | (_, "inkling2-fused-residual-doubles-the-boundary")
-        | (_, "inkling2-fused-projection-convolves-v-with-the-k-state") => "inkling2/fused.rs",
-        (_, "inkling2-mix-projects-the-first-row-for-every-row")
+        | (_, "inkling2-fused-projection-convolves-v-with-the-k-state") => "inkling2/regions.rs",
+        (_, "inkling2-fused-mix-doubles-the-softmax-scale") => "inkling2/fused.rs",
+        (_, "compile-constants-left-out-of-the-key")
+        | (_, "compile-regions-share-one-identity") => "keyed_compile.rs",
+        (_, "inkling2-fused-swiglu-skips-the-cap")
+        | (_, "inkling2-mix-projects-the-first-row-for-every-row")
         | (_, "inkling2-mask-geometry-keyed-on-the-shape-alone") => "inkling2/ops.rs",
         (_, "inkling2-draft-head-skips-its-first-position")
         | (_, "inkling2-draft-head-reads-the-anchors-row") => "inkling2/draft.rs",
