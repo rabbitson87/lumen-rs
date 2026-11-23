@@ -24,6 +24,7 @@ value → on.
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
 | `LUMEN_INKLING2_DRAFT` | on | Behavior | `lumen_mlx::inkling2::backend::inkling2_draft` |
+| `LUMEN_INKLING2_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::inkling2::profile::stage_sync` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
 | `LUMEN_MEMORY_PLAN_RECLAIMABLE` | on | Behavior | `lumen_mlx::qwen4_exp::runner::plan_reclaimable` |
@@ -235,6 +236,14 @@ Speculative decoding for Inkling 2: the checkpoint's bundled DSpark draft head
  like single-token steps in bfloat16, so a greedy continuation can differ from the plain
  loop's where the two best tokens are within a bfloat16 step or two of each other (about 1
  position in 200 here); hence a behavior flag. `=0` runs the plain loop.
+
+### `LUMEN_INKLING2_STAGE_SYNC`
+
+*Diagnostic, default off.*
+
+Evaluate every Inkling 2 decode step stage by stage (input mixing, projections, attention,
+ router, experts, ...) and record each stage's build time, evaluation time and MLX's
+ primitive and dispatch counts. Costs a sync per stage; for diagnosis only.
 
 ### `LUMEN_JOINT_PREFILL`
 

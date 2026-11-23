@@ -19,6 +19,7 @@ use super::ops::{
     next_conv_state, owned, route_topk, scalar, softcap, softcapped_swiglu, static_conv,
     static_conv_scale, unit_rms,
 };
+use super::profile;
 use super::quant::{QuantMode, QuantTable};
 use super::text_config::{AttnDims, TextArgs};
 use crate::native_cache::NativeKvCache;
@@ -652,7 +653,9 @@ impl Moe {
             mlx_rs::ops::transpose_axes(&self.router_weight, &[1, 0])?,
         )?;
         let (inds, weights) = route_topk(&logits, &self.router_bias, self.top_k, self.route_scale)?;
+        profile::mark("moe norm + router + top-k", &[&inds, &weights])?;
         let out = self.experts(&flat, &inds, &weights)?;
+        profile::mark("moe combine", &[&out])?;
         Ok(mlx_rs::ops::reshape(&out, &shape)?)
     }
 
@@ -686,6 +689,7 @@ impl Moe {
                 mlx_rs::ops::reshape(&scale, &shape)?.as_dtype(y.dtype())?,
             )?;
         }
+        profile::mark("moe w13 (gate+up experts)", &[&y])?;
         // y[..., 0::2] is the gate, y[..., 1::2] the up projection.
         let mut pair_shape = y.shape().to_vec();
         let last = pair_shape.pop().expect("rank >= 1");
@@ -707,11 +711,13 @@ impl Moe {
             )?,
         );
         let act = softcapped_swiglu(&gate, &up, self.gate_cap, self.up_cap)?;
+        profile::mark("moe softcapped swiglu", &[&act])?;
         let mut z = self.w2.apply(&act, &idx, do_sort)?;
         if let Some(inverse) = inverse {
             let n = inds.shape()[0];
             z = mlx_rs::ops::unflatten(&take_axis(&z, &inverse, 0)?, 0, &[n, k])?;
         }
+        profile::mark("moe w2 (down experts)", &[&z])?;
         let z = mlx_rs::ops::squeeze_axes(&z, &[-2])?; // [N, K, H]
         let weights = match self.w2.post_scale(inds)? {
             Some(s2) => mlx_rs::ops::multiply(weights, &s2)?,
@@ -846,6 +852,9 @@ impl Layer {
             ),
             (None, _) => None,
         };
+        if let Some(m) = &messages {
+            profile::mark("loop message bank mix", &[m])?;
+        }
         let norm = |x: &Array, w: &Array| -> Result<Array> {
             Ok(mlx_rs::fast::rms_norm(x, w, args.rms_norm_eps)?.as_dtype(dtype)?)
         };
@@ -869,6 +878,7 @@ impl Layer {
                 xv = mixed.try_index((.., .., 2))?;
             }
         }
+        profile::mark("attn_input mix", &[&xq, &xk, &xv])?;
         if let (Some(m), Some(ctl)) = (&messages, &self.loop_ctl) {
             let x = mlx_rs::ops::stack_axis(&[&xq, &xk, &xv], 0)?;
             let message =
@@ -885,6 +895,7 @@ impl Layer {
                 mixed.try_index(1)?,
                 mixed.try_index(2)?,
             );
+            profile::mark("loop message mix (attn)", &[&xq, &xk, &xv])?;
         }
         let (nq, nk, nv) = match &self.norms {
             Norms::Local { attn_norm } if messages.is_none() => (norm(&xq, attn_norm)?, None, None),
@@ -895,6 +906,13 @@ impl Layer {
             ),
             Norms::Global { q, k, v } => (norm(&xq, q)?, Some(norm(&xk, k)?), Some(norm(&xv, v)?)),
         };
+        profile::mark(
+            "attn input norms",
+            &[Some(&nq), nk.as_ref(), nv.as_ref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        )?;
 
         // -- attention --
         let p = self.attn.project(
@@ -905,23 +923,31 @@ impl Layer {
             &states[1],
             tau.as_ref(),
         )?;
+        profile::mark(
+            "qkv projection + conv + clip",
+            &[&p.q, &p.k, &p.v, &p.rel, &p.gate, &p.sink],
+        )?;
         let out = self.attn.attend(&p, &mut cache.kv)?;
+        profile::mark("attention (kv + sdpa)", &[&out])?;
         if self.is_boundary {
             blocks.push(h_n.clone());
         }
 
         // -- the residual and the MLP --
         let a = self.attn.output(&out, &p.gate)?;
+        profile::mark("attn gate + o_proj", &[&a])?;
         let (a, attn_window) = static_conv(&a, &self.attn_conv, &states[2], self.attn.sconv_scale)?;
         let residual = if self.is_boundary {
             a.as_dtype(Dtype::Float32)?
         } else {
             mlx_rs::ops::add(h.as_dtype(Dtype::Float32)?, a.as_dtype(Dtype::Float32)?)?
         };
+        profile::mark("attn conv + residual", &[&residual, &attn_window])?;
         let mut y = self
             .mlp_input
             .mix(blocks, &unit_rms(&residual)?)?
             .try_index((.., .., 0))?;
+        profile::mark("mlp_input mix", &[&y])?;
         if let (Some(m), Some(ctl)) = (&messages, &self.loop_ctl) {
             let message = mlx_rs::ops::expand_dims(&m.try_index((.., .., 3))?, 0)?;
             let mixed = mix_messages(
@@ -932,10 +958,12 @@ impl Layer {
                 cx.round_loop_mix,
             )?;
             y = mixed.try_index(0)?;
+            profile::mark("loop message mix (mlp)", &[&y])?;
         }
         let m = self.mlp.forward(&norm(&y, &self.mlp_norm)?)?;
         let (m, mlp_window) = static_conv(&m, &self.mlp_conv, &states[3], self.attn.sconv_scale)?;
         let next = mlx_rs::ops::add(&residual, m.as_dtype(Dtype::Float32)?)?.as_dtype(dtype)?;
+        profile::mark("mlp conv + residual", &[&next, &mlp_window])?;
 
         cache.conv = [
             Some(next_conv_state(&p.k_window, taps)?),
@@ -943,6 +971,10 @@ impl Layer {
             Some(next_conv_state(&attn_window, taps)?),
             Some(next_conv_state(&mlp_window, taps)?),
         ];
+        profile::mark(
+            "conv state cuts",
+            &cache.conv.iter().flatten().collect::<Vec<_>>(),
+        )?;
         cache.windows = cx.keep_windows.then(|| ConvWindows {
             arrays: [p.k_window, p.v_window, attn_window, mlp_window],
             rows: length as usize,
@@ -1507,10 +1539,12 @@ impl Inkling2Model {
         } else {
             logits
         };
-        match &self.vocab_bias {
-            Some(bias) => Ok(mlx_rs::ops::add(&logits, bias)?),
-            None => Ok(logits),
-        }
+        let logits = match &self.vocab_bias {
+            Some(bias) => mlx_rs::ops::add(&logits, bias)?,
+            None => logits,
+        };
+        profile::mark("lm_head + softcap", &[&logits])?;
+        Ok(logits)
     }
 
     fn hidden(&self, ids: &[u32], cache: &mut Inkling2Cache, mut rec: Pass<'_>) -> Result<Array> {
@@ -1521,10 +1555,12 @@ impl Inkling2Model {
             cache.visits.len(),
             self.schedule.len()
         );
+        profile::begin(ids.len());
         let mut h = self.embed_tokens(ids)?;
         if let Some(images) = rec.images {
             h = images.splice(&h, cache.len())?;
         }
+        profile::mark("embed", &[&h])?;
         let cx = Ctx {
             args: &self.args,
             round_loop_mix: self.options.round_loop_mix,
@@ -1546,6 +1582,9 @@ impl Inkling2Model {
                             blocks: blocks[prelude_blocks.len() + 1..].to_vec(),
                             partial_n: unit_rms(&h.as_dtype(Dtype::Float32)?)?,
                         });
+                        if let Some(bank) = &bank {
+                            profile::mark("loop bank", &[&bank.partial_n])?;
+                        }
                         h = prelude_h.clone();
                         blocks = prelude_blocks.clone();
                     }
@@ -1572,6 +1611,7 @@ impl Inkling2Model {
             .try_index((.., .., 0))?;
         let out =
             mlx_rs::fast::rms_norm(&x, &self.norm, self.args.rms_norm_eps)?.as_dtype(h.dtype())?;
+        profile::mark("final mix + norm", &[&out])?;
         if let Some(captured) = rec.capture {
             captured.push(out.clone());
         }

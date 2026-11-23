@@ -29,6 +29,8 @@ mod model;
 #[cfg(feature = "mlx-native")]
 mod ops;
 mod pixels;
+#[cfg(feature = "mlx-native")]
+mod profile;
 mod quant;
 mod response;
 mod safetensors_header;
@@ -56,6 +58,8 @@ pub use pixels::{
     BLOCK, MAX_IMAGE_TOKENS, PreparedImage, prepare as prepare_image,
     token_count as image_token_count,
 };
+#[cfg(feature = "mlx-native")]
+pub use profile::{stage_report, stage_reset};
 pub use quant::{PackedSummary, QuantMode, QuantSpec, QuantTable, check_packed_shapes};
 pub use response::{Markers, ResponseParser};
 pub use safetensors_header::{TensorInfo, read_header};
