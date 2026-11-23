@@ -2209,6 +2209,254 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "inkling2-conv-state-dropped",
+        symptom: "the short convolutions' key state was not carried from one pass to the next, so a decode step or the second chunk of a prefill convolved the new keys with zeros instead of the tokens before them: the first pass was exact and every later one drifted, the logits of a long prompt fed in chunks differed from the same prompt fed at once",
+        revert: &[Mutation {
+            path: MLX,
+            find: "Some(next_conv_state(&p.k_window, taps)?),",
+            replace: "None, // defect: the key convolution's state is dropped",
+        }],
+        guards: &[
+            mlx("inkling2::tests::prefill_then_single_token_decode_matches_the_reference"),
+            mlx("inkling2::tests::chunked_prefill_matches_a_single_prefill"),
+        ],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-decode-without-sinks",
+        symptom: "a decode step attended without the layer's attention sinks, so single-token steps put the sink's share of the softmax on the real keys: the prefill matched the reference and every generated token after it was a little off, which showed only in the continuation",
+        revert: &[Mutation {
+            path: MLX,
+            find: "Some(&sinks),",
+            replace: "None::<&Array>, // defect: the sinks are left out of a decode step",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::prefill_then_single_token_decode_matches_the_reference",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-log-scaling-ignores-the-cache-offset",
+        symptom: "the global layers' log scaling of the queries was computed from position zero on every pass instead of from the tokens already cached, so a decode step or a later chunk scaled its queries as if it were at the start of the prompt",
+        revert: &[Mutation {
+            path: MLX,
+            find: "log_tau(cache.kv.offset(), length as usize)",
+            replace: "log_tau(0, length as usize) /* defect: always from the start */",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::prefill_then_single_token_decode_matches_the_reference",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-loop-bank-keeps-the-first-core-block",
+        symptom: "the message bank the next loop pass reads included the core's first block, which every pass rebuilds, instead of the blocks the last pass wrote after it: passes 2 and 3 of the looped layers mixed in a stale message and the logits were wrong from the first prompt",
+        revert: &[Mutation {
+            path: MLX,
+            find: "blocks[prelude_blocks.len() + 1..]",
+            replace: "blocks[prelude_blocks.len()..] /* defect */",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::a_full_prefill_matches_the_reference_logits",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-window-one-token-too-wide",
+        symptom: "the sliding window of a local layer let a token see one more token than the window holds (`<=` for `<`): invisible while a prompt is shorter than the window, wrong from the first token past it",
+        revert: &[Mutation {
+            path: MLX,
+            find: "mlx_rs::ops::lt(&dist, Array::from_int(window_i))?,",
+            replace: "mlx_rs::ops::le(&dist, Array::from_int(window_i))?, // defect: one too wide",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::a_full_prefill_matches_the_reference_logits",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-effort-before-the-system-messages",
+        symptom: "the thinking-effort message was written before the first message of any kind instead of after the leading system messages, so a conversation with a system prompt rendered a prompt the model was not trained on (Hugging Face's rendering of the template put it after them)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "if !effort_emitted && !matches!(turn, ChatTurn::System(_)) {",
+            replace: "if !effort_emitted { // defect: ahead of the system messages",
+        }],
+        guards: &[mlx(
+            "inkling2::chat::tests::every_golden_prompt_is_what_the_template_renders",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-reuse-takes-the-whole-prompt",
+        symptom: "a retained conversation could be reused up to the whole of a repeated prompt, leaving no token to feed, so there were no logits for the next token and the request had nothing to sample from",
+        revert: &[Mutation {
+            path: MLX,
+            find: ".filter(|&len| len > 0 && len < new.len() && len <= seen.len())",
+            replace: ".filter(|&len| len > 0 && len <= new.len() && len <= seen.len()) // defect: may take the whole prompt",
+        }],
+        guards: &[mlx(
+            "inkling2::backend::tests::a_point_is_reusable_when_its_tokens_are_a_proper_prefix_of_the_new_prompt",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-vision-tower-runs-in-float32",
+        symptom: "the vision tower's adapter used mlx-rs's `nn::gelu`, which writes its constants as float32 arrays and so turns a bfloat16 activation into float32: on the checkpoint's bfloat16 weights the whole tower ran in float32 after the first MLP, the features came out `Float32` and sat farther from the reference's bfloat16 run (cosine 0.99974 against 0.99988); a float32 replica cannot see it",
+        revert: &[Mutation {
+            path: MLX,
+            find: "Ok(mlx_rs::ops::matmul(gelu(&projected)?, &self.proj_out_t)?)",
+            replace: "Ok(mlx_rs::ops::matmul(mlx_rs::nn::gelu(&projected)?, &self.proj_out_t)?) // defect: promotes bfloat16",
+        }],
+        guards: &[mlx(
+            "inkling2::vision_tests::a_bfloat16_tower_stays_bfloat16_to_the_end",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-vision-rope-axes-swapped",
+        symptom: "the tower's axial rotary embedding took the row as the width and the column as the height, so the picture was read transposed: a square drawn on the left was attended as if it were above",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let (cos, sin) = axial_rope(&row, &col, a);",
+            replace: "let (cos, sin) = axial_rope(&col, &row, a); // defect: axes swapped",
+        }],
+        guards: &[mlx(
+            "inkling2::vision_tests::the_tower_matches_the_reference_at_every_stage",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-image-rows-ignore-the-chunk-start",
+        symptom: "image features were put at the positions of the chunk as if every chunk began the prompt, so a prompt fed in chunks (anything over 512 tokens) spliced the first rows of the picture into every chunk: a picture past the first chunk was garbled",
+        revert: &[Mutation {
+            path: MLX,
+            find: "h = images.splice(&h, cache.len())?;",
+            replace: "h = images.splice(&h, 0)?; // defect: every chunk read from the start",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::a_prompt_fed_in_chunks_splices_each_chunk_with_its_own_rows",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-same-grid-images-share-a-cache-key",
+        symptom: "the retained conversation's key for an image token was the token alone, and two pictures of one size have the same tokens, so a new picture on the same grid reused the caches of the old one and the model answered about the wrong picture",
+        revert: &[Mutation {
+            path: MLX,
+            find: "hasher.finish()",
+            replace: "{ let _ = hasher.finish(); 0u64 } /* defect: no identity */",
+        }],
+        guards: &[mlx(
+            "inkling2::backend::tests::two_images_of_one_grid_are_different_prompts_and_the_same_image_is_not",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-transparent-image-rounds-down",
+        symptom: "a transparent image was composited over the checkerboard without the `+ 127` that rounds to nearest, so every semi-transparent pixel came out one level darker than the reference processor's and the blocks differed from the first pixel",
+        revert: &[Mutation {
+            path: MLX,
+            find: "background * (255 - alpha) + 127) / 255",
+            replace: "background * (255 - alpha)) / 255 /* defect: rounds down */",
+        }],
+        guards: &[mlx(
+            "inkling2::pixels::tests::the_blocks_are_the_reference_processors_bit_for_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-draft-block-queries-one-position-early",
+        symptom: "the draft's block queries were rotated from one position before the anchor's, so the block saw the context at the wrong distance: it still proposed tokens, with a lower chance of the model agreeing and nothing else to show for it",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let q = self.rope(&q, total)?;",
+            replace: "let q = self.rope(&q, total - 1)?; // defect: one position early",
+        }],
+        guards: &[mlx(
+            "inkling2::draft_tests::the_draft_matches_the_reference_over_five_cycles",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-draft-ring-forgets-skipped-rows",
+        symptom: "context rows older than the window were dropped without counting as positions, so after a long prompt every context key was rotated from the wrong absolute position: the draft agreed with the model less often and only on prompts longer than its window",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let base = (ctx.total + skip) as i32;",
+            replace: "let base = ctx.total as i32; // defect: skipped rows are not positions",
+        }],
+        guards: &[mlx(
+            "inkling2::draft_tests::the_draft_matches_the_reference_over_five_cycles",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-rollback-cuts-the-wrong-conv-window",
+        symptom: "after a verify pass accepted some of its drafts the convolution states were cut one row early from the pass's windows, so the caches were no longer those of the kept tokens: the next block was checked against a slightly wrong state and every reply after a rejection drifted",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let (from, to) = (kept as i32, (kept + windows.keep) as i32);",
+            replace: "let (from, to) = (kept as i32 - 1, (kept - 1 + windows.keep) as i32); // defect: one row early",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::a_rolled_back_verify_pass_leaves_the_caches_a_shorter_prefill_would",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-speculative-loop-never-feeds-the-marker",
+        symptom: "the speculative loop left the end-of-turn marker unfed, so the retained caches stopped one token short of what the plain loop leaves and a client that sent the reply back could not reuse the turn's end",
+        revert: &[Mutation {
+            path: MLX,
+            find: "    if let Flow::Done { marker: true } = flow {",
+            replace: "    if let Flow::Done { marker: false } = flow { // defect: the marker is not fed",
+        }],
+        guards: &[mlx(
+            "inkling2::backend::speculative_tests::the_limit_the_marker_and_a_stop_end_the_turn_where_the_plain_loop_ends_it",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-speculative-ring-misses-the-cycles-rows",
+        symptom: "the taps of the positions a cycle fed were handed to the drafter but not kept with the retained caches, so the next request on the conversation drafted from a context that stopped at the last prompt",
+        revert: &[Mutation {
+            path: MLX,
+            find: "ring.push(&rows, plan.keep)?;",
+            replace: "let _ = &rows; // defect: the retained taps miss the cycle's rows",
+        }],
+        guards: &[mlx(
+            "inkling2::backend::speculative_tests::a_drafter_that_is_right_wrong_or_half_right_changes_nothing_but_speed",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-sampled-drafts-always-accepted",
+        symptom: "a sampled request accepted every draft instead of with the probability its own sampling gave it, so the reply followed the draft's argmax and not the distribution the request asked for (nothing crashes; the replies are simply less random)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let verdict = speculative_accept(&p, &q, draft, rng);",
+            replace: "let verdict = lumen_core::sampling::SpecAccept { accepted: true, token: draft }; // defect: always accepted",
+        }],
+        guards: &[mlx(
+            "inkling2::backend::tests::the_sampled_block_rule_draws_what_plain_sampling_draws",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-sampled-penalty-window-drops-the-anchor",
+        symptom: "the repeat penalty of a drafted sampled request did not see the newest token, so a token could be repeated right after itself where the plain loop would have penalized it",
+        revert: &[Mutation {
+            path: MLX,
+            find: "history.push(anchor);",
+            replace: "let _ = anchor; // defect: the anchor is not in the window",
+        }],
+        guards: &[mlx(
+            "inkling2::backend::tests::the_penalty_window_holds_the_anchor_and_the_accepted_drafts",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2329,6 +2577,25 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "qwen-parser-drops-the-tail-held-for-a-delimiter") => "qwen3_5_tools.rs",
         (_, "runtime-kernel-needs-newer-metal") => "native_ssm.rs",
         (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
+        (_, "inkling2-conv-state-dropped") => "inkling2/model.rs",
+        (_, "inkling2-decode-without-sinks") => "inkling2/ops.rs",
+        (_, "inkling2-log-scaling-ignores-the-cache-offset") => "inkling2/model.rs",
+        (_, "inkling2-loop-bank-keeps-the-first-core-block") => "inkling2/model.rs",
+        (_, "inkling2-window-one-token-too-wide") => "inkling2/ops.rs",
+        (_, "inkling2-effort-before-the-system-messages") => "inkling2/chat.rs",
+        (_, "inkling2-reuse-takes-the-whole-prompt") => "inkling2/backend.rs",
+        (_, "inkling2-vision-tower-runs-in-float32") => "inkling2/vision.rs",
+        (_, "inkling2-vision-rope-axes-swapped") => "inkling2/vision.rs",
+        (_, "inkling2-image-rows-ignore-the-chunk-start") => "inkling2/model.rs",
+        (_, "inkling2-same-grid-images-share-a-cache-key") => "inkling2/backend.rs",
+        (_, "inkling2-transparent-image-rounds-down") => "inkling2/pixels.rs",
+        (_, "inkling2-draft-block-queries-one-position-early") => "inkling2/draft.rs",
+        (_, "inkling2-draft-ring-forgets-skipped-rows") => "inkling2/draft.rs",
+        (_, "inkling2-rollback-cuts-the-wrong-conv-window") => "inkling2/model.rs",
+        (_, "inkling2-speculative-loop-never-feeds-the-marker") => "inkling2/backend.rs",
+        (_, "inkling2-speculative-ring-misses-the-cycles-rows") => "inkling2/backend.rs",
+        (_, "inkling2-sampled-drafts-always-accepted") => "inkling2/backend.rs",
+        (_, "inkling2-sampled-penalty-window-drops-the-anchor") => "inkling2/backend.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)
