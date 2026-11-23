@@ -1066,13 +1066,13 @@ impl Layer {
             ),
             Norms::Global { q, k, v } => (norm(&xq, q)?, Some(norm(&xk, k)?), Some(norm(&xv, v)?)),
         };
-        profile::mark(
-            "attn input norms",
-            &[Some(&nq), nk.as_ref(), nv.as_ref()]
+        if profile::active() {
+            let outs: Vec<&Array> = [Some(&nq), nk.as_ref(), nv.as_ref()]
                 .into_iter()
                 .flatten()
-                .collect::<Vec<_>>(),
-        )?;
+                .collect();
+            profile::mark("attn input norms", &outs)?;
+        }
 
         // -- attention --
         let p = self.attn.project(
@@ -1137,10 +1137,10 @@ impl Layer {
             Some(next_conv_state(&attn_window, taps)?),
             Some(next_conv_state(&mlp_window, taps)?),
         ];
-        profile::mark(
-            "conv state cuts",
-            &cache.conv.iter().flatten().collect::<Vec<_>>(),
-        )?;
+        if profile::active() {
+            let outs: Vec<&Array> = cache.conv.iter().flatten().collect();
+            profile::mark("conv state cuts", &outs)?;
+        }
         cache.windows = cx.keep_windows.then(|| ConvWindows {
             arrays: [p.k_window, p.v_window, attn_window, mlp_window],
             rows: length as usize,

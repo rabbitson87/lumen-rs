@@ -8,7 +8,8 @@
 //! synchronisation per stage, so read it as a ratio, not as an absolute. Off, a mark costs one
 //! thread-local read.
 //!
-//! Only decode steps (at most [`DECODE_ROWS`] rows) are profiled; prefill runs unchanged.
+//! Only decode-sized passes (at most `fused::DECODE_ROWS` rows, so a verify block too) are profiled;
+//! a prefill runs unchanged.
 //! `examples/inkling2_profile.rs` prints the report.
 
 use std::cell::Cell;
@@ -18,9 +19,6 @@ use std::time::Instant;
 
 use anyhow::Result;
 use mlx_rs::Array;
-
-/// Passes of at most this many rows count as decode steps.
-const DECODE_ROWS: usize = 4;
 
 lumen_flags::flag! {
     /// Evaluate every Inkling 2 decode step stage by stage (input mixing, projections, attention,
@@ -91,7 +89,7 @@ fn state() -> std::sync::MutexGuard<'static, Option<State>> {
 
 /// Starts a pass of `rows` rows: profiled when it is a decode step and the flag is on.
 pub(super) fn begin(rows: usize) {
-    let on = rows <= DECODE_ROWS && stage_sync::get();
+    let on = rows <= super::fused::DECODE_ROWS && stage_sync::get();
     ACTIVE.with(|a| a.set(on));
     if on {
         let mut guard = state();
@@ -103,6 +101,11 @@ pub(super) fn begin(rows: usize) {
         st.steps += 1;
         st.last = Instant::now();
     }
+}
+
+/// Whether the pass being built is profiled (marks that would allocate their arguments check it).
+pub(super) fn active() -> bool {
+    ACTIVE.with(Cell::get)
 }
 
 /// Ends a stage: evaluates `outs` and charges everything since the previous mark to `stage`.

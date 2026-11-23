@@ -510,62 +510,88 @@ fn a_bad_tap_or_token_id_is_refused_before_anything_runs() {
     assert_eq!(cache.len(), 0);
 }
 
-/// The compiled regions (`fused.rs`) run the plain ops' arithmetic in the same order and dtypes.
-/// Token by token (every pass a single row, the same kernels both ways) the logits come out bit
-/// for bit; over a prefill and a verify block the loop controllers' projections run row by row in
-/// the compiled region (the kernel a single-token step runs) and as one matrix product in the plain
-/// ops, so the sums are in another order and the logits agree to float noise.
+/// A replica as serving loads it: the loop controllers round through bf16 (`round_loop_mix`), which
+/// the float32 parity replica turns off because the rounding is a staircase two implementations
+/// cross at different places.
+fn load_replica_rounded() -> Inkling2Model {
+    Inkling2Model::load(
+        &fixture_dir(),
+        LoadOptions {
+            round_loop_mix: true,
+        },
+    )
+    .expect("load the replica")
+}
+
+/// The same steps with the compiled regions on and off: token by token, then over a prefill, single
+/// tokens and a verify block. Returns each step's logits.
+fn steps_with(model: &Inkling2Model, fused_on: bool) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let ids = prompt_ids(&reference("outputs.safetensors"));
+    super::fused::fuse::with(fused_on, || {
+        let mut cache = model.make_cache();
+        let by_token = ids[..10]
+            .iter()
+            .map(|&t| host_f32(&model.forward(&[t], &mut cache, true).unwrap()))
+            .collect();
+        let mut cache = model.make_cache();
+        let mut in_blocks = vec![host_f32(
+            &model.forward(&ids[..8], &mut cache, true).unwrap(),
+        )];
+        for &t in &ids[8..12] {
+            in_blocks.push(host_f32(&model.forward(&[t], &mut cache, true).unwrap()));
+        }
+        let (logits, _) = model.verify(&ids[12..16], &mut cache, &[5]).unwrap();
+        in_blocks.push(host_f32(&logits));
+        (by_token, in_blocks)
+    })
+}
+
+fn assert_same_logits(label: &str, plain: &[Vec<f32>], fused: &[Vec<f32>]) {
+    assert_eq!(plain.len(), fused.len());
+    for (step, (p, f)) in plain.iter().zip(fused).enumerate() {
+        assert_eq!(p.len(), f.len());
+        let (mut worst, mut scale) = (0.0f32, 0.0f32);
+        for (a, b) in p.iter().zip(f) {
+            assert_eq!(
+                a.is_finite(),
+                b.is_finite(),
+                "{label}, step {step}: a masked id differs"
+            );
+            if a.is_finite() {
+                worst = worst.max((a - b).abs());
+                scale = scale.max(a.abs());
+            }
+        }
+        assert!(
+            worst <= 1e-6 * scale.max(1.0),
+            "{label}, step {step}: the compiled regions differ from the plain ops by {worst} of {scale}"
+        );
+    }
+}
+
+/// The compiled regions (`fused.rs`) run the plain ops' arithmetic in the same order and dtypes:
+/// the same steps with them on and off give the same logits (bit for bit on the replica; the bound
+/// allows float noise on another GPU), over single tokens and over blocks of rows, with the loop
+/// controllers' bf16 rounding off (the parity replica) and on (as serving runs them). They are
+/// also served at all: a run with them on counts compiled calls, one with them off counts none.
 #[test]
 fn the_compiled_regions_give_the_logits_the_plain_ops_give() {
-    let model = load_replica();
-    let ids = prompt_ids(&reference("outputs.safetensors"));
-    let by_token = |fused_on: bool| -> Vec<Vec<f32>> {
-        super::fused::fuse::with(fused_on, || {
-            let mut cache = model.make_cache();
-            ids[..10]
-                .iter()
-                .map(|&t| host_f32(&model.forward(&[t], &mut cache, true).unwrap()))
-                .collect()
-        })
-    };
-    let in_blocks = |fused_on: bool| -> Vec<Vec<f32>> {
-        super::fused::fuse::with(fused_on, || {
-            let mut cache = model.make_cache();
-            let mut out = vec![host_f32(
-                &model.forward(&ids[..8], &mut cache, true).unwrap(),
-            )];
-            for &t in &ids[8..12] {
-                out.push(host_f32(&model.forward(&[t], &mut cache, true).unwrap()));
-            }
-            let (logits, _) = model.verify(&ids[12..16], &mut cache, &[5]).unwrap();
-            out.push(host_f32(&logits));
-            out
-        })
-    };
-    for (label, bound, plain, fused) in [
-        ("token by token", 1e-6, by_token(false), by_token(true)),
-        ("in blocks", 1e-4, in_blocks(false), in_blocks(true)),
+    for (label, model) in [
+        ("replica", load_replica()),
+        ("rounded replica", load_replica_rounded()),
     ] {
-        assert_eq!(plain.len(), fused.len());
-        for (step, (p, f)) in plain.iter().zip(&fused).enumerate() {
-            assert_eq!(p.len(), f.len());
-            let (mut worst, mut scale) = (0.0f32, 0.0f32);
-            for (a, b) in p.iter().zip(f) {
-                assert_eq!(
-                    a.is_finite(),
-                    b.is_finite(),
-                    "{label}, step {step}: a masked id differs"
-                );
-                if a.is_finite() {
-                    worst = worst.max((a - b).abs());
-                    scale = scale.max(a.abs());
-                }
-            }
-            assert!(
-                worst <= bound * scale.max(1.0),
-                "{label}, step {step}: the compiled regions differ from the plain ops by {worst} of {scale}"
-            );
-        }
+        let served = || super::fused::SERVED.with(std::cell::Cell::get);
+        let before = served();
+        let off = steps_with(&model, false);
+        assert_eq!(served(), before, "{label}: the plain run served a region");
+        let on = steps_with(&model, true);
+        assert!(
+            served() > before + 100,
+            "{label}: the compiled regions were not served ({} calls)",
+            served() - before
+        );
+        assert_same_logits(&format!("{label}, token by token"), &off.0, &on.0);
+        assert_same_logits(&format!("{label}, in blocks"), &off.1, &on.1);
     }
 }
 

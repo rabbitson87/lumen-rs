@@ -2662,7 +2662,7 @@ static DEFECTS: &[Defect] = &[
             replace: "a.try_index((.., 0..1, ..))? /* defect: always row 0 */",
         }],
         guards: &[mlx(
-            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+            "inkling2::tests::chunked_prefill_matches_a_single_prefill",
         )],
         ..PLAIN
     },
@@ -2702,6 +2702,45 @@ static DEFECTS: &[Defect] = &[
         }],
         guards: &[mlx(
             "inkling2::draft_tests::the_draft_matches_the_reference_over_five_cycles",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-fused-swiglu-skips-the-cap",
+        symptom: "the compiled swiglu used the raw gate where the plain one uses the capped gate, so every expert's activation was a little off in each of the 48 visits and the replies drifted without an error",
+        revert: &[Mutation {
+            path: MLX,
+            find: "mlx_rs::ops::multiply(&capped_gate, mlx_rs::ops::sigmoid(&g)?)?,",
+            replace: "mlx_rs::ops::multiply(&g, mlx_rs::ops::sigmoid(&g)?)?, /* defect: the raw gate */",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-fused-residual-doubles-the-boundary",
+        symptom: "the compiled residual region doubled the stream at a block boundary (the layers where the residual is the convolution's output alone), so every block started from twice what it should",
+        revert: &[Mutation {
+            path: MLX,
+            find: "None => y32,",
+            replace: "None => mlx_rs::ops::add(&y32, &y32)?, /* defect: doubled */",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-fused-projection-convolves-v-with-the-k-state",
+        symptom: "the compiled projection region convolved the values with the keys' state, so a local layer's values mixed in the wrong history after the first token",
+        revert: &[Mutation {
+            path: MLX,
+            find: "static_conv(&a[2], &a[7], &a[5], cfg.conv_scale)",
+            replace: "static_conv(&a[2], &a[7], &a[4], cfg.conv_scale) /* defect: the k state */",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_compiled_regions_give_the_logits_the_plain_ops_give",
         )],
         ..PLAIN
     },
@@ -2857,7 +2896,10 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "inkling2-fused-projection-ignores-the-position-scaling")
         | (_, "inkling2-fused-residual-forgets-the-stream")
         | (_, "inkling2-fused-mix-doubles-the-softmax-scale")
-        | (_, "inkling2-fused-output-subtracts-the-mlp") => "inkling2/fused.rs",
+        | (_, "inkling2-fused-output-subtracts-the-mlp")
+        | (_, "inkling2-fused-swiglu-skips-the-cap")
+        | (_, "inkling2-fused-residual-doubles-the-boundary")
+        | (_, "inkling2-fused-projection-convolves-v-with-the-k-state") => "inkling2/fused.rs",
         (_, "inkling2-mix-projects-the-first-row-for-every-row")
         | (_, "inkling2-mask-geometry-keyed-on-the-shape-alone") => "inkling2/ops.rs",
         (_, "inkling2-draft-head-skips-its-first-position")

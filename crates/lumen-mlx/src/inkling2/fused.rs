@@ -1,4 +1,4 @@
-//! Compiled (fused) forms of the elementwise-heavy helpers of the Inkling 2 decode step.
+//! Compiled (fused) forms of the elementwise-heavy regions of the Inkling 2 decode step.
 //!
 //! A decode step makes about 21,000 MLX primitives and 11,600 kernel dispatches, 1% of them
 //! weight kernels (see `profile.rs`); launching them costs more than half of the step. MLX's
@@ -38,48 +38,69 @@ pub(super) fn enabled() -> bool {
     fuse::get()
 }
 
-fn one(
+#[cfg(test)]
+thread_local! {
+    /// How many compiled regions this thread has run (a test's check that they were served at all).
+    pub(super) static SERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs a compiled region. `inner` is passed as a fn *item*, never a fn pointer: the fork
+/// identifies a compiled function by the type of what it is given, so one shared pointer type would
+/// give every region the same identity, told apart only by the shapes of their arguments.
+fn call<F>(
     slot: &'static OnceLock<Mutex<CompiledMultiRefs>>,
-    inner: fn(&[Array]) -> std::result::Result<Vec<Array>, Exception>,
+    inner: F,
+    shapeless: bool,
+    args: &[&Array],
+) -> Result<Vec<Array>>
+where
+    F: FnMut(&[Array]) -> std::result::Result<Vec<Array>, Exception> + 'static + Send,
+{
+    #[cfg(test)]
+    SERVED.with(|n| n.set(n.get() + 1));
+    Ok(invoke_compiled_multi_refs(slot, inner, shapeless, args)?)
+}
+
+/// [`call`] for a region with one output.
+fn one<F>(
+    slot: &'static OnceLock<Mutex<CompiledMultiRefs>>,
+    inner: F,
     shapeless: bool,
     args: &[&Array],
     what: &str,
-) -> Result<Array> {
-    let mut out = invoke_compiled_multi_refs(slot, inner, shapeless, args)?;
-    out.pop()
+) -> Result<Array>
+where
+    F: FnMut(&[Array]) -> std::result::Result<Vec<Array>, Exception> + 'static + Send,
+{
+    call(slot, inner, shapeless, args)?
+        .pop()
         .with_context(|| format!("{what}: the compiled graph returned nothing"))
+}
+
+/// Refuses a call whose argument count is not one the region reads (the closures index their
+/// arguments by position, and a wrong count would panic inside the compiler's callback).
+fn arity(what: &str, got: usize, allowed: &[usize]) -> Result<()> {
+    anyhow::ensure!(
+        allowed.contains(&got),
+        "the {what} region takes {allowed:?} arguments, got {got}"
+    );
+    Ok(())
+}
+
+/// Says once that a region was refused because a layer's constants are not the ones it was traced
+/// with (that layer then runs the plain ops: slower, not wrong).
+fn refused(bit: u8, what: &str, held: &dyn std::fmt::Debug, got: &dyn std::fmt::Debug) {
+    static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    if SAID.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        eprintln!(
+            "[inkling2] the compiled {what} region was traced for {held:?}; a layer with {got:?} \
+             runs the plain ops"
+        );
+    }
 }
 
 fn f32_of(x: &Array) -> std::result::Result<Array, Exception> {
     x.as_dtype(Dtype::Float32)
-}
-
-/// `ops::l2_clip`: `[x, scale, threshold]`, a rank-0 `threshold`.
-fn l2_clip_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
-    let (x, scale, threshold) = (&args[0], &args[1], &args[2]);
-    let xf = mlx_rs::ops::multiply(f32_of(x)?, scale)?;
-    let squares = mlx_rs::ops::multiply(&xf, &xf)?;
-    let norm = mlx_rs::ops::sqrt(mlx_rs::ops::sum_axis(&squares, -1, true)?)?;
-    let denom = mlx_rs::ops::add(&norm, Array::from_f32(1e-6))?;
-    let factor = mlx_rs::ops::minimum(
-        mlx_rs::ops::divide(threshold, &denom)?,
-        Array::from_f32(1.0),
-    )?;
-    Ok(vec![
-        mlx_rs::ops::multiply(&xf, &factor)?.as_dtype(x.dtype())?,
-    ])
-}
-
-static L2_CLIP: OnceLock<Mutex<CompiledMultiRefs>> = OnceLock::new();
-
-pub(super) fn l2_clip(x: &Array, scale: &Array, threshold: &Array) -> Result<Array> {
-    one(
-        &L2_CLIP,
-        l2_clip_inner,
-        true,
-        &[x, scale, threshold],
-        "l2_clip",
-    )
 }
 
 /// `ops::softcapped_swiglu`: `[gate, up, gate_cap, up_cap]`, the caps rank 0.
@@ -154,16 +175,16 @@ fn projection_tail(
     (q_scale, r_scale, rel_proj): (&Array, &Array, &Array),
     tau: Option<&Array>,
 ) -> std::result::Result<Vec<Array>, Exception> {
-    use super::ops::{l2_clip_plain, scalar, unit_rms};
+    use super::ops::{l2_clip, scalar, unit_rms};
     let (b, length) = (q.shape()[0], q.shape()[1]);
     let (nh, nkv, hd) = (cfg.heads, cfg.kv_heads, cfg.head_dim);
     let one = scalar(1.0);
-    let q = ex(l2_clip_plain(
+    let q = ex(l2_clip(
         &mlx_rs::ops::reshape(q, &[b, length, nh, hd])?,
         q_scale,
         cfg.qk_clip,
     ))?;
-    let k = ex(l2_clip_plain(
+    let k = ex(l2_clip(
         &mlx_rs::ops::reshape(&k, &[b, length, nkv, hd])?,
         &one,
         cfg.qk_clip,
@@ -173,7 +194,7 @@ fn projection_tail(
         &mlx_rs::ops::reshape(&v, &[b, length, nkv, hd])?.as_dtype(Dtype::Float32)?,
     ))?
     .as_dtype(q.dtype())?;
-    let r = ex(l2_clip_plain(
+    let r = ex(l2_clip(
         &mlx_rs::ops::reshape(r, &[b, length, nh, cfg.d_rel])?,
         r_scale,
         cfg.rel_clip,
@@ -240,10 +261,13 @@ fn project_global_inner(a: &[Array]) -> std::result::Result<Vec<Array>, Exceptio
 /// The compiled projection region of a local layer, or `None` when this layer's constants are not
 /// the ones the region was traced with.
 pub(super) fn project_local(cfg: ProjCfg, args: &[&Array]) -> Result<Option<Vec<Array>>> {
-    if *LOCAL_CFG.get_or_init(|| cfg) != cfg {
+    arity("local projection", args.len(), &[11, 12])?;
+    let held = *LOCAL_CFG.get_or_init(|| cfg);
+    if held != cfg {
+        refused(1, "local projection", &held, &cfg);
         return Ok(None);
     }
-    Ok(Some(invoke_compiled_multi_refs(
+    Ok(Some(call(
         &PROJECT_LOCAL,
         project_local_inner,
         false,
@@ -253,10 +277,13 @@ pub(super) fn project_local(cfg: ProjCfg, args: &[&Array]) -> Result<Option<Vec<
 
 /// [`project_local`] for a global layer.
 pub(super) fn project_global(cfg: ProjCfg, args: &[&Array]) -> Result<Option<Vec<Array>>> {
-    if *GLOBAL_CFG.get_or_init(|| cfg) != cfg {
+    arity("global projection", args.len(), &[11, 12])?;
+    let held = *GLOBAL_CFG.get_or_init(|| cfg);
+    if held != cfg {
+        refused(2, "global projection", &held, &cfg);
         return Ok(None);
     }
-    Ok(Some(invoke_compiled_multi_refs(
+    Ok(Some(call(
         &PROJECT_GLOBAL,
         project_global_inner,
         false,
@@ -280,7 +307,11 @@ pub(super) struct SharedCfg {
 static SHARED_CFG: OnceLock<SharedCfg> = OnceLock::new();
 
 fn claimed(cfg: SharedCfg) -> bool {
-    *SHARED_CFG.get_or_init(|| cfg) == cfg
+    let held = *SHARED_CFG.get_or_init(|| cfg);
+    if held != cfg {
+        refused(4, "residual and mix", &held, &cfg);
+    }
+    held == cfg
 }
 
 fn shared() -> &'static SharedCfg {
@@ -325,10 +356,11 @@ static CONV_NEXT: OnceLock<Mutex<CompiledMultiRefs>> = OnceLock::new();
 
 /// [`conv_residual_inner`] compiled; `None` when the constants are not the claimed ones.
 pub(super) fn conv_residual(cfg: SharedCfg, args: &[&Array]) -> Result<Option<Vec<Array>>> {
+    arity("conv residual", args.len(), &[3, 4])?;
     if !claimed(cfg) {
         return Ok(None);
     }
-    Ok(Some(invoke_compiled_multi_refs(
+    Ok(Some(call(
         &CONV_RESIDUAL,
         conv_residual_inner,
         false,
@@ -338,20 +370,16 @@ pub(super) fn conv_residual(cfg: SharedCfg, args: &[&Array]) -> Result<Option<Ve
 
 /// [`conv_next_inner`] compiled; `None` when the constants are not the claimed ones.
 pub(super) fn conv_next(cfg: SharedCfg, args: &[&Array]) -> Result<Option<Vec<Array>>> {
+    arity("conv next", args.len(), &[4])?;
     if !claimed(cfg) {
         return Ok(None);
     }
-    Ok(Some(invoke_compiled_multi_refs(
-        &CONV_NEXT,
-        conv_next_inner,
-        false,
-        args,
-    )?))
+    Ok(Some(call(&CONV_NEXT, conv_next_inner, false, args)?))
 }
 
 /// Arguments `[x, message, down, gain_forget]`: the loop controllers' mix.
 fn mix_messages_inner(a: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
-    Ok(vec![ex(super::ops::mix_messages_by_row(
+    Ok(vec![ex(super::ops::mix_messages(
         &a[0],
         &a[1],
         &a[2],
@@ -375,6 +403,7 @@ static ATTN_RES_MIX: OnceLock<Mutex<CompiledMultiRefs>> = OnceLock::new();
 
 /// [`mix_messages_inner`] compiled; `None` when the constants are not the claimed ones.
 pub(super) fn mix_messages(cfg: SharedCfg, args: &[&Array]) -> Result<Option<Array>> {
+    arity("mix_messages", args.len(), &[4])?;
     if !claimed(cfg) {
         return Ok(None);
     }
@@ -390,6 +419,12 @@ pub(super) fn mix_messages(cfg: SharedCfg, args: &[&Array]) -> Result<Option<Arr
 
 /// [`attn_res_mix_inner`] compiled; `None` when the constants are not the claimed ones.
 pub(super) fn attn_res_mix(cfg: SharedCfg, args: &[&Array]) -> Result<Option<Array>> {
+    // The partial sum, the query, and at least the one block that is always there.
+    anyhow::ensure!(
+        args.len() >= 2,
+        "the attention-residual mix takes the partial sum, the query and the blocks, got {}",
+        args.len()
+    );
     if !claimed(cfg) {
         return Ok(None);
     }

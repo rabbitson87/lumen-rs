@@ -232,6 +232,7 @@ fn main() -> Result<()> {
             let ids = vec![next; k + 1];
             let mut times = Vec::new();
             let (mut prims, mut dispatches) = (0u64, 0u64);
+            let mut first_call = 0.0f64;
             lumen_mlx::inkling2::stage_reset();
             for round in 0..24 {
                 let (_, d0) = mlx_rs::metal::cmd_buffer_stats().unwrap_or_default();
@@ -239,6 +240,9 @@ fn main() -> Result<()> {
                 let t = Instant::now();
                 let (logits, _) = model.verify(&ids, &mut cache, &tap_ids)?;
                 logits.eval()?;
+                if round == 0 {
+                    first_call = t.elapsed().as_secs_f64() * 1e3;
+                }
                 if round >= 4 {
                     times.push(t.elapsed().as_secs_f64() * 1e3);
                     let (_, d1) = mlx_rs::metal::cmd_buffer_stats().unwrap_or_default();
@@ -249,7 +253,7 @@ fn main() -> Result<()> {
                 cache.rollback(k)?;
             }
             println!(
-                "verify pass over {} tokens: {:.2} ms (median of {}); {prims} primitives, {dispatches} dispatches",
+                "verify pass over {} tokens: {:.2} ms (median of {}); {prims} primitives, {dispatches} dispatches; the first call of this size {first_call:.0} ms",
                 k + 1,
                 median(times.clone()),
                 times.len()

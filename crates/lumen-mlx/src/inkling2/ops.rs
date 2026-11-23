@@ -68,15 +68,6 @@ pub(super) fn softcap(x: &Array, cap: f32) -> Result<Array> {
 /// `_l2_clip`: scale `x` by `scale`, then shrink each last-axis row to norm `threshold` if it is
 /// longer. Computed in float32, returned in `x`'s dtype.
 pub(super) fn l2_clip(x: &Array, scale: &Array, threshold: f32) -> Result<Array> {
-    if fused::enabled() {
-        return fused::l2_clip(x, scale, &scalar(threshold));
-    }
-    l2_clip_plain(x, scale, threshold)
-}
-
-/// [`l2_clip`] as plain ops: what the fused forms are checked against and what the compiled
-/// regions of `fused.rs` are traced from.
-pub(super) fn l2_clip_plain(x: &Array, scale: &Array, threshold: f32) -> Result<Array> {
     let xf = mlx_rs::ops::multiply(f32_of(x)?, scale)?;
     let squares = mlx_rs::ops::multiply(&xf, &xf)?;
     let norm = mlx_rs::ops::sqrt(mlx_rs::ops::sum_axis(&squares, -1, true)?)?;
@@ -208,6 +199,9 @@ pub(super) fn attn_res_mix(
     Ok(mlx_rs::ops::matmul(&weights_t, &src)?)
 }
 
+/// Up to this many rows [`mix_messages`] runs its projections one row at a time.
+const BY_ROW_MAX: usize = 16;
+
 /// `_mix_messages`: the loop controllers, `(1 - tanh(forget)) * x + tanh(gain) * message`, where
 /// gain and forget come from a low-rank projection of the unit-RMS `x` and `message`.
 ///
@@ -223,35 +217,13 @@ pub(super) fn mix_messages(
     gain_forget: &Array,
     round_bf16: bool,
 ) -> Result<Array> {
-    mix_messages_with(x, message, down, gain_forget, round_bf16, false)
-}
-
-/// [`mix_messages`] with the two projections run one row at a time: each is the matrix-vector
-/// product a one-token step runs, so a block of rows gets from every row what a single step gets
-/// (the matrix kernel a multi-row product takes is slower here and rounds differently). For
-/// decode-sized inputs; the batched form stays for prefill, where the rows are many.
-pub(super) fn mix_messages_by_row(
-    x: &Array,
-    message: &Array,
-    down: &Array,
-    gain_forget: &Array,
-    round_bf16: bool,
-) -> Result<Array> {
-    mix_messages_with(x, message, down, gain_forget, round_bf16, true)
-}
-
-fn mix_messages_with(
-    x: &Array,
-    message: &Array,
-    down: &Array,
-    gain_forget: &Array,
-    round_bf16: bool,
-    by_row: bool,
-) -> Result<Array> {
-    // `a @ w` with the rows of `a` (axis 1) taken together, or one at a time.
+    // `a @ w` with the rows of `a` (axis 1) taken one at a time when there are few (the matrix-
+    // vector product a one-token step runs: a block of rows gets from every row what a single step
+    // gets, and avoids the matrix kernel a multi-row product takes, which is slower here and sums in
+    // another order), together when there are many (a prefill, where the rows are the work).
     let project = |a: &Array, w: &Array| -> Result<Array> {
         let rows = a.shape()[1];
-        if !by_row || rows == 1 {
+        if rows as usize > BY_ROW_MAX || rows == 1 {
             return Ok(mlx_rs::ops::matmul(a, w)?);
         }
         let parts = (0..rows)
