@@ -2267,8 +2267,8 @@ static DEFECTS: &[Defect] = &[
         symptom: "the sliding window of a local layer let a token see one more token than the window holds (`<=` for `<`): invisible while a prompt is shorter than the window, wrong from the first token past it",
         revert: &[Mutation {
             path: MLX,
-            find: "mlx_rs::ops::lt(&dist, Array::from_int(window_i))?,",
-            replace: "mlx_rs::ops::le(&dist, Array::from_int(window_i))?, // defect: one too wide",
+            find: "mlx_rs::ops::lt(&dist, Array::from_int(window))?",
+            replace: "mlx_rs::ops::le(&dist, Array::from_int(window))? /* defect: one too wide */",
         }],
         guards: &[mlx(
             "inkling2::tests::a_full_prefill_matches_the_reference_logits",
@@ -2666,6 +2666,19 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "inkling2-mask-geometry-keyed-on-the-shape-alone",
+        symptom: "a block's mask geometry was shared by every layer visit of the same shapes, a sliding layer's with a global one's, so one kind attended with the other's window and the replies drifted without any error",
+        revert: &[Mutation {
+            path: MLX,
+            find: ".find(|(k, _)| *k == key)\n                .map(|(_, g)| g.clone())",
+            replace: ".find(|(k, _)| k.shape == key.shape) /* defect: shapes alone */\n                .map(|(_, g)| g.clone())",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::a_blocks_mask_geometry_is_shared_only_by_layers_that_would_build_the_same",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2819,7 +2832,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "inkling2-fused-residual-forgets-the-stream")
         | (_, "inkling2-fused-mix-doubles-the-softmax-scale")
         | (_, "inkling2-fused-output-subtracts-the-mlp") => "inkling2/fused.rs",
-        (_, "inkling2-mix-projects-the-first-row-for-every-row") => "inkling2/ops.rs",
+        (_, "inkling2-mix-projects-the-first-row-for-every-row")
+        | (_, "inkling2-mask-geometry-keyed-on-the-shape-alone") => "inkling2/ops.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)

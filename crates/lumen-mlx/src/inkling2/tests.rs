@@ -568,3 +568,40 @@ fn the_compiled_regions_give_the_logits_the_plain_ops_give() {
         }
     }
 }
+
+/// A block's mask geometry is shared by the layer visits of a step (`ops::band_geometry`): a sliding
+/// and a global layer on the same shapes, called alternately with the geometries kept, give what each
+/// gives with none kept. (RED if the sharing keyed on the shapes alone: the second kind would read
+/// the first's window.)
+#[test]
+fn a_blocks_mask_geometry_is_shared_only_by_layers_that_would_build_the_same() {
+    use super::ops::{banded_sink_attention, forget_band_geometry};
+    let filled = |n: usize, mul: usize, shape: &[i32]| {
+        let data: Vec<f32> = (0..n)
+            .map(|i| ((i * mul + 3) % 101) as f32 / 50.0 - 1.0)
+            .collect();
+        Array::from_slice(&data, shape)
+    };
+    let (b, hq, hkv, d, length, s, r) = (1, 4, 2, 8, 3, 11, 5);
+    let q = filled((b * hq * length * d) as usize, 7919, &[b, hq, length, d]);
+    let k = filled((b * hkv * s * d) as usize, 6073, &[b, hkv, s, d]);
+    let v = filled((b * hkv * s * d) as usize, 4421, &[b, hkv, s, d]);
+    let rel = filled((b * length * hq * r) as usize, 3331, &[b, length, hq, r]);
+    let sink = filled((b * length * hq) as usize, 1229, &[b, length, hq]);
+    let run = |window: usize| {
+        let out = banded_sink_attention(&q, &k, &v, &rel, &sink, 0.35, window).unwrap();
+        host_f32(&out)
+    };
+    forget_band_geometry();
+    let sliding = run(r as usize);
+    forget_band_geometry();
+    let global = run(0);
+    let alone = (sliding, global);
+    forget_band_geometry();
+    let interleaved = [run(r as usize), run(0), run(r as usize), run(0)];
+    assert_eq!(interleaved[0], alone.0, "sliding, first");
+    assert_eq!(interleaved[1], alone.1, "global after sliding");
+    assert_eq!(interleaved[2], alone.0, "sliding after global");
+    assert_eq!(interleaved[3], alone.1, "global, again");
+    assert_ne!(alone.0, alone.1, "the two kinds are told apart by the data");
+}

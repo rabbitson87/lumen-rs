@@ -365,6 +365,121 @@ fn decode_attention(
     )?)
 }
 
+/// What the additive mask of one block of queries is built from before the layer's own bias comes
+/// in: where each key sits behind each query, which keys a query may see, which lie inside the
+/// bias band, and the constants the mask is filled with. It depends on the shapes and the window
+/// only, so every layer visit of a kind in a decode step needs the same one: a decode-sized block
+/// keeps the last few, and the 40-odd visits after the first take them instead of building them.
+struct BandGeometry {
+    /// `[B, Hq, nq, near]`: the position in the bias band each key reads, clipped into it.
+    gather_at: Array,
+    /// `[nq, near]`: the key is not after the query, and inside the window of a sliding layer.
+    visible: Array,
+    /// `[nq, near]`: the key lies inside the bias band.
+    within: Array,
+    /// `-inf` in the query's dtype.
+    neg: Array,
+    /// `0` in the query's dtype, and in the bias's.
+    zero: Array,
+    zero_bias: Array,
+}
+
+#[derive(Clone, PartialEq)]
+struct BandKey {
+    shape: [i32; 4],
+    shift: i32,
+    r: i32,
+    window: i32,
+    q_dtype: Dtype,
+    bias_dtype: Dtype,
+}
+
+thread_local! {
+    static BAND_GEOMETRY: std::cell::RefCell<Vec<(BandKey, std::rc::Rc<BandGeometry>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many geometries a decode-sized block keeps: a sliding and a global layer's of this step.
+const BAND_GEOMETRY_KEPT: usize = 4;
+
+fn band_geometry(key: BandKey, cache: bool) -> Result<std::rc::Rc<BandGeometry>> {
+    if cache
+        && let Some(hit) = BAND_GEOMETRY.with(|c| {
+            c.borrow()
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, g)| g.clone())
+        })
+    {
+        return Ok(hit);
+    }
+    let [b, hq, nq, near] = key.shape;
+    let (r, window) = (key.r, key.window);
+    // dist[i, j]: how far key `f + j` lies behind query `i0 + i`.
+    let rows = Array::arange::<_, i32>(None, nq, None)?;
+    let cols = Array::arange::<_, i32>(None, near, None)?;
+    let dist = mlx_rs::ops::subtract(
+        mlx_rs::ops::add(
+            mlx_rs::ops::reshape(&rows, &[nq, 1])?,
+            Array::from_int(key.shift),
+        )?,
+        mlx_rs::ops::reshape(&cols, &[1, near])?,
+    )?;
+    let clipped = mlx_rs::ops::minimum(
+        mlx_rs::ops::maximum(&dist, Array::from_int(0))?,
+        Array::from_int(r - 1),
+    )?;
+    let mut visible = mlx_rs::ops::ge(&dist, Array::from_int(0))?;
+    if window > 0 {
+        visible =
+            mlx_rs::ops::logical_and(&visible, mlx_rs::ops::lt(&dist, Array::from_int(window))?)?;
+    }
+    let geometry = std::rc::Rc::new(BandGeometry {
+        gather_at: mlx_rs::ops::broadcast_to(&clipped, &[b, hq, nq, near])?,
+        visible,
+        within: mlx_rs::ops::lt(&dist, Array::from_int(r))?,
+        neg: scalar(f32::NEG_INFINITY).as_dtype(key.q_dtype)?,
+        zero: scalar(0.0).as_dtype(key.q_dtype)?,
+        zero_bias: scalar(0.0).as_dtype(key.bias_dtype)?,
+    });
+    if cache {
+        BAND_GEOMETRY.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= BAND_GEOMETRY_KEPT {
+                c.remove(0);
+            }
+            c.push((key, geometry.clone()));
+        });
+    }
+    Ok(geometry)
+}
+
+thread_local! {
+    static SINK_ROWS: std::cell::RefCell<Vec<((i32, i32, i32, Dtype), Array)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The zero key or value row that stands for the sink in front of the keys: one per shape and
+/// dtype, made once and evaluated, not a fill kernel on every layer visit.
+fn sink_row(b: i32, hkv: i32, d: i32, dtype: Dtype) -> Result<Array> {
+    SINK_ROWS.with(|rows| {
+        let key = (b, hkv, d, dtype);
+        if let Some((_, row)) = rows.borrow().iter().find(|(k, _)| *k == key) {
+            return Ok(row.clone());
+        }
+        let row = mlx_rs::ops::zeros_dtype(&[b, hkv, 1, d], dtype)?;
+        row.eval()?;
+        rows.borrow_mut().push((key, row.clone()));
+        Ok(row)
+    })
+}
+
+/// Drops the kept geometries (the test of the sharing starts from none).
+#[cfg(test)]
+pub(super) fn forget_band_geometry() {
+    BAND_GEOMETRY.with(|c| c.borrow_mut().clear());
+}
+
 /// `_masked_attention`: SDPA over an additive mask that carries the relative-bias band and the
 /// sinks. A zero key and value row in front of the keys stands for the sink: its logit is the
 /// mask's first column.
@@ -396,13 +511,12 @@ fn masked_attention(
         0
     };
     let hkv = k.shape()[1];
-    let zero = mlx_rs::ops::zeros_dtype(&[b, hkv, 1, d], k.dtype())?;
+    let zero = sink_row(b, hkv, d, k.dtype())?;
     let kz = mlx_rs::ops::concatenate_axis(&[&zero, &k.try_index((.., .., lo.., ..))?], 2)?;
     let vz = mlx_rs::ops::concatenate_axis(&[&zero, &v.try_index((.., .., lo.., ..))?], 2)?;
     let nk = s - lo;
     let budget_rows = MASK_BUDGET / i64::from((b * hq * (nk + 1)).max(1));
     let qb = (budget_rows.min(i64::from(length)) as i32).max(16);
-    let neg = scalar(f32::NEG_INFINITY).as_dtype(q.dtype())?;
     let mut outs: Vec<Array> = Vec::new();
     let mut i0 = 0;
     while i0 < length {
@@ -412,38 +526,23 @@ fn masked_attention(
         let hi = s - length + i1;
         let f = lo.max(a0 - r + 1);
         let near = hi - f;
-        // dist[i, j]: how far key `f + j` lies behind query `i0 + i`.
-        let rows = Array::arange::<_, i32>(None, nq, None)?;
-        let cols = Array::arange::<_, i32>(None, near, None)?;
-        let dist = mlx_rs::ops::subtract(
-            mlx_rs::ops::add(
-                mlx_rs::ops::reshape(&rows, &[nq, 1])?,
-                Array::from_int(a0 - f),
-            )?,
-            mlx_rs::ops::reshape(&cols, &[1, near])?,
+        let geo = band_geometry(
+            BandKey {
+                shape: [b, hq, nq, near],
+                shift: a0 - f,
+                r,
+                window: window_i,
+                q_dtype: q.dtype(),
+                bias_dtype: rel.dtype(),
+            },
+            nq <= super::fused::DECODE_ROWS as i32,
         )?;
+        let neg = &geo.neg;
         let rel_q =
             mlx_rs::ops::transpose_axes(&rel.try_index((.., i0..i1, .., ..))?, &[0, 2, 1, 3])?;
-        let clipped = mlx_rs::ops::minimum(
-            mlx_rs::ops::maximum(&dist, Array::from_int(0))?,
-            Array::from_int(r - 1),
-        )?;
-        let gather_at = mlx_rs::ops::broadcast_to(&clipped, &[b, hq, nq, near])?;
-        let bias = take_along_axis(&rel_q, &gather_at, -1)?;
-        let mut visible = mlx_rs::ops::ge(&dist, Array::from_int(0))?;
-        if window > 0 {
-            visible = mlx_rs::ops::logical_and(
-                &visible,
-                mlx_rs::ops::lt(&dist, Array::from_int(window_i))?,
-            )?;
-        }
-        let zero_bias = scalar(0.0).as_dtype(bias.dtype())?;
-        let in_band = mlx_rs::ops::r#where(
-            &mlx_rs::ops::lt(&dist, Array::from_int(r))?,
-            &bias,
-            &zero_bias,
-        )?;
-        let near_mask = mlx_rs::ops::r#where(&visible, &in_band, &neg)?;
+        let bias = take_along_axis(&rel_q, &geo.gather_at, -1)?;
+        let in_band = mlx_rs::ops::r#where(&geo.within, &bias, &geo.zero_bias)?;
+        let near_mask = mlx_rs::ops::r#where(&geo.visible, &in_band, neg)?;
         let sink_col = mlx_rs::ops::expand_dims(
             mlx_rs::ops::transpose_axes(&sink.try_index((.., i0..i1, ..))?, &[0, 2, 1])?,
             -1,
@@ -454,13 +553,13 @@ fn masked_attention(
             let fill = if window > 0 {
                 neg.clone()
             } else {
-                scalar(0.0).as_dtype(q.dtype())?
+                geo.zero.clone()
             };
             parts.push(mlx_rs::ops::broadcast_to(&fill, &[b, hq, nq, f - lo])?);
         }
         parts.push(near_mask.as_dtype(q.dtype())?);
         if hi < s {
-            parts.push(mlx_rs::ops::broadcast_to(&neg, &[b, hq, nq, s - hi])?);
+            parts.push(mlx_rs::ops::broadcast_to(neg, &[b, hq, nq, s - hi])?);
         }
         let refs: Vec<&Array> = parts.iter().collect();
         let mask = mlx_rs::ops::concatenate_axis(&refs, -1)?;
