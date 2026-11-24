@@ -2494,7 +2494,16 @@ mod real_checkpoint_tests {
     /// differently from single-token steps in bfloat16, so it can pick the other of two tokens the
     /// plain loop barely preferred. This feeds the plain loop's own continuation back in blocks of 8
     /// (what a verify pass does) and checks that wherever the block pass disagrees with the plain
-    /// choice, the two tokens were within bfloat16 noise of each other in that pass too.
+    /// choice, the two tokens were close in that pass too.
+    ///
+    /// Two top logits that are exactly equal (bfloat16 has few values) are a tie, which the argmax
+    /// breaks one way or the other, not a disagreement; they are counted apart. The bounds come from
+    /// measurement, not from this test's three prompts: over 20 prompts and 2,745 positions per
+    /// regime (`a_kernel_flips_the_greedy_choice_only_at_near_ties_like_a_block_pass`) the verify
+    /// blocks flip 0.87 to 1.28% of the positions, up to 7.3 bfloat16 steps (the loop's bf16 rounding
+    /// staircases turn rounding noise into a flip of a step or two, and now and then of several),
+    /// and the default-on kernels 0.7 to 1.1%, up to 8.7. So a flip may be up to 10 steps and may
+    /// touch up to 3% of the positions; a wrong verify pass moves most of the logits, not a few.
     #[test]
     #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
     fn a_batched_pass_disagrees_with_single_steps_only_at_near_ties() {
@@ -2504,8 +2513,9 @@ mod real_checkpoint_tests {
         // The largest margin in units of the bfloat16 step at the top logit (a bf16 value is only exact to
         // one step, and the two passes can each be a step off).
         let mut worst = 0.0f32;
-        let mut disagreements = 0;
-        let mut compared = 0;
+        let mut disagreements = 0usize;
+        let mut ties = 0usize;
+        let mut compared = 0usize;
         for (prompt, thinking) in [
             (
                 "Write a Python function that returns the n-th Fibonacci number using memoization, with a short docstring.",
@@ -2553,6 +2563,10 @@ mod real_checkpoint_tests {
                         compared += 1;
                         if got != want {
                             let margin = row[got as usize] - row[want as usize];
+                            if margin <= 0.0 {
+                                ties += 1;
+                                continue;
+                            }
                             eprintln!(
                                 "position {} of {:?}... in blocks of {size}: plain {want}, block pass {got}, the block pass prefers it by {margin:.3} (of a top logit {:.1})",
                                 n * size + j,
@@ -2568,11 +2582,15 @@ mod real_checkpoint_tests {
             }
         }
         eprintln!(
-            "{disagreements} of {compared} positions differ, the largest margin {worst:.2} bfloat16 steps"
+            "{disagreements} of {compared} positions differ (and {ties} exact ties), the largest margin {worst:.2} bfloat16 steps"
         );
         assert!(
-            worst <= 3.0,
+            worst <= 10.0,
             "a disagreement that is not a near tie: the block pass prefers the other token by {worst} bfloat16 steps"
+        );
+        assert!(
+            disagreements as f64 <= 0.03 * compared as f64,
+            "the block pass disagrees with the plain loop at {disagreements} of {compared} positions, more than the 3% the shipped verify blocks come to"
         );
     }
 
