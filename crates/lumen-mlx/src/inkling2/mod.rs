@@ -27,6 +27,8 @@ mod draft_tests;
 mod fused;
 mod manifest;
 #[cfg(feature = "mlx-native")]
+mod mix_kernel;
+#[cfg(feature = "mlx-native")]
 mod model;
 #[cfg(feature = "mlx-native")]
 mod ops;

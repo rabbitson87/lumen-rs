@@ -569,6 +569,64 @@ fn assert_same_logits(label: &str, plain: &[Vec<f32>], fused: &[Vec<f32>]) {
     }
 }
 
+/// The mix kernel (`mix_kernel.rs`) gives the logits the composed mix gives: the same steps with it
+/// on and off, over single tokens and over blocks of rows. It sums in another order than the
+/// composed matmuls, so one mix differs by float32 rounding (the unit test bounds that, at 6e-7) and
+/// the 48 visits of the replica amplify it a thousandfold: the bound here, 2e-3 of the largest
+/// logit, is where the reference-parity tests put theirs, and a wrong formula moves the logits by
+/// 1e-2 or more. The replica as serving runs it rounds the loop controllers through bf16, a
+/// staircase that float32 noise crosses at a few elements and the 48 visits turn into jumps of
+/// order one (any change of numerics does, and the continuation of the real model can part at a near
+/// tie for the same reason), so there no bound means anything: that replica only checks that the
+/// kernel runs and the logits stay finite. A run with the kernel on launches it, one with it off does
+/// not.
+#[test]
+fn the_mix_kernel_gives_the_logits_the_composed_mix_gives() {
+    for (name, model, bound) in [
+        ("replica", load_replica(), Some(2e-3f32)),
+        ("rounded replica", load_replica_rounded(), None),
+    ] {
+        let before = super::mix_kernel::launches();
+        let off = super::mix_kernel::kernel::with(false, || steps_with(&model, true));
+        assert_eq!(
+            super::mix_kernel::launches(),
+            before,
+            "{name}: the kernel ran while it was off"
+        );
+        let on = super::mix_kernel::kernel::with(true, || steps_with(&model, true));
+        assert!(
+            super::mix_kernel::launches() > before,
+            "{name}: the kernel never ran while it was on"
+        );
+        for (label, a, b) in [("single tokens", &off.0, &on.0), ("blocks", &off.1, &on.1)] {
+            assert_eq!(a.len(), b.len());
+            for (step, (p, k)) in a.iter().zip(b).enumerate() {
+                let (mut worst, mut scale) = (0.0f32, 0.0f32);
+                for (x, y) in p.iter().zip(k) {
+                    assert_eq!(
+                        x.is_finite(),
+                        y.is_finite(),
+                        "{name}, {label}, step {step}: a masked id differs"
+                    );
+                    if x.is_finite() {
+                        worst = worst.max((x - y).abs());
+                        scale = scale.max(x.abs());
+                    }
+                }
+                eprintln!(
+                    "{name}, {label}, step {step}: mix kernel differs by {worst:.2e} of {scale:.1}"
+                );
+                if let Some(bound) = bound {
+                    assert!(
+                        worst <= bound * scale.max(1.0),
+                        "{name}, {label}, step {step}: the mix kernel differs from the composed mix by {worst} of {scale}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The regions `fused.rs` compiles, under the names it counts them by.
 const REGIONS: [&str; 7] = [
     "swiglu",

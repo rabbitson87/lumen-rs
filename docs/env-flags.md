@@ -25,6 +25,7 @@ value → on.
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
 | `LUMEN_INKLING2_DRAFT` | on | Behavior | `lumen_mlx::inkling2::backend::inkling2_draft` |
 | `LUMEN_INKLING2_FUSE` | on | Optimization | `lumen_mlx::inkling2::fused::fuse` |
+| `LUMEN_INKLING2_MIX_KERNEL` | off | Behavior | `lumen_mlx::inkling2::mix_kernel::kernel` |
 | `LUMEN_INKLING2_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::inkling2::profile::stage_sync` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
@@ -244,6 +245,16 @@ Speculative decoding for Inkling 2: the checkpoint's bundled DSpark draft head
 
 Serve the compiled (fused) forms of the Inkling 2 elementwise helpers: the length-1 decode
  step makes a third of the kernel dispatches. `=0` restores the plain composed ops.
+
+### `LUMEN_INKLING2_MIX_KERNEL`
+
+*Behavior, default off.*
+
+Mix the Inkling 2 depth sources (the attention residual) in one Metal kernel instead of
+ the composed ops: a dozen launches a call become one, a decode token about 2 ms (6%) faster.
+ The kernel sums in another order than the composed ops' matmuls, so the mix differs at
+ float32 rounding and a greedy continuation can part from the composed form's at a near
+ tie: a different-but-equivalent numeric regime, not a pure optimization.
 
 ### `LUMEN_INKLING2_STAGE_SYNC`
 

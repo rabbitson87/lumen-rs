@@ -2773,6 +2773,110 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "inkling2-mix-kernel-skips-the-softmax-shift",
+        symptom: "the mix kernel took the exponential of the raw logits, so a source far ahead of the rest overflowed the softmax to infinity and the layer's input became NaN",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float e = exp(weight[s * Q + tid] - top);",
+            replace: "const float e = exp(weight[s * Q + tid]); // defect: no shift by the maximum",
+        }],
+        guards: &[mlx(
+            "inkling2::mix_kernel::tests::a_dominant_source_wins_without_overflow",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-kernel-forgets-the-scale",
+        symptom: "the mix kernel did not scale its dots, so the depth sources were weighed by a softmax far sharper than the model's in every layer",
+        revert: &[Mutation {
+            path: MLX,
+            find: "weight[s0 * Q + tid] = total * scale;",
+            replace: "weight[s0 * Q + tid] = total; // defect: the scale is not applied",
+        }],
+        guards: &[mlx(
+            "inkling2::mix_kernel::tests::the_kernel_gives_the_composed_mix",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-kernel-does-not-normalise-the-weights",
+        symptom: "the mix kernel weighed the sources by their unnormalised exponentials, so a layer's input was scaled by the sum of them",
+        revert: &[Mutation {
+            path: MLX,
+            find: "weight[s * Q + tid] /= total;",
+            replace: "weight[s * Q + tid] *= 1.0f; // defect: the weights are not divided by their sum",
+        }],
+        guards: &[mlx(
+            "inkling2::mix_kernel::tests::the_kernel_gives_the_composed_mix",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-kernel-drops-a-simdgroups-share-of-the-dot",
+        symptom: "the mix kernel summed the dot's partial sums over all but the last simdgroup, so every logit lacked that simdgroup's share of the hidden axis (an eighteenth at the model's width)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "for (int g = 0; g < SIMDS; ++g) {",
+            replace: "for (int g = 0; g < SIMDS - 1; ++g) { // defect: the last simdgroup's share is dropped",
+        }],
+        guards: &[mlx(
+            "inkling2::mix_kernel::tests::the_kernel_gives_the_composed_mix",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-kernel-weighs-the-sources-in-reverse",
+        symptom: "the mix kernel gave each source the weight of the one at the mirrored position, so the newest block carried the oldest one's weight",
+        revert: &[Mutation {
+            path: MLX,
+            find: "acc[q] += weight[s * Q + q] * v;",
+            replace: "acc[q] += weight[(sources - 1 - s) * Q + q] * v; // defect: the weights are mirrored",
+        }],
+        guards: &[mlx(
+            "inkling2::mix_kernel::tests::the_kernel_gives_the_composed_mix",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-kernel-stops-after-the-first-tile-of-sources",
+        symptom: "the mix kernel read the logits of the first twelve sources only, so with more depth sources than that the rest were weighed by whatever the threadgroup memory held",
+        revert: &[Mutation {
+            path: MLX,
+            find: "for (int s0 = 0; s0 < sources; s0 += TILE) {",
+            replace: "for (int s0 = 0; s0 < sources && s0 < TILE; s0 += TILE) { // defect: one tile only",
+        }],
+        guards: &[mlx(
+            "inkling2::mix_kernel::tests::the_kernel_gives_the_composed_mix",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-kernel-is-never-launched",
+        symptom: "the layer's mix ran the compiled form although the kernel was on, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "(true, true) => mix_kernel::attn_res_mix,",
+            replace: "(true, true) => fused::attn_res_mix, // defect: the kernel is never chosen",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_mix_kernel_gives_the_logits_the_composed_mix_gives",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-kernel-runs-while-off",
+        symptom: "the layer's mix launched the kernel although it was off, so the default path ran a different numeric regime than the flag said",
+        revert: &[Mutation {
+            path: MLX,
+            find: "(true, false) => fused::attn_res_mix,",
+            replace: "(true, false) => mix_kernel::attn_res_mix, // defect: the kernel runs while off",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_mix_kernel_gives_the_logits_the_composed_mix_gives",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2930,6 +3034,16 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "inkling2-fused-mix-doubles-the-softmax-scale") => "inkling2/fused.rs",
         (_, "compile-constants-left-out-of-the-key")
         | (_, "compile-regions-share-one-identity") => "keyed_compile.rs",
+        (_, "inkling2-mix-kernel-skips-the-softmax-shift")
+        | (_, "inkling2-mix-kernel-forgets-the-scale")
+        | (_, "inkling2-mix-kernel-does-not-normalise-the-weights")
+        | (_, "inkling2-mix-kernel-drops-a-simdgroups-share-of-the-dot")
+        | (_, "inkling2-mix-kernel-weighs-the-sources-in-reverse")
+        | (_, "inkling2-mix-kernel-stops-after-the-first-tile-of-sources") => {
+            "inkling2/mix_kernel.rs"
+        }
+        (_, "inkling2-mix-kernel-is-never-launched")
+        | (_, "inkling2-mix-kernel-runs-while-off") => "inkling2/model.rs",
         (_, "inkling2-fused-swiglu-skips-the-cap")
         | (_, "inkling2-mix-projects-the-first-row-for-every-row")
         | (_, "inkling2-mask-geometry-keyed-on-the-shape-alone") => "inkling2/ops.rs",

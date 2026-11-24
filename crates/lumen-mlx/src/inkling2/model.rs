@@ -15,6 +15,7 @@ use mlx_rs::ops::indexing::{TryIndexOp, take_axis};
 use mlx_rs::{Array, Dtype};
 
 use super::fused;
+use super::mix_kernel;
 use super::ops::{
     attn_res_mix, banded_sink_attention, dynamic_conv_scale, mix_messages, next_conv_state, owned,
     route_topk, scalar, softcap, softcapped_swiglu, static_conv_scale, unit_rms,
@@ -284,12 +285,13 @@ impl AttnResQuery {
         })
     }
 
-    /// The mix of the depth sources, compiled when `fuse` (decode-sized, `fused.rs`).
+    /// The mix of the depth sources: one Metal kernel when `fuse` (decode-sized) and the kernel is
+    /// on (`mix_kernel.rs`), compiled when only `fuse` (`fused.rs`), the composed ops otherwise.
     fn mix(&self, blocks: &[Array], partial_n: &Array, fuse: bool) -> Result<Array> {
-        let run = if fuse {
-            fused::attn_res_mix
-        } else {
-            attn_res_mix
+        let run = match (fuse, mix_kernel::enabled()) {
+            (true, true) => mix_kernel::attn_res_mix,
+            (true, false) => fused::attn_res_mix,
+            (false, _) => attn_res_mix,
         };
         run(blocks, partial_n, &self.query, self.scale)
     }
