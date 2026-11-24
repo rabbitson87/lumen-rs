@@ -25,8 +25,8 @@ value → on.
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
 | `LUMEN_INKLING2_DRAFT` | on | Behavior | `lumen_mlx::inkling2::backend::inkling2_draft` |
 | `LUMEN_INKLING2_FUSE` | on | Optimization | `lumen_mlx::inkling2::fused::fuse` |
-| `LUMEN_INKLING2_MIX_KERNEL` | off | Behavior | `lumen_mlx::inkling2::mix_kernel::kernel` |
-| `LUMEN_INKLING2_ROUTE_KERNEL` | off | Behavior | `lumen_mlx::inkling2::route_kernel::kernel` |
+| `LUMEN_INKLING2_MIX_KERNEL` | on | Behavior | `lumen_mlx::inkling2::mix_kernel::kernel` |
+| `LUMEN_INKLING2_ROUTE_KERNEL` | on | Behavior | `lumen_mlx::inkling2::route_kernel::kernel` |
 | `LUMEN_INKLING2_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::inkling2::profile::stage_sync` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
@@ -249,7 +249,7 @@ Serve the compiled (fused) forms of the Inkling 2 elementwise helpers: the lengt
 
 ### `LUMEN_INKLING2_MIX_KERNEL`
 
-*Behavior, default off.*
+*Behavior, default on.*
 
 Mix the Inkling 2 depth sources (the attention residual) in one Metal kernel instead of
  the composed ops: a dozen launches a call become one, a decode token about 2 ms (6%) faster.
@@ -257,15 +257,25 @@ Mix the Inkling 2 depth sources (the attention residual) in one Metal kernel ins
  float32 rounding and a greedy continuation can part from the composed form's at a near
  tie: a different-but-equivalent numeric regime, not a pure optimization.
 
+ On by default. Teacher-forced over 2,745 positions of 20 prompts it flips the greedy choice
+ at 0.69% of them, none by more than 2.7 bfloat16 steps, against 0.9 to 1.3% (up to 7 steps)
+ for the verify blocks that `LUMEN_INKLING2_DRAFT` ships on. `=0` restores the composed ops.
+
 ### `LUMEN_INKLING2_ROUTE_KERNEL`
 
-*Behavior, default off.*
+*Behavior, default on.*
 
 Pick each token's experts in one Metal kernel instead of the composed ops (a sigmoid, an
  `argpartition`, a gather, a renormalisation: about ten launches a layer visit become one).
  The kernel returns the chosen experts best first and not in `argpartition`'s order, so the
  experts' weighted sum adds in another order: a different-but-equivalent numeric regime, not a
  pure optimization. Decode-sized passes only (a verify block too): prefill keeps the composed ops.
+
+ On by default: a decode token about 0.7 ms (2%) faster (16 same-session runs, standard error
+ 0.17 ms). Teacher-forced over 2,745 positions of 20 prompts it flips the greedy choice at 1.09%
+ of them, none by more than 1.7 bfloat16 steps (together with the mix kernel 1.06%, up to
+ 8.7 steps), against 0.9 to 1.3% (up to 7 steps) for the verify blocks that
+ `LUMEN_INKLING2_DRAFT` ships on. `=0` restores the composed ops.
 
 ### `LUMEN_INKLING2_STAGE_SYNC`
 

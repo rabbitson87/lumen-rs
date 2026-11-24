@@ -705,6 +705,14 @@ const REGIONS: [&str; 7] = [
     "attention-residual mix",
 ];
 
+/// Runs `f` with the `Behavior` kernels (the mix and the router) off. The compiled regions are an
+/// `Optimization`: bit for bit the plain ops, and the compiled attention-residual mix is the form a
+/// pass takes when the mix kernel is off. The tests of that contract compare the composed forms, which
+/// the kernels replace when they are on (as they are by default).
+fn without_kernels<R>(f: impl FnOnce() -> R) -> R {
+    super::mix_kernel::kernel::with(false, || super::route_kernel::kernel::with(false, f))
+}
+
 /// How many times each region has been served since `before`.
 fn served_since(before: &BTreeMap<&'static str, usize>) -> Vec<(&'static str, usize)> {
     let now = super::fused::served();
@@ -731,22 +739,24 @@ fn assert_every_region_served(label: &str, before: &BTreeMap<&'static str, usize
 /// models load in one process, the second after the first has compiled its regions.
 #[test]
 fn the_compiled_regions_give_the_logits_the_plain_ops_give() {
-    for (label, model) in [
-        ("replica", load_replica()),
-        ("rounded replica", load_replica_rounded()),
-    ] {
-        let before = super::fused::served();
-        let off = steps_with(&model, false);
-        assert_eq!(
-            super::fused::served(),
-            before,
-            "{label}: the plain run served a region"
-        );
-        let on = steps_with(&model, true);
-        assert_every_region_served(label, &before);
-        assert_same_logits(&format!("{label}, token by token"), &off.0, &on.0);
-        assert_same_logits(&format!("{label}, in blocks"), &off.1, &on.1);
-    }
+    without_kernels(|| {
+        for (label, model) in [
+            ("replica", load_replica()),
+            ("rounded replica", load_replica_rounded()),
+        ] {
+            let before = super::fused::served();
+            let off = steps_with(&model, false);
+            assert_eq!(
+                super::fused::served(),
+                before,
+                "{label}: the plain run served a region"
+            );
+            let on = steps_with(&model, true);
+            assert_every_region_served(label, &before);
+            assert_same_logits(&format!("{label}, token by token"), &off.0, &on.0);
+            assert_same_logits(&format!("{label}, in blocks"), &off.1, &on.1);
+        }
+    });
 }
 
 /// The replica with other clip thresholds in its config: the same shapes and weights, other
@@ -799,29 +809,31 @@ fn worst_difference(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 /// logits, so the test cannot pass by the two models computing the same thing.
 #[test]
 fn a_model_with_other_constants_is_served_graphs_of_its_own() {
-    let a = load_replica_rounded();
-    let (b, _dir) = load_replica_with_clips(0.4, 0.2);
-    let a_first = steps_with(&a, true);
-    let before_b = super::fused::served();
-    let b_compiled = steps_with(&b, true);
-    assert_every_region_served("the second model", &before_b);
-    let a_again = steps_with(&a, true);
-    let b_plain = steps_with(&b, false);
-    assert_same_logits("the second model, compiled", &b_plain.0, &b_compiled.0);
-    assert_same_logits(
-        "the second model, compiled, in blocks",
-        &b_plain.1,
-        &b_compiled.1,
-    );
-    assert_same_logits(
-        "the first model after the second ran",
-        &a_first.0,
-        &a_again.0,
-    );
-    assert!(
-        worst_difference(&a_first.0, &b_compiled.0) > 1e-3,
-        "the clip thresholds move nothing, so this test proves nothing"
-    );
+    without_kernels(|| {
+        let a = load_replica_rounded();
+        let (b, _dir) = load_replica_with_clips(0.4, 0.2);
+        let a_first = steps_with(&a, true);
+        let before_b = super::fused::served();
+        let b_compiled = steps_with(&b, true);
+        assert_every_region_served("the second model", &before_b);
+        let a_again = steps_with(&a, true);
+        let b_plain = steps_with(&b, false);
+        assert_same_logits("the second model, compiled", &b_plain.0, &b_compiled.0);
+        assert_same_logits(
+            "the second model, compiled, in blocks",
+            &b_plain.1,
+            &b_compiled.1,
+        );
+        assert_same_logits(
+            "the first model after the second ran",
+            &a_first.0,
+            &a_again.0,
+        );
+        assert!(
+            worst_difference(&a_first.0, &b_compiled.0) > 1e-3,
+            "the clip thresholds move nothing, so this test proves nothing"
+        );
+    });
 }
 
 /// A block's mask geometry is shared by the layer visits of a step (`ops::band_geometry`): a sliding

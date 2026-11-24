@@ -2205,6 +2205,30 @@ mod real_checkpoint_tests {
         Inkling2Backend::from_dir("inkling2", Path::new(&dir)).expect("load")
     }
 
+    /// Prompts of the regime comparisons: short answers, code, arithmetic, translation, lists.
+    const PROMPTS: [&str; 20] = [
+        "Name one primary color. One word.",
+        "What is the capital of France? One short sentence.",
+        "Write a Python function that returns the nth Fibonacci number, with a docstring.",
+        "Explain in three sentences why the sky is blue.",
+        "Translate to French: 'The meeting has been moved to Thursday afternoon.'",
+        "Write a haiku about autumn rain.",
+        "What is 17 * 23? Show the steps.",
+        "List five prime numbers greater than 50.",
+        "Summarize the plot of Romeo and Juliet in two sentences.",
+        "Write a SQL query that finds the second highest salary in an employees table.",
+        "Give me a short packing list for a three day hiking trip.",
+        "What is the difference between a process and a thread?",
+        "Write a limerick about a cat who learns to code.",
+        "Translate to Korean: 'Where is the nearest train station?'",
+        "Is 9973 a prime number? Explain briefly.",
+        "Write a bash one-liner that counts the lines of every .rs file in a directory.",
+        "Describe the water cycle for a ten year old.",
+        "If a train leaves at 3:15 pm and the trip takes 2 hours 50 minutes, when does it arrive?",
+        "Give two pros and two cons of using a monorepo.",
+        "Write a short, polite email declining a meeting invitation.",
+    ];
+
     /// One greedy turn over `turns`, returning what the model said.
     fn greedy(b: &mut Inkling2Backend, turns: &[ChatTurn<'_>], max_new: usize) -> ParsedResponse {
         let ov = SamplingOverrides::default();
@@ -2630,5 +2654,205 @@ mod real_checkpoint_tests {
         assert!(pieces >= 3);
         assert!(b.last_run().generated_tokens < 200);
         let _ = reply;
+    }
+
+    /// Numeric regimes against the served one, over many prompts, greedy, each from a cold prefill
+    /// (the retained caches are dropped between runs so one regime's caches never serve another's
+    /// request). The reference is the default: composed mix, composed router, drafting on. Each
+    /// variant turns one thing: the mix kernel, the router kernel, both, and drafting off. Drafting
+    /// off is a weak control, not a measure of noise: on text the draft cannot predict the controller
+    /// falls back to single-token steps, so it parts nowhere on these prompts. The test prints, per
+    /// prompt, where each variant parts (`=` when it does not) and a tally; it asserts only that
+    /// every run says something, because a part at a near tie is not a failure. How often a regime
+    /// flips a choice is measured position by position in
+    /// `a_kernel_flips_the_greedy_choice_only_at_near_ties_like_a_block_pass`.
+    #[test]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
+    fn the_kernels_keep_the_greedy_text_over_many_prompts() {
+        // (name, mix kernel, router kernel, drafting)
+        const VARIANTS: [(&str, bool, bool, bool); 4] = [
+            ("mix", true, false, true),
+            ("route", false, true, true),
+            ("both", true, true, true),
+            ("control: no drafting", false, false, false),
+        ];
+        const MAX_NEW: usize = 160;
+        let mut b = backend();
+        let mut said = |mix: bool, route: bool, draft: bool, prompt: &str| -> String {
+            b.clear_retained();
+            let turns = [ChatTurn::User(prompt)];
+            let reply = inkling2_draft::with(draft, || {
+                super::super::mix_kernel::kernel::with(mix, || {
+                    super::super::route_kernel::kernel::with(route, || {
+                        greedy(&mut b, &turns, MAX_NEW)
+                    })
+                })
+            });
+            format!("{}{}", reply.reasoning, reply.visible)
+        };
+        let mut splits: Vec<Vec<usize>> = vec![Vec::new(); VARIANTS.len()];
+        for (at, prompt) in PROMPTS.iter().enumerate() {
+            let reference = said(false, false, true, prompt);
+            assert!(!reference.is_empty(), "prompt {at} said nothing");
+            let mut line = format!("[{at:>2}] of {:>4} chars:", reference.chars().count());
+            for (v, (name, mix, route, draft)) in VARIANTS.iter().enumerate() {
+                let text = said(*mix, *route, *draft, prompt);
+                assert!(!text.is_empty(), "prompt {at} said nothing with {name}");
+                if text == reference {
+                    line.push_str(&format!("  {name}: ="));
+                } else {
+                    let split = reference
+                        .chars()
+                        .zip(text.chars())
+                        .position(|(x, y)| x != y)
+                        .unwrap_or_else(|| reference.chars().count().min(text.chars().count()));
+                    line.push_str(&format!("  {name}: parts@{split}"));
+                    splits[v].push(split);
+                }
+            }
+            eprintln!("{line}");
+        }
+        for (v, (name, ..)) in VARIANTS.iter().enumerate() {
+            let mut s = splits[v].clone();
+            s.sort_unstable();
+            eprintln!(
+                "{name}: {} of {} parted from the reference; earliest chars {:?}, median {}",
+                s.len(),
+                PROMPTS.len(),
+                &s[..s.len().min(5)],
+                s.get(s.len() / 2).copied().unwrap_or(0)
+            );
+        }
+    }
+
+    /// How often each regime flips the greedy choice, position by position, and by how much. The
+    /// plain loop's own continuation (kernels off, no drafting) of each prompt is fed back with each
+    /// regime on: single steps with the mix kernel, the router kernel and both, and, as the baseline
+    /// the project already ships, a pass over blocks of 2, 4 and 8 tokens as a verify pass has. At
+    /// every position the regime's argmax is compared with the plain choice. Two top logits that are
+    /// exactly equal (bfloat16 has few values, so it happens) are a tie, which the argmax breaks one
+    /// way or the other, not a flip; a flip is measured in units of the bfloat16 step at the top
+    /// logit (a few steps is a near tie, what
+    /// `a_batched_pass_disagrees_with_single_steps_only_at_near_ties` accepts). Single steps with
+    /// every kernel off must flip nothing: the determinism the other rows are measured against.
+    /// It prints the table and every margin above 3 steps and asserts only that determinism.
+    #[test]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
+    fn a_kernel_flips_the_greedy_choice_only_at_near_ties_like_a_block_pass() {
+        const NEW_TOKENS: usize = 150;
+        // (name, mix kernel, router kernel, block size)
+        const REGIMES: [(&str, bool, bool, usize); 7] = [
+            (
+                "single steps, every kernel off (determinism)",
+                false,
+                false,
+                1,
+            ),
+            ("single steps, mix kernel", true, false, 1),
+            ("single steps, router kernel", false, true, 1),
+            ("single steps, both kernels", true, true, 1),
+            (
+                "blocks of 2, kernels off (what drafting ships)",
+                false,
+                false,
+                2,
+            ),
+            (
+                "blocks of 4, kernels off (what drafting ships)",
+                false,
+                false,
+                4,
+            ),
+            (
+                "blocks of 8, kernels off (what drafting ships)",
+                false,
+                false,
+                8,
+            ),
+        ];
+        let mut b = backend();
+        b.set_draft_depth(None);
+        let ov = SamplingOverrides::default();
+        let vocab = b.model.args().vocab_size;
+        // Per regime: positions compared, exact ties, and the margin of every flip in bf16 steps.
+        let mut compared = vec![0usize; REGIMES.len()];
+        let mut ties = vec![0usize; REGIMES.len()];
+        let mut flips: Vec<Vec<f32>> = vec![Vec::new(); REGIMES.len()];
+        for prompt in PROMPTS {
+            let ids = b
+                .build_prompt(
+                    &[ChatTurn::User(prompt)],
+                    &[],
+                    &ResolvedToolChoice::Auto,
+                    false,
+                    None,
+                )
+                .unwrap();
+            let plain = super::super::mix_kernel::kernel::with(false, || {
+                super::super::route_kernel::kernel::with(false, || {
+                    b.generate(&ids, NEW_TOKENS, 0.0, 1.0, &ov).unwrap()
+                })
+            });
+            let mut fed = vec![*ids.last().unwrap()];
+            fed.extend_from_slice(&plain[..plain.len() - 1]);
+            for (r, (_, mix, route, size)) in REGIMES.iter().enumerate() {
+                super::super::mix_kernel::kernel::with(*mix, || {
+                    super::super::route_kernel::kernel::with(*route, || {
+                        let mut cache = b.model.make_cache();
+                        b.model.advance(&ids[..ids.len() - 1], &mut cache).unwrap();
+                        for (n, block) in fed.chunks(*size).enumerate() {
+                            let (logits, _) = b.model.verify(block, &mut cache, &[5]).unwrap();
+                            logits.eval().unwrap();
+                            let rows = logits.as_slice::<f32>().to_vec();
+                            for (j, row) in rows.chunks(vocab).enumerate() {
+                                let want = plain[n * size + j];
+                                let got = row
+                                    .iter()
+                                    .enumerate()
+                                    .max_by(|a, c| a.1.total_cmp(c.1))
+                                    .map(|(i, _)| i as u32)
+                                    .unwrap();
+                                compared[r] += 1;
+                                if got == want {
+                                    continue;
+                                }
+                                let margin = row[got as usize] - row[want as usize];
+                                if margin <= 0.0 {
+                                    ties[r] += 1;
+                                } else {
+                                    let step = 2f32
+                                        .powi(row[got as usize].abs().log2().floor() as i32 - 7);
+                                    flips[r].push(margin / step);
+                                }
+                            }
+                        }
+                    })
+                });
+            }
+            eprintln!("done: {}...", &prompt[..prompt.len().min(40)]);
+        }
+        for (r, (name, ..)) in REGIMES.iter().enumerate() {
+            let mut steps = flips[r].clone();
+            steps.sort_by(f32::total_cmp);
+            let beyond: Vec<String> = steps
+                .iter()
+                .filter(|s| **s > 3.0)
+                .map(|s| format!("{s:.2}"))
+                .collect();
+            eprintln!(
+                "{name}: {} flips ({:.2}%) and {} exact ties of {} positions; largest {:.2} bfloat16 steps; beyond 3 steps: [{}]",
+                steps.len(),
+                100.0 * steps.len() as f64 / compared[r].max(1) as f64,
+                ties[r],
+                compared[r],
+                steps.last().copied().unwrap_or(0.0),
+                beyond.join(", ")
+            );
+        }
+        assert!(
+            flips[0].is_empty(),
+            "single steps with every kernel off must be deterministic, not flip {} positions",
+            flips[0].len()
+        );
     }
 }

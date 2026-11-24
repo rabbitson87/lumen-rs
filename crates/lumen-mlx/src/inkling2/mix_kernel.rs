@@ -34,9 +34,13 @@ lumen_flags::flag! {
     /// The kernel sums in another order than the composed ops' matmuls, so the mix differs at
     /// float32 rounding and a greedy continuation can part from the composed form's at a near
     /// tie: a different-but-equivalent numeric regime, not a pure optimization.
+    ///
+    /// On by default. Teacher-forced over 2,745 positions of 20 prompts it flips the greedy choice
+    /// at 0.69% of them, none by more than 2.7 bfloat16 steps, against 0.9 to 1.3% (up to 7 steps)
+    /// for the verify blocks that `LUMEN_INKLING2_DRAFT` ships on. `=0` restores the composed ops.
     pub(crate) kernel {
         env: "LUMEN_INKLING2_MIX_KERNEL",
-        default: false,
+        default: true,
         kind: Behavior,
     }
 }

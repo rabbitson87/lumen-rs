@@ -28,9 +28,15 @@ lumen_flags::flag! {
     /// The kernel returns the chosen experts best first and not in `argpartition`'s order, so the
     /// experts' weighted sum adds in another order: a different-but-equivalent numeric regime, not a
     /// pure optimization. Decode-sized passes only (a verify block too): prefill keeps the composed ops.
+    ///
+    /// On by default: a decode token about 0.7 ms (2%) faster (16 same-session runs, standard error
+    /// 0.17 ms). Teacher-forced over 2,745 positions of 20 prompts it flips the greedy choice at 1.09%
+    /// of them, none by more than 1.7 bfloat16 steps (together with the mix kernel 1.06%, up to
+    /// 8.7 steps), against 0.9 to 1.3% (up to 7 steps) for the verify blocks that
+    /// `LUMEN_INKLING2_DRAFT` ships on. `=0` restores the composed ops.
     pub(crate) kernel {
         env: "LUMEN_INKLING2_ROUTE_KERNEL",
-        default: false,
+        default: true,
         kind: Behavior,
     }
 }
