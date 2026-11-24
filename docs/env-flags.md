@@ -26,6 +26,7 @@ value → on.
 | `LUMEN_INKLING2_DRAFT` | on | Behavior | `lumen_mlx::inkling2::backend::inkling2_draft` |
 | `LUMEN_INKLING2_FUSE` | on | Optimization | `lumen_mlx::inkling2::fused::fuse` |
 | `LUMEN_INKLING2_MIX_KERNEL` | off | Behavior | `lumen_mlx::inkling2::mix_kernel::kernel` |
+| `LUMEN_INKLING2_ROUTE_KERNEL` | off | Behavior | `lumen_mlx::inkling2::route_kernel::kernel` |
 | `LUMEN_INKLING2_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::inkling2::profile::stage_sync` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
@@ -255,6 +256,16 @@ Mix the Inkling 2 depth sources (the attention residual) in one Metal kernel ins
  The kernel sums in another order than the composed ops' matmuls, so the mix differs at
  float32 rounding and a greedy continuation can part from the composed form's at a near
  tie: a different-but-equivalent numeric regime, not a pure optimization.
+
+### `LUMEN_INKLING2_ROUTE_KERNEL`
+
+*Behavior, default off.*
+
+Pick each token's experts in one Metal kernel instead of the composed ops (a sigmoid, an
+ `argpartition`, a gather, a renormalisation: about ten launches a layer visit become one).
+ The kernel returns the chosen experts best first and not in `argpartition`'s order, so the
+ experts' weighted sum adds in another order: a different-but-equivalent numeric regime, not a
+ pure optimization. Decode-sized passes only (a verify block too): prefill keeps the composed ops.
 
 ### `LUMEN_INKLING2_STAGE_SYNC`
 

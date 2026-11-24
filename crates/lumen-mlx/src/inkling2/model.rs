@@ -23,6 +23,7 @@ use super::ops::{
 use super::profile;
 use super::quant::{QuantMode, QuantTable};
 use super::regions::{self, ProjCfg};
+use super::route_kernel;
 use super::text_config::{AttnDims, TextArgs};
 use crate::native_cache::NativeKvCache;
 use crate::native_embedding::quantized_embedding_lookup_with_mode;
@@ -637,7 +638,14 @@ impl Moe {
             flat.as_dtype(Dtype::Float32)?,
             mlx_rs::ops::transpose_axes(&self.router_weight, &[1, 0])?,
         )?;
-        let (inds, weights) = route_topk(&logits, &self.router_bias, self.top_k, self.route_scale)?;
+        // Decode-sized passes only (a verify block too), as the mix kernel: prefill keeps the composed ops.
+        let rows = flat.shape()[0] as usize;
+        let route = if fused::serves(rows) && route_kernel::enabled() {
+            route_kernel::route_topk
+        } else {
+            route_topk
+        };
+        let (inds, weights) = route(&logits, &self.router_bias, self.top_k, self.route_scale)?;
         profile::mark("moe norm + router + top-k", &[&inds, &weights])?;
         let out = self.experts(&flat, &inds, &weights)?;
         profile::mark("moe combine", &[&out])?;

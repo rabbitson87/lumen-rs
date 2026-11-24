@@ -2877,6 +2877,123 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "inkling2-route-kernel-scores-negative-logits-as-positive",
+        symptom: "the router kernel scored a negative logit as its mirror image, so an expert the router disliked scored above one half and was picked ahead of the ones it liked",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float s = x < 0.0f ? 1.0f - y : y;",
+            replace: "const float s = y; // defect: a negative logit is scored as its mirror",
+        }],
+        guards: &[mlx(
+            "inkling2::route_kernel::tests::the_kernel_picks_the_composed_experts",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-route-kernel-ignores-the-bias",
+        symptom: "the router kernel ranked the experts by their scores alone, so the load-balancing bias never steered a token toward an expert it would otherwise skip",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float biased = s + bias[e];",
+            replace: "const float biased = s; // defect: the router bias is not added to the key",
+        }],
+        guards: &[mlx(
+            "inkling2::route_kernel::tests::the_kernel_picks_the_composed_experts",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-route-kernel-picks-the-worst-experts",
+        symptom: "the router kernel ranked the lowest keys first, so every token was sent to the eight experts the router liked least",
+        revert: &[Mutation {
+            path: MLX,
+            find: "rank += (other > mine || (other == mine && j < e)) ? 1 : 0;",
+            replace: "rank += (other < mine || (other == mine && j < e)) ? 1 : 0; // defect: the lowest keys rank first",
+        }],
+        guards: &[mlx(
+            "inkling2::route_kernel::tests::the_kernel_picks_the_composed_experts",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-route-kernel-breaks-ties-toward-the-higher-expert",
+        symptom: "the router kernel resolved equal keys toward the higher expert index, so a router that cannot tell experts apart always picked the last ones and the choice differed from the plain form's",
+        revert: &[Mutation {
+            path: MLX,
+            find: "rank += (other > mine || (other == mine && j < e)) ? 1 : 0;",
+            replace: "rank += (other > mine || (other == mine && j > e)) ? 1 : 0; // defect: ties go to the higher index",
+        }],
+        guards: &[mlx(
+            "inkling2::route_kernel::tests::ties_and_nans_still_give_distinct_valid_experts",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-route-kernel-forgets-the-route-scale",
+        symptom: "the router kernel left the picked weights summing to one instead of the route scale, so every expert layer's output was too small by that factor",
+        revert: &[Mutation {
+            path: MLX,
+            find: "picked[tid] / total * route_scale;",
+            replace: "picked[tid] / total; // defect: the weights are not scaled by the route scale",
+        }],
+        guards: &[mlx(
+            "inkling2::route_kernel::tests::the_kernel_picks_the_composed_experts",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-route-kernel-ranks-a-nan-key-first",
+        symptom: "the router kernel ranked a NaN key above every real one, so a single NaN logit sent the token to its expert and dropped a real one",
+        revert: &[Mutation {
+            path: MLX,
+            find: "key[e] = isnan(biased) ? -INFINITY : biased;",
+            replace: "key[e] = isnan(biased) ? INFINITY : biased; // defect: a NaN key outranks every real one",
+        }],
+        guards: &[mlx(
+            "inkling2::route_kernel::tests::ties_and_nans_still_give_distinct_valid_experts",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-route-kernel-is-never-launched",
+        symptom: "the layer picked its experts with the composed ops although the router kernel was on, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "if fused::serves(rows) && route_kernel::enabled() {",
+            replace: "if false && fused::serves(rows) && route_kernel::enabled() { // defect: the kernel is never chosen",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_route_kernel_gives_the_logits_the_composed_router_gives",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-route-kernel-runs-while-off",
+        symptom: "the layer picked its experts with the router kernel although it was off, so the default path ran a different numeric regime than the flag said",
+        revert: &[Mutation {
+            path: MLX,
+            find: "if fused::serves(rows) && route_kernel::enabled() {",
+            replace: "if fused::serves(rows) { // defect: the kernel runs while off",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_route_kernel_gives_the_logits_the_composed_router_gives",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-route-kernel-takes-prefill-sized-passes",
+        symptom: "the layer picked the experts of a prefill chunk with the router kernel, so prompt processing ran a numeric regime and a launch per chunk row the decode-sized gate was meant to keep it out of",
+        revert: &[Mutation {
+            path: MLX,
+            find: "if fused::serves(rows) && route_kernel::enabled() {",
+            replace: "if route_kernel::enabled() { // defect: the kernel is not limited to decode-sized passes",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_route_kernel_gives_the_logits_the_composed_router_gives",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -3043,7 +3160,16 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
             "inkling2/mix_kernel.rs"
         }
         (_, "inkling2-mix-kernel-is-never-launched")
-        | (_, "inkling2-mix-kernel-runs-while-off") => "inkling2/model.rs",
+        | (_, "inkling2-mix-kernel-runs-while-off")
+        | (_, "inkling2-route-kernel-is-never-launched")
+        | (_, "inkling2-route-kernel-runs-while-off")
+        | (_, "inkling2-route-kernel-takes-prefill-sized-passes") => "inkling2/model.rs",
+        (_, "inkling2-route-kernel-scores-negative-logits-as-positive")
+        | (_, "inkling2-route-kernel-ignores-the-bias")
+        | (_, "inkling2-route-kernel-picks-the-worst-experts")
+        | (_, "inkling2-route-kernel-breaks-ties-toward-the-higher-expert")
+        | (_, "inkling2-route-kernel-forgets-the-route-scale")
+        | (_, "inkling2-route-kernel-ranks-a-nan-key-first") => "inkling2/route_kernel.rs",
         (_, "inkling2-fused-swiglu-skips-the-cap")
         | (_, "inkling2-mix-projects-the-first-row-for-every-row")
         | (_, "inkling2-mask-geometry-keyed-on-the-shape-alone") => "inkling2/ops.rs",

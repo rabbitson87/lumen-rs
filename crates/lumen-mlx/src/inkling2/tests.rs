@@ -627,6 +627,73 @@ fn the_mix_kernel_gives_the_logits_the_composed_mix_gives() {
     }
 }
 
+/// The router kernel (`route_kernel.rs`) gives the logits the composed router gives: the same steps
+/// with it on and off, over single tokens and over blocks of rows. It picks the same experts with
+/// the same weights to float32 rounding (the unit test bounds that) but returns them best first and
+/// not in `argpartition`'s order, so the experts' weighted sum adds in another order: the float32
+/// replica is bounded at the reference-parity tests' 2e-3 of the largest logit, and the replica as
+/// serving runs it, whose bf16 loop rounding turns any change of numerics into jumps of order one,
+/// only has to run and stay finite. A run with the kernel on launches it, one with it off does not.
+#[test]
+fn the_route_kernel_gives_the_logits_the_composed_router_gives() {
+    for (name, model, bound) in [
+        ("replica", load_replica(), Some(2e-3f32)),
+        ("rounded replica", load_replica_rounded(), None),
+    ] {
+        let before = super::route_kernel::launches();
+        let off = super::route_kernel::kernel::with(false, || steps_with(&model, true));
+        assert_eq!(
+            super::route_kernel::launches(),
+            before,
+            "{name}: the kernel ran while it was off"
+        );
+        let on = super::route_kernel::kernel::with(true, || steps_with(&model, true));
+        assert!(
+            super::route_kernel::launches() > before,
+            "{name}: the kernel never ran while it was on"
+        );
+        // Only decode-sized passes take the kernel: a pass over more rows than that keeps the composed router.
+        let launched = super::route_kernel::launches();
+        super::route_kernel::kernel::with(true, || {
+            let mut cache = model.make_cache();
+            let ids = vec![1u32; super::ops::DECODE_ROWS + 1];
+            host_f32(&model.forward(&ids, &mut cache, true).unwrap());
+        });
+        assert_eq!(
+            super::route_kernel::launches(),
+            launched,
+            "{name}: the kernel took a pass of more than {} rows",
+            super::ops::DECODE_ROWS
+        );
+        for (label, a, b) in [("single tokens", &off.0, &on.0), ("blocks", &off.1, &on.1)] {
+            assert_eq!(a.len(), b.len());
+            for (step, (p, k)) in a.iter().zip(b).enumerate() {
+                let (mut worst, mut scale) = (0.0f32, 0.0f32);
+                for (x, y) in p.iter().zip(k) {
+                    assert_eq!(
+                        x.is_finite(),
+                        y.is_finite(),
+                        "{name}, {label}, step {step}: a masked id differs"
+                    );
+                    if x.is_finite() {
+                        worst = worst.max((x - y).abs());
+                        scale = scale.max(x.abs());
+                    }
+                }
+                eprintln!(
+                    "{name}, {label}, step {step}: route kernel differs by {worst:.2e} of {scale:.1}"
+                );
+                if let Some(bound) = bound {
+                    assert!(
+                        worst <= bound * scale.max(1.0),
+                        "{name}, {label}, step {step}: the route kernel differs from the composed router by {worst} of {scale}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The regions `fused.rs` compiles, under the names it counts them by.
 const REGIONS: [&str; 7] = [
     "swiglu",

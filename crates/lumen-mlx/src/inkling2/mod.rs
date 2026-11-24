@@ -39,6 +39,8 @@ mod quant;
 #[cfg(feature = "mlx-native")]
 mod regions;
 mod response;
+#[cfg(feature = "mlx-native")]
+mod route_kernel;
 mod safetensors_header;
 #[cfg(all(test, feature = "mlx-native"))]
 mod tests;
