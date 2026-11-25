@@ -2873,4 +2873,61 @@ mod real_checkpoint_tests {
             flips[0].len()
         );
     }
+
+    /// The fold (`mix_kernel::fold`) is an `Optimization`: on the real checkpoint every logit of a
+    /// pass is the bit it is without it, over single steps and verify blocks of 2, 4 and 8 rows, the
+    /// plain loop's own continuation of each prompt fed through each (the mix and router kernels on,
+    /// as served). The fold stacks the blocks once and scales the partial sum inside the mix kernel
+    /// with `rms_norm`'s own summation order, so nothing may move, not even at a near tie.
+    #[test]
+    #[ignore = "needs the real checkpoint; set LUMEN_INKLING2_MODEL_DIR"]
+    fn the_fold_gives_the_same_logits_to_the_bit_on_the_real_checkpoint() {
+        const NEW_TOKENS: usize = 60;
+        let mut b = backend();
+        b.set_draft_depth(None);
+        let ov = SamplingOverrides::default();
+        let mut compared = 0usize;
+        for prompt in PROMPTS.iter().take(6) {
+            let ids = b
+                .build_prompt(
+                    &[ChatTurn::User(prompt)],
+                    &[],
+                    &ResolvedToolChoice::Auto,
+                    false,
+                    None,
+                )
+                .unwrap();
+            let plain = b.generate(&ids, NEW_TOKENS, 0.0, 1.0, &ov).unwrap();
+            let mut fed = vec![*ids.last().unwrap()];
+            fed.extend_from_slice(&plain[..plain.len() - 1]);
+            for size in [1usize, 2, 4, 8] {
+                let logits_with = |fold: bool| -> Vec<u32> {
+                    super::super::mix_kernel::fold::with(fold, || {
+                        let mut cache = b.model.make_cache();
+                        b.model.advance(&ids[..ids.len() - 1], &mut cache).unwrap();
+                        let mut bits = Vec::new();
+                        for block in fed.chunks(size) {
+                            let (logits, _) = b.model.verify(block, &mut cache, &[5]).unwrap();
+                            logits.eval().unwrap();
+                            bits.extend(logits.as_slice::<f32>().iter().map(|x| x.to_bits()));
+                        }
+                        bits
+                    })
+                };
+                let (off, on) = (logits_with(false), logits_with(true));
+                assert_eq!(off.len(), on.len());
+                let moved = off.iter().zip(&on).filter(|(a, c)| a != c).count();
+                assert_eq!(
+                    moved,
+                    0,
+                    "the fold moved {moved} of {} logits in blocks of {size} of {:?}...",
+                    off.len(),
+                    &prompt[..prompt.len().min(40)]
+                );
+                compared += off.len();
+            }
+            eprintln!("same to the bit: {}...", &prompt[..prompt.len().min(40)]);
+        }
+        eprintln!("{compared} logits compared, none differs");
+    }
 }

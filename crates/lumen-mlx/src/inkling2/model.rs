@@ -296,6 +296,56 @@ impl AttnResQuery {
         };
         run(blocks, partial_n, &self.query, self.scale)
     }
+
+    /// The mix for a partial sum `h` as the layer left it (any float dtype, not yet at unit RMS):
+    /// the mix kernel scales it itself and reads the blocks from their stack when it folds
+    /// (`mix_kernel::folds`), otherwise `h` is cast and normalised here and [`Self::mix`] does the
+    /// rest. Returns the mix and, when `want_partial_n`, `h` at unit RMS in float32 (the block a
+    /// boundary layer adds).
+    fn mix_partial(
+        &self,
+        blocks: &mut Blocks,
+        h: &Array,
+        want_partial_n: bool,
+        fuse: bool,
+    ) -> Result<(Array, Option<Array>)> {
+        if fuse && mix_kernel::folds() {
+            return mix_kernel::attn_res_mix_raw(
+                blocks.stacked()?,
+                h,
+                &self.query,
+                self.scale,
+                want_partial_n,
+            );
+        }
+        let partial_n = unit_rms(&h.as_dtype(Dtype::Float32)?)?;
+        let mixed = self.mix(&blocks.list, &partial_n, fuse)?;
+        Ok((mixed, want_partial_n.then_some(partial_n)))
+    }
+}
+
+/// The completed depth blocks of one pass.
+#[derive(Clone, Default)]
+pub(super) struct Blocks {
+    list: Vec<Array>,
+    /// `list` stacked for the mix kernel, built at the first mix after a block is added: a stack is
+    /// a copy launch a block, and a pass mixes dozens of times between blocks.
+    stacked: Option<Array>,
+}
+
+impl Blocks {
+    pub(super) fn push(&mut self, block: Array) {
+        self.list.push(block);
+        self.stacked = None;
+    }
+
+    /// The stack of the blocks (`None` while there are none).
+    pub(super) fn stacked(&mut self) -> Result<Option<&Array>> {
+        if self.stacked.is_none() {
+            self.stacked = mix_kernel::stack_blocks(&self.list)?;
+        }
+        Ok(self.stacked.as_ref())
+    }
 }
 
 /// The loop controllers of a core layer: message queries and the gain/forget projections for the
@@ -868,7 +918,7 @@ impl Layer {
         &self,
         cx: &Ctx<'_>,
         h: &Array,
-        blocks: &mut Vec<Array>,
+        blocks: &mut Blocks,
         cache: &mut VisitCache,
         bank: Option<&Bank>,
     ) -> Result<Array> {
@@ -911,16 +961,23 @@ impl Layer {
         };
 
         // -- the inputs of attention --
-        let h_n = unit_rms(&h.as_dtype(Dtype::Float32)?)?;
+        // The partial sum at unit RMS, which a block boundary adds to the blocks.
+        let h_n: Option<Array>;
         let (mut xq, mut xk, mut xv);
         if self.idx == 0 {
+            h_n = if self.is_boundary {
+                Some(unit_rms(&h.as_dtype(Dtype::Float32)?)?)
+            } else {
+                None
+            };
             (xq, xk, xv) = (h.clone(), h.clone(), h.clone());
         } else {
-            let mixed = self
+            let (mixed, normed) = self
                 .attn_input
                 .as_ref()
                 .ok_or_else(|| anyhow!("layer {} has no attn_input", self.idx))?
-                .mix(blocks, &h_n, fuse)?;
+                .mix_partial(blocks, h, self.is_boundary, fuse)?;
+            h_n = normed;
             xq = mixed.try_index((.., .., 0))?;
             if self.sliding {
                 (xk, xv) = (xq.clone(), xq.clone());
@@ -981,7 +1038,7 @@ impl Layer {
         let out = self.attn.attend(&p, &mut cache.kv)?;
         profile::mark("attention (kv + sdpa)", &[&out])?;
         if self.is_boundary {
-            blocks.push(h_n.clone());
+            blocks.push(h_n.ok_or_else(|| anyhow!("layer {} kept no partial sum", self.idx))?);
         }
 
         // -- the residual and the MLP --
@@ -997,7 +1054,8 @@ impl Layer {
         profile::mark("attn conv + residual", &[&residual, &attn_window])?;
         let mut y = self
             .mlp_input
-            .mix(blocks, &unit_rms(&residual)?, fuse)?
+            .mix_partial(blocks, &residual, false, fuse)?
+            .0
             .try_index((.., .., 0))?;
         profile::mark("mlp_input mix", &[&y])?;
         if let (Some(m), Some(ctl)) = (&messages, &self.loop_ctl) {
@@ -1618,8 +1676,8 @@ impl Inkling2Model {
             keep_windows: rec.keep_windows,
         };
         let core_start = self.args.loop_config.core_start;
-        let mut blocks: Vec<Array> = Vec::new();
-        let mut prelude: Option<(Array, Vec<Array>)> = None;
+        let mut blocks = Blocks::default();
+        let mut prelude: Option<(Array, Blocks)> = None;
         let mut bank: Option<Bank> = None;
         for (visit, &(idx, pass)) in self.schedule.iter().enumerate() {
             if idx == core_start {
@@ -1630,7 +1688,7 @@ impl Inkling2Model {
                         // pass wrote (all but the core's first, which every pass rebuilds the
                         // same) become its message bank.
                         bank = Some(Bank {
-                            blocks: blocks[prelude_blocks.len() + 1..].to_vec(),
+                            blocks: blocks.list[prelude_blocks.list.len() + 1..].to_vec(),
                             partial_n: unit_rms(&h.as_dtype(Dtype::Float32)?)?,
                         });
                         if let Some(bank) = &bank {
@@ -1658,7 +1716,11 @@ impl Inkling2Model {
         }
         let x = self
             .final_input
-            .mix(&blocks, &unit_rms(&h.as_dtype(Dtype::Float32)?)?, false)?
+            .mix(
+                &blocks.list,
+                &unit_rms(&h.as_dtype(Dtype::Float32)?)?,
+                false,
+            )?
             .try_index((.., .., 0))?;
         let out =
             mlx_rs::fast::rms_norm(&x, &self.norm, self.args.rms_norm_eps)?.as_dtype(h.dtype())?;

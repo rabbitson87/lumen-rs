@@ -25,6 +25,7 @@ value → on.
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
 | `LUMEN_INKLING2_DRAFT` | on | Behavior | `lumen_mlx::inkling2::backend::inkling2_draft` |
 | `LUMEN_INKLING2_FUSE` | on | Optimization | `lumen_mlx::inkling2::fused::fuse` |
+| `LUMEN_INKLING2_MIX_FOLD` | on | Optimization | `lumen_mlx::inkling2::mix_kernel::fold` |
 | `LUMEN_INKLING2_MIX_KERNEL` | on | Behavior | `lumen_mlx::inkling2::mix_kernel::kernel` |
 | `LUMEN_INKLING2_ROUTE_KERNEL` | on | Behavior | `lumen_mlx::inkling2::route_kernel::kernel` |
 | `LUMEN_INKLING2_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::inkling2::profile::stage_sync` |
@@ -246,6 +247,20 @@ Speculative decoding for Inkling 2: the checkpoint's bundled DSpark draft head
 
 Serve the compiled (fused) forms of the Inkling 2 elementwise helpers: the length-1 decode
  step makes a third of the kernel dispatches. `=0` restores the plain composed ops.
+
+### `LUMEN_INKLING2_MIX_FOLD`
+
+*Optimization, default on.*
+
+Let the mix kernel read the depth blocks from one stacked array (built when a block is
+ added, not once a mix) and normalise the partial sum itself, in place of a cast, an
+ `rms_norm` and a stack of copies ahead of each of the 96 mixes of a decode token. Needs
+ `LUMEN_INKLING2_MIX_KERNEL` (and is off with it).
+
+ Bit for bit what the mix kernel gives with those ops ahead of it: the kernel adds the sum of
+ squares in the order `rms_norm` does, and the tests compare the scaled sum and the mix to
+ the bit. A decode token about 0.7 ms (2.4%) faster (20 same-session runs against the
+ version without it, standard error 0.13 ms).
 
 ### `LUMEN_INKLING2_MIX_KERNEL`
 

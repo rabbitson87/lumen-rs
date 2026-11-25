@@ -593,7 +593,12 @@ fn the_mix_kernel_gives_the_logits_the_composed_mix_gives() {
             before,
             "{name}: the kernel ran while it was off"
         );
-        let on = super::mix_kernel::kernel::with(true, || steps_with(&model, true));
+        // The fold off: the layer's mix then goes through `AttnResQuery::mix`, the choice between the
+        // kernel and the compiled form that this test is about (the fold has its own test, and with
+        // it on the kernel is launched from another place, which would hide a broken choice here).
+        let on = super::mix_kernel::kernel::with(true, || {
+            super::mix_kernel::fold::with(false, || steps_with(&model, true))
+        });
         assert!(
             super::mix_kernel::launches() > before,
             "{name}: the kernel never ran while it was on"
@@ -692,6 +697,91 @@ fn the_route_kernel_gives_the_logits_the_composed_router_gives() {
             }
         }
     }
+}
+
+/// The fold (`mix_kernel::fold`) is an `Optimization`: the logits with it on are the bits they are
+/// with it off (the mix kernel on both times), over single tokens and over blocks of rows, on the
+/// float32 replica and on the replica as serving runs it (bf16 loop rounding, where any change of
+/// numerics would show as jumps of order one). A run with the fold on launches the normalising
+/// kernel, one with it off does not, and a pass of more rows than a decode takes never does.
+#[test]
+fn the_folded_mix_gives_the_logits_the_unfolded_kernel_gives() {
+    for (name, model) in [
+        ("replica", load_replica()),
+        ("rounded replica", load_replica_rounded()),
+    ] {
+        let run = |fold: bool| {
+            super::mix_kernel::kernel::with(true, || {
+                super::mix_kernel::fold::with(fold, || steps_with(&model, true))
+            })
+        };
+        let before = super::mix_kernel::folded_launches();
+        let off = run(false);
+        assert_eq!(
+            super::mix_kernel::folded_launches(),
+            before,
+            "{name}: the fold ran while it was off"
+        );
+        let on = run(true);
+        assert!(
+            super::mix_kernel::folded_launches() > before,
+            "{name}: the fold never ran while it was on"
+        );
+        let launched = super::mix_kernel::folded_launches();
+        super::mix_kernel::kernel::with(true, || {
+            super::mix_kernel::fold::with(true, || {
+                let mut cache = model.make_cache();
+                let ids = vec![1u32; super::ops::DECODE_ROWS + 1];
+                host_f32(&model.forward(&ids, &mut cache, true).unwrap());
+            })
+        });
+        assert_eq!(
+            super::mix_kernel::folded_launches(),
+            launched,
+            "{name}: the fold took a pass of more than {} rows",
+            super::ops::DECODE_ROWS
+        );
+        let bits = |steps: &[Vec<f32>]| -> Vec<Vec<u32>> {
+            steps
+                .iter()
+                .map(|s| s.iter().map(|x| x.to_bits()).collect())
+                .collect()
+        };
+        assert_eq!(
+            bits(&off.0),
+            bits(&on.0),
+            "{name}: single tokens: the fold changed a logit"
+        );
+        assert_eq!(
+            bits(&off.1),
+            bits(&on.1),
+            "{name}: blocks: the fold changed a logit"
+        );
+    }
+}
+
+/// A block added after a stack was built is in the next stack: the stack is kept between mixes, and
+/// a stale one would drop the block a boundary layer just added from every later mix.
+#[test]
+fn a_block_added_after_a_stack_is_in_the_next_one() {
+    let block = |v: f32| Array::from_slice(&[v; 16], &[1, 2, 8]);
+    let mut blocks = super::model::Blocks::default();
+    assert!(blocks.stacked().unwrap().is_none(), "no blocks, no stack");
+    blocks.push(block(1.0));
+    assert_eq!(blocks.stacked().unwrap().unwrap().shape(), &[2, 1, 8]);
+    blocks.push(block(2.0));
+    let stacked = blocks.stacked().unwrap().unwrap().clone();
+    assert_eq!(stacked.shape(), &[2, 2, 8], "the new block is in the stack");
+    assert_eq!(
+        host_f32(&stacked)[8..16],
+        [2.0; 8],
+        "after the first, in order"
+    );
+    // A copy keeps its own list: the prelude's blocks are restored for each pass of the loop.
+    let mut other = blocks.clone();
+    other.push(block(3.0));
+    assert_eq!(other.stacked().unwrap().unwrap().shape(), &[2, 3, 8]);
+    assert_eq!(blocks.stacked().unwrap().unwrap().shape(), &[2, 2, 8]);
 }
 
 /// The regions `fused.rs` compiles, under the names it counts them by.

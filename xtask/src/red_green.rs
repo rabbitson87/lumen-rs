@@ -2254,8 +2254,8 @@ static DEFECTS: &[Defect] = &[
         symptom: "the message bank the next loop pass reads included the core's first block, which every pass rebuilds, instead of the blocks the last pass wrote after it: passes 2 and 3 of the looped layers mixed in a stale message and the logits were wrong from the first prompt",
         revert: &[Mutation {
             path: MLX,
-            find: "blocks[prelude_blocks.len() + 1..]",
-            replace: "blocks[prelude_blocks.len()..] /* defect */",
+            find: "blocks.list[prelude_blocks.list.len() + 1..]",
+            replace: "blocks.list[prelude_blocks.list.len()..] /* defect */",
         }],
         guards: &[mlx(
             "inkling2::tests::a_full_prefill_matches_the_reference_logits",
@@ -2878,6 +2878,111 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "inkling2-mix-fold-skips-the-scaling",
+        symptom: "the folded mix kernel read the raw partial sum as if it were at unit RMS, so the newest source was weighed and mixed at the layer's own magnitude instead of the normalised one",
+        revert: &[Mutation {
+            path: MLX,
+            find: "tail_scale = metal::precise::rsqrt(total / float(last_shape[1]) + 1e-6f);",
+            replace: "tail_scale = 1.0f; // defect: the partial sum is not scaled to unit RMS",
+        }],
+        guards: &[mlx(
+            "inkling2::mix_kernel::tests::the_raw_mix_gives_the_composed_mix_of_the_scaled_sum",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-fold-emits-the-unscaled-sum",
+        symptom: "the folded mix kernel handed back the partial sum it was given as the block a boundary layer adds, so every later mix of the pass read a block at the layer's magnitude and not at unit RMS",
+        revert: &[Mutation {
+            path: MLX,
+            find: "emitted[(size_t)row * H4 + h] = load4(tail, h) * tail_scale;",
+            replace: "emitted[(size_t)row * H4 + h] = load4(tail, h); // defect: the emitted block is not scaled",
+        }],
+        guards: &[mlx(
+            "inkling2::mix_kernel::tests::the_raw_mix_gives_the_composed_mix_of_the_scaled_sum",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-fold-sums-the-squares-in-another-order",
+        symptom: "the folded mix kernel added the sum of squares in another order than rms_norm, so its scale differed in the last bit and the fold, promised to be bit for bit the unfolded mix, moved logits (the greedy continuation parted at a near tie)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float total = simd_sum(lane < SIMDS ? squares[lane] : 0.0f);",
+            replace: "float total = 0.0f; for (int g = 0; g < SIMDS; ++g) { total += squares[g]; } // defect: the simdgroups' totals are added one after the other",
+        }],
+        guards: &[mlx(
+            "inkling2::mix_kernel::tests::the_raw_mix_is_the_norm_and_the_kernel_mix_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-fold-reads-the-blocks-of-the-first-row",
+        symptom: "the folded mix kernel read every row's blocks from the first row's, so a verify pass mixed each token's depth with the first token's blocks",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const device float4* base = (const device float4*)(blocks + (size_t)row * nb * H);",
+            replace: "const device float4* base = (const device float4*)(blocks); // defect: no row offset",
+        }],
+        guards: &[mlx(
+            "inkling2::mix_kernel::tests::the_raw_mix_gives_the_composed_mix_of_the_scaled_sum",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-fold-runs-while-off",
+        symptom: "the layer's mix normalised the partial sum inside the kernel although the fold was off, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "kernel::get() && fold::get()",
+            replace: "kernel::get() // defect: the fold flag is not read",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_folded_mix_gives_the_logits_the_unfolded_kernel_gives",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-fold-is-never-chosen",
+        symptom: "the layer's mix cast, normalised and stacked ahead of the kernel although the fold was on, so the flag saved nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "if fuse && mix_kernel::folds() {",
+            replace: "if false && fuse && mix_kernel::folds() { // defect: the fold is never chosen",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_folded_mix_gives_the_logits_the_unfolded_kernel_gives",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-mix-fold-takes-prefill-sized-passes",
+        symptom: "a prefill chunk's mix took the folded kernel, which is only the decode-sized passes' (a threadgroup a row, hundreds of rows to a chunk)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "if fuse && mix_kernel::folds() {",
+            replace: "if mix_kernel::folds() { // defect: the fold is not limited to decode-sized passes",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_folded_mix_gives_the_logits_the_unfolded_kernel_gives",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-blocks-keep-a-stale-stack",
+        symptom: "the stack of the depth blocks was kept after a boundary layer added a block, so every later mix of the pass left that block out",
+        revert: &[Mutation {
+            path: MLX,
+            find: "self.stacked = None;",
+            replace: "// defect: the stack is not dropped when a block is added",
+        }],
+        guards: &[
+            mlx("inkling2::tests::a_block_added_after_a_stack_is_in_the_next_one"),
+            mlx("inkling2::tests::the_folded_mix_gives_the_logits_the_unfolded_kernel_gives"),
+        ],
+        ..PLAIN
+    },
+    Defect {
         name: "inkling2-route-kernel-scores-negative-logits-as-positive",
         symptom: "the router kernel scored a negative logit as its mirror image, so an expert the router disliked scored above one half and was picked ahead of the ones it liked",
         revert: &[Mutation {
@@ -3156,10 +3261,16 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "inkling2-mix-kernel-does-not-normalise-the-weights")
         | (_, "inkling2-mix-kernel-drops-a-simdgroups-share-of-the-dot")
         | (_, "inkling2-mix-kernel-weighs-the-sources-in-reverse")
-        | (_, "inkling2-mix-kernel-stops-after-the-first-tile-of-sources") => {
-            "inkling2/mix_kernel.rs"
-        }
-        (_, "inkling2-mix-kernel-is-never-launched")
+        | (_, "inkling2-mix-kernel-stops-after-the-first-tile-of-sources")
+        | (_, "inkling2-mix-fold-skips-the-scaling")
+        | (_, "inkling2-mix-fold-emits-the-unscaled-sum")
+        | (_, "inkling2-mix-fold-sums-the-squares-in-another-order")
+        | (_, "inkling2-mix-fold-reads-the-blocks-of-the-first-row")
+        | (_, "inkling2-mix-fold-runs-while-off") => "inkling2/mix_kernel.rs",
+        (_, "inkling2-mix-fold-is-never-chosen")
+        | (_, "inkling2-mix-fold-takes-prefill-sized-passes")
+        | (_, "inkling2-blocks-keep-a-stale-stack")
+        | (_, "inkling2-mix-kernel-is-never-launched")
         | (_, "inkling2-mix-kernel-runs-while-off")
         | (_, "inkling2-route-kernel-is-never-launched")
         | (_, "inkling2-route-kernel-runs-while-off")
