@@ -2740,7 +2740,7 @@ static DEFECTS: &[Defect] = &[
             replace: "static_conv(v, v_conv, k_state, cfg.conv_scale)?; /* defect: the k state */",
         }],
         guards: &[mlx(
-            "inkling2::tests::prefill_then_single_token_decode_matches_the_reference",
+            "inkling2::tests::prefill_then_single_token_decode_matches_the_reference_through_the_compiled_regions",
         )],
         ..PLAIN
     },
@@ -3113,6 +3113,188 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "inkling2-project-kernel-adds-a-wrong-epsilon",
+        symptom: "the projection kernel's clip added an epsilon a thousand times too large to a row's norm, so every clipped query, key and relative query was scaled a little too hard",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float denom = norm + 1e-6f;",
+            replace: "const float denom = norm + 1e-3f; // defect: the epsilon is a thousand times too large",
+        }],
+        guards: &[mlx(
+            "inkling2::project_kernel::tests::the_kernel_is_the_composed_projection_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-ignores-the-clip-threshold",
+        symptom: "the projection kernel's clip divided one by the norm in place of the threshold, so a row was scaled to a unit norm and not to the layer's",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float ratio = threshold / denom;",
+            replace: "const float ratio = 1.0f / denom; // defect: the threshold is not used",
+        }],
+        guards: &[mlx(
+            "inkling2::project_kernel::tests::the_kernel_is_the_composed_projection_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-never-caps-the-factor",
+        symptom: "the projection kernel's clip did not cap its factor at one, so a row shorter than the threshold was scaled up to it instead of being left alone",
+        revert: &[Mutation {
+            path: MLX,
+            find: "return ratio < 1.0f ? ratio : 1.0f;",
+            replace: "return ratio; // defect: the factor is not capped at one",
+        }],
+        guards: &[mlx(
+            "inkling2::project_kernel::tests::the_kernel_is_the_composed_projection_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-sums-in-another-order",
+        symptom: "the projection kernel gave each lane another set of the head row's values than MLX's row reduction does, so the sums of squares rounded differently and the layer's logits moved in the last bit",
+        revert: &[Mutation {
+            path: MLX,
+            find: "own[n_own++] = b * 128 + lane * 4 + i;",
+            replace: "own[n_own++] = b * 128 + lane + 32 * i; // defect: the lanes take strided values",
+        }],
+        guards: &[mlx(
+            "inkling2::project_kernel::tests::the_kernel_is_the_composed_projection_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-skips-the-k-convolution",
+        symptom: "the projection kernel clipped the keys without convolving them, so every key lacked the short convolution of the last three tokens",
+        revert: &[Mutation {
+            path: MLX,
+            find: "#define X_K(E) conv_y(sk, C0, TOTAL, r, h * HD + (E), k_conv, k_state, DKV, TAPS, scale)",
+            replace: "#define X_K(E) float(sk[r * TOTAL + C0 + h * HD + (E)]) // defect: no convolution",
+        }],
+        guards: &[mlx(
+            "inkling2::project_kernel::tests::the_kernel_is_the_composed_projection_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-ignores-the-q-scale",
+        symptom: "the projection kernel clipped the queries without the layer's learned scale, so every query was too long or too short per channel",
+        revert: &[Mutation {
+            path: MLX,
+            find: "#define X_Q(E) (float(sq[r * TOTAL + h * HD + (E)]) * float(q_scale[h * HD + (E)]))",
+            replace: "#define X_Q(E) float(sq[r * TOTAL + h * HD + (E)]) // defect: the scale is not applied",
+        }],
+        guards: &[mlx(
+            "inkling2::project_kernel::tests::the_kernel_is_the_composed_projection_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-clips-the-relative-query-by-the-wrong-threshold",
+        symptom: "the projection kernel clipped the relative query to the queries' threshold, so its scores were far too large",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float factor = clip_factor(total, rel_clip);",
+            replace: "const float factor = clip_factor(total, qk_clip); // defect: the wrong threshold",
+        }],
+        guards: &[mlx(
+            "inkling2::project_kernel::tests::the_kernel_is_the_composed_projection_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-adds-a-wrong-epsilon-to-the-value-norm",
+        symptom: "the projection kernel's value norm added an epsilon a thousand times too large, so every value was a little too short",
+        revert: &[Mutation {
+            path: MLX,
+            find: "acc / float(q_scale_shape[1]) + 1e-6f",
+            replace: "acc / float(q_scale_shape[1]) + 1e-3f /* defect: the epsilon is a thousand times too large */",
+        }],
+        guards: &[mlx(
+            "inkling2::project_kernel::tests::the_kernel_is_the_composed_projection_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-drops-the-current-key-from-the-window",
+        symptom: "the projection kernel wrote zeros in place of the current key row in the padded window, so the next token convolved with a key of zero",
+        revert: &[Mutation {
+            path: MLX,
+            find: "k_window[(TAPS - 1 + r) * DKV + ch] = float(sk[r * TOTAL + C0 + ch]);",
+            replace: "k_window[(TAPS - 1 + r) * DKV + ch] = 0.0f; // defect: the row is not kept",
+        }],
+        guards: &[mlx(
+            "inkling2::project_kernel::tests::the_kernel_is_the_composed_projection_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-drops-the-value-state-from-the-window",
+        symptom: "the projection kernel wrote zeros in place of the value state rows of the padded window, so after the first token every value was convolved with a state of zeros",
+        revert: &[Mutation {
+            path: MLX,
+            find: "v_window[tt * DKV + ch] = v_state[tt * DKV + ch];",
+            replace: "v_window[tt * DKV + ch] = 0.0f; // defect: the state rows are not copied",
+        }],
+        guards: &[mlx(
+            "inkling2::project_kernel::tests::the_kernel_is_the_composed_projection_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-runs-while-off",
+        symptom: "a local layer's projection launched the kernel although it was off, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "kernel::get()",
+            replace: "true // defect: the flag is not read",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_project_kernel_gives_the_logits_the_compiled_region_gives",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-is-never-launched",
+        symptom: "a local layer's projection ran the compiled region although the kernel was on, so the flag saved nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "&& project_kernel::enabled()",
+            replace: "&& project_kernel::enabled() && false // defect: the kernel is never chosen",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_project_kernel_gives_the_logits_the_compiled_region_gives",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-takes-prefill-sized-passes",
+        symptom: "a prefill chunk's projection took the kernel, which serves decode-sized passes only (a simdgroup for each head row of each of hundreds of rows)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let out = if fuse",
+            replace: "let out = if true /* defect: not limited to decode-sized passes */",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_project_kernel_gives_the_logits_the_compiled_region_gives",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-project-kernel-cuts-k-and-v-from-the-q-projection",
+        symptom: "a looped pass's projection read k and v from the queries' third of the stacked projection, so the keys and values were the queries' input's",
+        revert: &[Mutation {
+            path: MLX,
+            find: "(q, k, v, r, gate, sink, [pq, pk, pv])",
+            replace: "(q, k, v, r, gate, sink, [pq.clone(), pq.clone(), pq]) // defect: one source for all three",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_project_kernel_gives_the_logits_the_compiled_region_gives",
+        )],
+        ..PLAIN
+    },
+    Defect {
         name: "inkling2-route-kernel-scores-negative-logits-as-positive",
         symptom: "the router kernel scored a negative logit as its mirror image, so an expert the router disliked scored above one half and was picked ahead of the ones it liked",
         revert: &[Mutation {
@@ -3403,7 +3585,21 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "inkling2-conv-kernel-mirrors-the-taps")
         | (_, "inkling2-conv-kernel-drops-the-state-from-the-window")
         | (_, "inkling2-conv-kernel-drops-the-stream") => "inkling2/conv_kernel.rs",
-        (_, "inkling2-conv-kernel-residual-is-never-launched")
+        (_, "inkling2-project-kernel-adds-a-wrong-epsilon")
+        | (_, "inkling2-project-kernel-ignores-the-clip-threshold")
+        | (_, "inkling2-project-kernel-never-caps-the-factor")
+        | (_, "inkling2-project-kernel-sums-in-another-order")
+        | (_, "inkling2-project-kernel-skips-the-k-convolution")
+        | (_, "inkling2-project-kernel-ignores-the-q-scale")
+        | (_, "inkling2-project-kernel-clips-the-relative-query-by-the-wrong-threshold")
+        | (_, "inkling2-project-kernel-adds-a-wrong-epsilon-to-the-value-norm")
+        | (_, "inkling2-project-kernel-drops-the-current-key-from-the-window")
+        | (_, "inkling2-project-kernel-drops-the-value-state-from-the-window")
+        | (_, "inkling2-project-kernel-runs-while-off") => "inkling2/project_kernel.rs",
+        (_, "inkling2-project-kernel-is-never-launched")
+        | (_, "inkling2-project-kernel-takes-prefill-sized-passes")
+        | (_, "inkling2-project-kernel-cuts-k-and-v-from-the-q-projection")
+        | (_, "inkling2-conv-kernel-residual-is-never-launched")
         | (_, "inkling2-conv-kernel-next-is-never-launched")
         | (_, "inkling2-conv-kernel-next-runs-while-off")
         | (_, "inkling2-conv-kernel-takes-prefill-sized-passes")

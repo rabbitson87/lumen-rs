@@ -193,8 +193,7 @@ fn a_full_prefill_matches_the_reference_logits() {
     assert_eq!(cache.len(), ids.len());
 }
 
-#[test]
-fn prefill_then_single_token_decode_matches_the_reference() {
+fn prefill_then_single_token_decode_against_the_reference(label: &str) {
     let model = load_replica();
     let want = reference("outputs.safetensors");
     let ids = prompt_ids(&want);
@@ -205,8 +204,23 @@ fn prefill_then_single_token_decode_matches_the_reference() {
     }
     let refs: Vec<&Array> = parts.iter().collect();
     let logits = mlx_rs::ops::concatenate_axis(&refs, 1).unwrap();
-    assert_logits_match("prefill + decode", &logits, &want["logits_split"], &model);
+    assert_logits_match(label, &logits, &want["logits_split"], &model);
     assert_eq!(cache.len(), ids.len());
+}
+
+#[test]
+fn prefill_then_single_token_decode_matches_the_reference() {
+    prefill_then_single_token_decode_against_the_reference("prefill + decode");
+}
+
+/// The same with the kernels off, so that every decode step runs the compiled regions (`fused.rs`)
+/// the kernels replace by default: the guard of a defect in a region's arithmetic that only a decode
+/// step with a convolution state shows (the first chunk of a prefill starts from a state of zeros).
+#[test]
+fn prefill_then_single_token_decode_matches_the_reference_through_the_compiled_regions() {
+    without_kernels(|| {
+        prefill_then_single_token_decode_against_the_reference("prefill + decode, compiled regions")
+    });
 }
 
 /// The same prompt fed in uneven chunks must land on the same logits as one prefill: every carried
@@ -820,6 +834,62 @@ fn the_conv_kernel_gives_the_logits_the_compiled_regions_give() {
     }
 }
 
+/// The local projection kernel (`project_kernel.rs`) is an `Optimization`: the logits with it on are
+/// the bits they are with it off (the compiled region runs instead), over single tokens and over
+/// blocks of rows, on the float32 replica and on the replica as serving runs it (its local layers run
+/// both the single-input projection and, in the loop's later passes, the stacked one). A run with the
+/// kernel on launches it, one with it off does not, and a pass of more rows than a decode takes never
+/// does.
+#[test]
+fn the_project_kernel_gives_the_logits_the_compiled_region_gives() {
+    for (name, model) in [
+        ("replica", load_replica()),
+        ("rounded replica", load_replica_rounded()),
+    ] {
+        let run = |on: bool| super::project_kernel::kernel::with(on, || steps_with(&model, true));
+        let before = super::project_kernel::launches();
+        let off = run(false);
+        assert_eq!(
+            super::project_kernel::launches(),
+            before,
+            "{name}: the kernel ran while it was off"
+        );
+        let on = run(true);
+        assert!(
+            super::project_kernel::launches() > before,
+            "{name}: the kernel never ran while it was on"
+        );
+        let launched = super::project_kernel::launches();
+        super::project_kernel::kernel::with(true, || {
+            let mut cache = model.make_cache();
+            let ids = vec![1u32; super::ops::DECODE_ROWS + 1];
+            host_f32(&model.forward(&ids, &mut cache, true).unwrap());
+        });
+        assert_eq!(
+            super::project_kernel::launches(),
+            launched,
+            "{name}: the kernel took a pass of more than {} rows",
+            super::ops::DECODE_ROWS
+        );
+        let bits = |steps: &[Vec<f32>]| -> Vec<Vec<u32>> {
+            steps
+                .iter()
+                .map(|s| s.iter().map(|x| x.to_bits()).collect())
+                .collect()
+        };
+        assert_eq!(
+            bits(&off.0),
+            bits(&on.0),
+            "{name}: single tokens: the kernel changed a logit"
+        );
+        assert_eq!(
+            bits(&off.1),
+            bits(&on.1),
+            "{name}: blocks: the kernel changed a logit"
+        );
+    }
+}
+
 /// A block added after a stack was built is in the next stack: the stack is kept between mixes, and
 /// a stale one would drop the block a boundary layer just added from every later mix.
 #[test]
@@ -855,13 +925,18 @@ const REGIONS: [&str; 7] = [
     "attention-residual mix",
 ];
 
-/// Runs `f` with the kernels (the mix, the router and the convolution) off. The compiled regions are
-/// an `Optimization`: bit for bit the plain ops, and the compiled attention-residual mix and
-/// convolutions are the forms a pass takes when their kernels are off. The tests of that contract
-/// compare the composed forms, which the kernels replace when they are on (as they are by default).
+/// Runs `f` with the kernels (the mix, the router, the convolution and the local projection) off. The
+/// compiled regions are an `Optimization`: bit for bit the plain ops, and the compiled
+/// attention-residual mix, convolutions and local projection are the forms a pass takes when their
+/// kernels are off. The tests of that contract compare the composed forms, which the kernels replace
+/// when they are on (as they are by default).
 fn without_kernels<R>(f: impl FnOnce() -> R) -> R {
     super::mix_kernel::kernel::with(false, || {
-        super::route_kernel::kernel::with(false, || super::conv_kernel::kernel::with(false, f))
+        super::route_kernel::kernel::with(false, || {
+            super::conv_kernel::kernel::with(false, || {
+                super::project_kernel::kernel::with(false, f)
+            })
+        })
     })
 }
 
@@ -1023,4 +1098,68 @@ fn a_blocks_mask_geometry_is_shared_only_by_layers_that_would_build_the_same() {
     assert_eq!(interleaved[2], alone.0, "sliding after global");
     assert_eq!(interleaved[3], alone.1, "global, again");
     assert_ne!(alone.0, alone.1, "the two kinds are told apart by the data");
+}
+
+#[test]
+#[ignore = "temporary probe"]
+fn probe_projection_region_dispatches() {
+    use mlx_rs::Dtype;
+    let (nh, nkv, hd, dr, ext) = (24i32, 8i32, 128i32, 16i32, 1024i32);
+    let cfg = super::regions::ProjCfg {
+        heads: nh,
+        kv_heads: nkv,
+        head_dim: hd,
+        d_rel: dr,
+        qk_clip: 22.627417,
+        rel_clip: 8.0,
+        conv_scale: 0.4472136,
+    };
+    let (dq, dkv, drr) = (nh * hd, nkv * hd, nh * dr);
+    let total = dq + 2 * dkv + drr + dq + nh;
+    let mk = |shape: &[i32], dt: Dtype| {
+        let n: i32 = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+        Array::from_slice(&v, shape).as_dtype(dt).unwrap()
+    };
+    for (rows, dt) in [(1, Dtype::Bfloat16), (1, Dtype::Float32)] {
+        let big = mk(&[1, rows, total], dt);
+        use mlx_rs::ops::indexing::TryIndexOp;
+        let (c0, c1, c2, c3) = (dq, dq + dkv, dq + 2 * dkv, dq + 2 * dkv + drr);
+        let q = big.try_index((.., .., ..c0)).unwrap();
+        let k = big.try_index((.., .., c0..c1)).unwrap();
+        let v = big.try_index((.., .., c1..c2)).unwrap();
+        let r = big.try_index((.., .., c2..c3)).unwrap();
+        let ks = mk(&[1, 3, dkv], Dtype::Float32);
+        let vs = mk(&[1, 3, dkv], Dtype::Float32);
+        let kc = mk(&[dkv, 4], dt);
+        let vc = mk(&[dkv, 4], dt);
+        let qs = mk(&[nh, hd], dt);
+        let rs = mk(&[nh, dr], dt);
+        let rp = mk(&[dr, ext], dt);
+        let args: Vec<&Array> = vec![&q, &k, &v, &r, &ks, &vs, &kc, &vc, &qs, &rs, &rp];
+        type Run = fn(&super::regions::ProjCfg, &[&Array]) -> anyhow::Result<[Array; 6]>;
+        let runs: [(&str, Run); 2] = [
+            ("compiled", super::fused::project_local),
+            ("plain", super::regions::project_local),
+        ];
+        for (name, f) in runs {
+            let warm = f(&cfg, &args).unwrap();
+            for a in &warm {
+                a.eval().unwrap();
+            }
+            let (_, d0) = mlx_rs::metal::cmd_buffer_stats().unwrap_or_default();
+            let n = 10;
+            for _ in 0..n {
+                let out = f(&cfg, &args).unwrap();
+                for a in &out {
+                    a.eval().unwrap();
+                }
+            }
+            let (_, d1) = mlx_rs::metal::cmd_buffer_stats().unwrap_or_default();
+            eprintln!(
+                "PROBE {name} {dt:?} rows {rows}: {:.1} dispatches a call",
+                (d1 - d0) as f64 / n as f64
+            );
+        }
+    }
 }

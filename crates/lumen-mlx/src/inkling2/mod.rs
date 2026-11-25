@@ -37,6 +37,8 @@ mod ops;
 mod pixels;
 #[cfg(feature = "mlx-native")]
 mod profile;
+#[cfg(feature = "mlx-native")]
+mod project_kernel;
 mod quant;
 #[cfg(feature = "mlx-native")]
 mod regions;

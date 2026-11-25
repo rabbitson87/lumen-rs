@@ -22,6 +22,7 @@ use super::ops::{
     route_topk, scalar, softcap, softcapped_swiglu, static_conv_scale, unit_rms,
 };
 use super::profile;
+use super::project_kernel;
 use super::quant::{QuantMode, QuantTable};
 use super::regions::{self, ProjCfg};
 use super::route_kernel;
@@ -517,16 +518,18 @@ impl Attention {
                 k_conv,
                 v_conv,
             } => {
-                let (q, k, v, r, gate, sink) = match (xk, xv) {
+                // `srcs`: the projection outputs q and the relative query, k, and v are cut from.
+                let (q, k, v, r, gate, sink, srcs) = match (xk, xv) {
                     (None, None) => {
-                        let mut p =
-                            mlx_rs::ops::split_sections(&in_proj.apply(xq)?, &self.cuts, -1)?
-                                .into_iter();
+                        let full = in_proj.apply(xq)?;
+                        let mut p = mlx_rs::ops::split_sections(&full, &self.cuts, -1)?.into_iter();
                         let mut next = || {
                             p.next()
                                 .ok_or_else(|| anyhow!("split yielded too few parts"))
                         };
-                        (next()?, next()?, next()?, next()?, next()?, next()?)
+                        let (q, k, v, r, gate, sink) =
+                            (next()?, next()?, next()?, next()?, next()?, next()?);
+                        (q, k, v, r, gate, sink, [full.clone(), full.clone(), full])
                     }
                     (Some(xk), Some(xv)) => {
                         // Looped passes give q, k and v their own inputs; one stacked projection
@@ -554,12 +557,35 @@ impl Attention {
                             (next()?, next()?, next()?, next()?, next()?, next()?);
                         let k = pk.try_index((.., .., self.cuts[0]..self.cuts[1]))?;
                         let v = pv.try_index((.., .., self.cuts[1]..self.cuts[2]))?;
-                        (q, k, v, r, gate, sink)
+                        (q, k, v, r, gate, sink, [pq, pk, pv])
                     }
                     _ => bail!("a local layer takes either one input or all three"),
                 };
-                let lead = [&q, &k, &v, &r, k_state, v_state, k_conv, v_conv];
-                (self.region(&lead, tau, fuse)?, gate, sink)
+                profile::mark("qkv matmul", &[&q, &k, &v, &r])?;
+                let cfg = self.proj_cfg();
+                let fixed = [
+                    k_state,
+                    v_state,
+                    k_conv,
+                    v_conv,
+                    &self.q_scale,
+                    &self.r_scale,
+                    &self.rel_proj,
+                ];
+                let from = [&srcs[0], &srcs[1], &srcs[2]];
+                // One launch (and the relative-bias matmul) for a decode-sized pass, bit for bit the
+                // compiled region (`project_kernel.rs`).
+                let out = if fuse
+                    && tau.is_none()
+                    && project_kernel::enabled()
+                    && project_kernel::serves(&cfg, from, &fixed)
+                {
+                    project_kernel::project_local(&cfg, &self.cuts, from, &fixed)?
+                } else {
+                    let lead = [&q, &k, &v, &r, k_state, v_state, k_conv, v_conv];
+                    self.region(&lead, tau, fuse)?
+                };
+                (out, gate, sink)
             }
             AttnProj::Global {
                 q_proj,
@@ -580,10 +606,23 @@ impl Attention {
                 let (q, r, gate, sink) = (next()?, next()?, next()?, next()?);
                 let kp = k_proj.apply(xk)?;
                 let vp = v_proj.apply(xv)?;
+                profile::mark("qkv matmul", &[&q, &r, &kp, &vp])?;
                 let lead = [&q, &r, &kp, &vp, k_state, v_state, k_static, v_static];
                 (self.region(&lead, tau, fuse)?, gate, sink)
             }
         };
+        if profile::active() {
+            let outs: Vec<&Array> = out.iter().collect();
+            let local = matches!(self.proj, AttnProj::Local { .. });
+            profile::mark(
+                if local {
+                    "qkv region (local)"
+                } else {
+                    "qkv region (global)"
+                },
+                &outs,
+            )?;
+        }
         let [q, k, v, rel, k_window, v_window] = out;
         Ok(Projected {
             q,
@@ -597,12 +636,11 @@ impl Attention {
         })
     }
 
-    /// The projection region of this layer kind (`regions.rs`), compiled when `fuse` (`fused.rs`):
-    /// `lead` are the pieces it starts from (q, k, v, r with their states and taps, or the global
-    /// layer's), after which come the layer's scales and relative projection and the position scaling.
-    fn region(&self, lead: &[&Array], tau: Option<&Array>, fuse: bool) -> Result<[Array; 6]> {
+    /// What the projection regions build their graph from: this layer's head geometry, clips and
+    /// convolution scale.
+    fn proj_cfg(&self) -> ProjCfg {
         let local = matches!(self.proj, AttnProj::Local { .. });
-        let cfg = ProjCfg {
+        ProjCfg {
             heads: self.dims.heads as i32,
             kv_heads: self.dims.kv_heads as i32,
             head_dim: self.dims.head_dim as i32,
@@ -614,7 +652,15 @@ impl Attention {
             } else {
                 self.dconv_scale
             },
-        };
+        }
+    }
+
+    /// The projection region of this layer kind (`regions.rs`), compiled when `fuse` (`fused.rs`):
+    /// `lead` are the pieces it starts from (q, k, v, r with their states and taps, or the global
+    /// layer's), after which come the layer's scales and relative projection and the position scaling.
+    fn region(&self, lead: &[&Array], tau: Option<&Array>, fuse: bool) -> Result<[Array; 6]> {
+        let local = matches!(self.proj, AttnProj::Local { .. });
+        let cfg = self.proj_cfg();
         let mut args: Vec<&Array> = lead.to_vec();
         args.extend([&self.q_scale, &self.r_scale, &self.rel_proj]);
         args.extend(tau);
@@ -1035,10 +1081,6 @@ impl Layer {
             &states[1],
             tau.as_ref(),
             fuse,
-        )?;
-        profile::mark(
-            "qkv projection + conv + clip",
-            &[&p.q, &p.k, &p.v, &p.rel, &p.gate, &p.sink],
         )?;
         let out = self.attn.attend(&p, &mut cache.kv)?;
         profile::mark("attention (kv + sdpa)", &[&out])?;

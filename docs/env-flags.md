@@ -28,6 +28,7 @@ value → on.
 | `LUMEN_INKLING2_FUSE` | on | Optimization | `lumen_mlx::inkling2::fused::fuse` |
 | `LUMEN_INKLING2_MIX_FOLD` | on | Optimization | `lumen_mlx::inkling2::mix_kernel::fold` |
 | `LUMEN_INKLING2_MIX_KERNEL` | on | Behavior | `lumen_mlx::inkling2::mix_kernel::kernel` |
+| `LUMEN_INKLING2_PROJECT_KERNEL` | on | Optimization | `lumen_mlx::inkling2::project_kernel::kernel` |
 | `LUMEN_INKLING2_ROUTE_KERNEL` | on | Behavior | `lumen_mlx::inkling2::route_kernel::kernel` |
 | `LUMEN_INKLING2_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::inkling2::profile::stage_sync` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
@@ -290,6 +291,21 @@ Mix the Inkling 2 depth sources (the attention residual) in one Metal kernel ins
  On by default. Teacher-forced over 2,745 positions of 20 prompts it flips the greedy choice
  at 0.69% of them, none by more than 2.7 bfloat16 steps, against 0.9 to 1.3% (up to 7 steps)
  for the verify blocks that `LUMEN_INKLING2_DRAFT` ships on. `=0` restores the composed ops.
+
+### `LUMEN_INKLING2_PROJECT_KERNEL`
+
+*Optimization, default on.*
+
+Run a local attention layer's projection region (the short convolutions of k and v, the L2
+ clips of q, k and the relative query, the value norm, the layout of q, k, v) as one Metal
+ kernel in place of the compiled composed ops: 24 dispatches become one (and the relative
+ bias matmul after it). Bit for bit what the composed ops give (the kernel adds every sum in
+ the order MLX's reductions do, and the tests compare bits). Decode-sized passes only (a verify
+ block too): a prefill chunk keeps the composed ops.
+
+ A decode token about 0.7 ms (2.5%) faster: 10 same-session runs an arm against the version
+ without it, 0.73 ms (paired standard error 0.03) by mean wall time and 0.71 ms by the median of
+ steps; 880 fewer dispatches a token (22 for each of the 40 local layer visits).
 
 ### `LUMEN_INKLING2_ROUTE_KERNEL`
 

@@ -2885,7 +2885,11 @@ mod real_checkpoint_tests {
         super::super::conv_kernel::kernel::with(on, f)
     }
 
-    /// The `Optimization` kernels (the mix's fold, the convolution) change no bit: on the real
+    fn pin_project(on: bool, f: &mut dyn FnMut() -> Vec<u32>) -> Vec<u32> {
+        super::super::project_kernel::kernel::with(on, f)
+    }
+
+    /// The `Optimization` kernels (the mix's fold, the convolution, the local projection) change no bit: on the real
     /// checkpoint every logit of a pass is the bit it is without them, over single steps and verify
     /// blocks of 2, 4 and 8 rows, the plain loop's own continuation of each prompt fed through each
     /// (the mix and router kernels on, as served). Each kernel does the arithmetic of the ops it
@@ -2911,7 +2915,11 @@ mod real_checkpoint_tests {
             let plain = b.generate(&ids, NEW_TOKENS, 0.0, 1.0, &ov).unwrap();
             let mut fed = vec![*ids.last().unwrap()];
             fed.extend_from_slice(&plain[..plain.len() - 1]);
-            for (kernel, pin) in [("the fold", pin_fold as Pin), ("the conv kernel", pin_conv)] {
+            for (kernel, pin) in [
+                ("the fold", pin_fold as Pin),
+                ("the conv kernel", pin_conv),
+                ("the projection kernel", pin_project),
+            ] {
                 for size in [1usize, 2, 4, 8] {
                     let logits_with = |on: bool| -> Vec<u32> {
                         pin(on, &mut || {
