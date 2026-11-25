@@ -2983,6 +2983,136 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "inkling2-conv-kernel-skips-the-weight-rounding",
+        symptom: "the convolution kernel did not round the sum of the taps to the weight dtype before adding the row, so every convolved row differed from the reference's in the last bits of bfloat16 and the logits moved",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float y = round_as(x, (round_as(w, acc) + current) * scale);",
+            replace: "const float y = round_as(x, (acc + current) * scale); // defect: the sum is not rounded to the weight dtype",
+        }],
+        guards: &[mlx(
+            "inkling2::conv_kernel::tests::the_kernel_is_the_composed_convolution_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-conv-kernel-forgets-the-scale",
+        symptom: "the convolution kernel did not scale the sum of the convolution and the row, so every sublayer's output joined the stream about two and a quarter times too large",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float y = round_as(x, (round_as(w, acc) + current) * scale);",
+            replace: "const float y = round_as(x, round_as(w, acc) + current); // defect: no scale",
+        }],
+        guards: &[mlx(
+            "inkling2::conv_kernel::tests::the_kernel_is_the_composed_convolution_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-conv-kernel-skips-the-row-rounding",
+        symptom: "the convolution kernel kept its result in float32 where the reference rounds it to the row's dtype before the residual add, so the stream drifted from the reference's in the last bits of bfloat16",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float y = round_as(x, (round_as(w, acc) + current) * scale);",
+            replace: "const float y = (round_as(w, acc) + current) * scale; // defect: not rounded to the row dtype",
+        }],
+        guards: &[mlx(
+            "inkling2::conv_kernel::tests::the_kernel_is_the_composed_convolution_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-conv-kernel-mirrors-the-taps",
+        symptom: "the convolution kernel applied the taps in mirrored order, so the newest row met the oldest tap",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float term = float(w[c * TAPS + j]) * v;",
+            replace: "const float term = float(w[c * TAPS + (TAPS - 1 - j)]) * v; // defect: the taps are mirrored",
+        }],
+        guards: &[mlx(
+            "inkling2::conv_kernel::tests::the_kernel_is_the_composed_convolution_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-conv-kernel-drops-the-state-from-the-window",
+        symptom: "the convolution kernel wrote zeros in place of the state rows of the padded window, so the next token convolved with a state of zeros and every token after the first was wrong",
+        revert: &[Mutation {
+            path: MLX,
+            find: "window[t * C + c] = state[t * C + c];",
+            replace: "window[t * C + c] = 0.0f; // defect: the state rows are not copied",
+        }],
+        guards: &[mlx(
+            "inkling2::conv_kernel::tests::the_kernel_is_the_composed_convolution_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-conv-kernel-drops-the-stream",
+        symptom: "the convolution kernel returned the convolution alone where the residual stream joins it, so the layer lost everything before it",
+        revert: &[Mutation {
+            path: MLX,
+            find: "result = float(h[i]) + y;",
+            replace: "result = y; // defect: the stream is not added",
+        }],
+        guards: &[mlx(
+            "inkling2::conv_kernel::tests::the_kernel_is_the_composed_convolution_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-conv-kernel-residual-is-never-launched",
+        symptom: "the layer's attention convolution ran the compiled form although the kernel was on, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "(true, true) => conv_kernel::conv_residual,",
+            replace: "(true, true) => fused::conv_residual, // defect: the kernel is never chosen",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_conv_kernel_gives_the_logits_the_compiled_regions_give",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-conv-kernel-next-is-never-launched",
+        symptom: "the layer's MLP convolution ran the compiled form although the kernel was on, so half of the flag's saving was lost",
+        revert: &[Mutation {
+            path: MLX,
+            find: "(true, true) => conv_kernel::conv_next,",
+            replace: "(true, true) => fused::conv_next, // defect: the kernel is never chosen",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_conv_kernel_gives_the_logits_the_compiled_regions_give",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-conv-kernel-next-runs-while-off",
+        symptom: "the layer's MLP convolution launched the kernel although it was off, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "(true, false) => fused::conv_next,",
+            replace: "(true, false) => conv_kernel::conv_next, // defect: the kernel runs while off",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_conv_kernel_gives_the_logits_the_compiled_regions_give",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "inkling2-conv-kernel-takes-prefill-sized-passes",
+        symptom: "a prefill chunk's attention convolution took the kernel, which serves decode-sized passes only (a thread for each channel of each of hundreds of rows, and a window the compiled form never had to build)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "match (fuse, conv_kernel::enabled() && x.shape()[0] == 1) {",
+            replace: "match (true, conv_kernel::enabled() && x.shape()[0] == 1) { // defect: not limited to decode-sized passes",
+        }],
+        guards: &[mlx(
+            "inkling2::tests::the_conv_kernel_gives_the_logits_the_compiled_regions_give",
+        )],
+        ..PLAIN
+    },
+    Defect {
         name: "inkling2-route-kernel-scores-negative-logits-as-positive",
         symptom: "the router kernel scored a negative logit as its mirror image, so an expert the router disliked scored above one half and was picked ahead of the ones it liked",
         revert: &[Mutation {
@@ -3267,7 +3397,17 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "inkling2-mix-fold-sums-the-squares-in-another-order")
         | (_, "inkling2-mix-fold-reads-the-blocks-of-the-first-row")
         | (_, "inkling2-mix-fold-runs-while-off") => "inkling2/mix_kernel.rs",
-        (_, "inkling2-mix-fold-is-never-chosen")
+        (_, "inkling2-conv-kernel-skips-the-weight-rounding")
+        | (_, "inkling2-conv-kernel-forgets-the-scale")
+        | (_, "inkling2-conv-kernel-skips-the-row-rounding")
+        | (_, "inkling2-conv-kernel-mirrors-the-taps")
+        | (_, "inkling2-conv-kernel-drops-the-state-from-the-window")
+        | (_, "inkling2-conv-kernel-drops-the-stream") => "inkling2/conv_kernel.rs",
+        (_, "inkling2-conv-kernel-residual-is-never-launched")
+        | (_, "inkling2-conv-kernel-next-is-never-launched")
+        | (_, "inkling2-conv-kernel-next-runs-while-off")
+        | (_, "inkling2-conv-kernel-takes-prefill-sized-passes")
+        | (_, "inkling2-mix-fold-is-never-chosen")
         | (_, "inkling2-mix-fold-takes-prefill-sized-passes")
         | (_, "inkling2-blocks-keep-a-stale-stack")
         | (_, "inkling2-mix-kernel-is-never-launched")

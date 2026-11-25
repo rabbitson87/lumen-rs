@@ -23,6 +23,7 @@ value → on.
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
+| `LUMEN_INKLING2_CONV_KERNEL` | on | Optimization | `lumen_mlx::inkling2::conv_kernel::kernel` |
 | `LUMEN_INKLING2_DRAFT` | on | Behavior | `lumen_mlx::inkling2::backend::inkling2_draft` |
 | `LUMEN_INKLING2_FUSE` | on | Optimization | `lumen_mlx::inkling2::fused::fuse` |
 | `LUMEN_INKLING2_MIX_FOLD` | on | Optimization | `lumen_mlx::inkling2::mix_kernel::fold` |
@@ -219,6 +220,20 @@ Run quantized-KV prefill (queries of more than one token) through
  bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
  at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
  `=0` restores the quantized matmuls.
+
+### `LUMEN_INKLING2_CONV_KERNEL`
+
+*Optimization, default on.*
+
+Run the Inkling 2 short convolution and its residual add (after the attention and after the
+ MLP of each layer visit) as one Metal kernel in place of the compiled composed ops: about
+ eight dispatches each become one. Bit for bit what the composed ops give (the kernel adds
+ the taps and rounds in the same order, and the tests compare bits). Decode-sized passes
+ only (a verify block too): a prefill chunk keeps the composed ops.
+
+ A decode token about 0.5 to 0.6 ms (1.8%) faster: 20 same-session runs an arm against the
+ version without it, 0.53 ms by mean wall time (paired standard error 0.12) and 0.64 ms by
+ the median of steps; 608 fewer dispatches a token.
 
 ### `LUMEN_INKLING2_DRAFT`
 

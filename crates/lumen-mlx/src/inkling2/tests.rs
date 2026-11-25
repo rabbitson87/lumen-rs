@@ -760,6 +760,66 @@ fn the_folded_mix_gives_the_logits_the_unfolded_kernel_gives() {
     }
 }
 
+/// The convolution kernel (`conv_kernel.rs`) is an `Optimization`: the logits with it on are the bits
+/// they are with it off (the compiled regions run instead), over single tokens and over blocks of
+/// rows, on the float32 replica and on the replica as serving runs it. A run with the kernel on
+/// launches it after the attention and after the MLP, one with it off launches neither, and a pass of
+/// more rows than a decode takes never does.
+#[test]
+fn the_conv_kernel_gives_the_logits_the_compiled_regions_give() {
+    for (name, model) in [
+        ("replica", load_replica()),
+        ("rounded replica", load_replica_rounded()),
+    ] {
+        let run = |on: bool| super::conv_kernel::kernel::with(on, || steps_with(&model, true));
+        let before = super::conv_kernel::launches();
+        let off = run(false);
+        assert_eq!(
+            super::conv_kernel::launches(),
+            before,
+            "{name}: the kernel ran while it was off"
+        );
+        let on = run(true);
+        let after = super::conv_kernel::launches();
+        assert!(
+            after[0] > before[0],
+            "{name}: the kernel never ran after the attention while it was on"
+        );
+        assert!(
+            after[1] > before[1],
+            "{name}: the kernel never ran after the MLP while it was on"
+        );
+        let launched = super::conv_kernel::launches();
+        super::conv_kernel::kernel::with(true, || {
+            let mut cache = model.make_cache();
+            let ids = vec![1u32; super::ops::DECODE_ROWS + 1];
+            host_f32(&model.forward(&ids, &mut cache, true).unwrap());
+        });
+        assert_eq!(
+            super::conv_kernel::launches(),
+            launched,
+            "{name}: the kernel took a pass of more than {} rows",
+            super::ops::DECODE_ROWS
+        );
+        let bits = |steps: &[Vec<f32>]| -> Vec<Vec<u32>> {
+            steps
+                .iter()
+                .map(|s| s.iter().map(|x| x.to_bits()).collect())
+                .collect()
+        };
+        assert_eq!(
+            bits(&off.0),
+            bits(&on.0),
+            "{name}: single tokens: the kernel changed a logit"
+        );
+        assert_eq!(
+            bits(&off.1),
+            bits(&on.1),
+            "{name}: blocks: the kernel changed a logit"
+        );
+    }
+}
+
 /// A block added after a stack was built is in the next stack: the stack is kept between mixes, and
 /// a stale one would drop the block a boundary layer just added from every later mix.
 #[test]
@@ -795,12 +855,14 @@ const REGIONS: [&str; 7] = [
     "attention-residual mix",
 ];
 
-/// Runs `f` with the `Behavior` kernels (the mix and the router) off. The compiled regions are an
-/// `Optimization`: bit for bit the plain ops, and the compiled attention-residual mix is the form a
-/// pass takes when the mix kernel is off. The tests of that contract compare the composed forms, which
-/// the kernels replace when they are on (as they are by default).
+/// Runs `f` with the kernels (the mix, the router and the convolution) off. The compiled regions are
+/// an `Optimization`: bit for bit the plain ops, and the compiled attention-residual mix and
+/// convolutions are the forms a pass takes when their kernels are off. The tests of that contract
+/// compare the composed forms, which the kernels replace when they are on (as they are by default).
 fn without_kernels<R>(f: impl FnOnce() -> R) -> R {
-    super::mix_kernel::kernel::with(false, || super::route_kernel::kernel::with(false, f))
+    super::mix_kernel::kernel::with(false, || {
+        super::route_kernel::kernel::with(false, || super::conv_kernel::kernel::with(false, f))
+    })
 }
 
 /// How many times each region has been served since `before`.

@@ -14,6 +14,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use mlx_rs::ops::indexing::{TryIndexOp, take_axis};
 use mlx_rs::{Array, Dtype};
 
+use super::conv_kernel;
 use super::fused;
 use super::mix_kernel;
 use super::ops::{
@@ -883,11 +884,14 @@ impl Layer {
     ) -> Result<(Array, Array)> {
         let mut args: Vec<&Array> = vec![x, w, state];
         args.extend(h);
-        let run = if fuse {
-            fused::conv_residual
-        } else {
-            regions::conv_residual
-        };
+        // The kernel (`conv_kernel.rs`) serves a single sequence of decode-sized rows, as the compiled
+        // regions do (`fused.rs`); the composed ops serve everything else.
+        let run: fn(f32, &[&Array]) -> Result<[Array; 2]> =
+            match (fuse, conv_kernel::enabled() && x.shape()[0] == 1) {
+                (true, true) => conv_kernel::conv_residual,
+                (true, false) => fused::conv_residual,
+                (false, _) => regions::conv_residual,
+            };
         let [residual, window] = run(self.attn.sconv_scale, &args)?;
         Ok((residual, window))
     }
@@ -903,11 +907,12 @@ impl Layer {
         residual: &Array,
         dtype: Dtype,
     ) -> Result<(Array, Array)> {
-        let run = if fuse {
-            fused::conv_next
-        } else {
-            regions::conv_next
-        };
+        let run: fn(f32, Dtype, &[&Array]) -> Result<[Array; 2]> =
+            match (fuse, conv_kernel::enabled() && m.shape()[0] == 1) {
+                (true, true) => conv_kernel::conv_next,
+                (true, false) => fused::conv_next,
+                (false, _) => regions::conv_next,
+            };
         let [next, window] = run(self.attn.sconv_scale, dtype, &[m, w, state, residual])?;
         Ok((next, window))
     }

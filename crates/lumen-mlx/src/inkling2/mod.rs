@@ -20,6 +20,8 @@ mod backend;
 mod chat;
 mod config;
 #[cfg(feature = "mlx-native")]
+mod conv_kernel;
+#[cfg(feature = "mlx-native")]
 mod draft;
 #[cfg(all(test, feature = "mlx-native"))]
 mod draft_tests;
