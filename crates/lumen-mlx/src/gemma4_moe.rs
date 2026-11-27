@@ -2374,6 +2374,7 @@ pub(crate) mod imp {
     pub fn set_decode_kernel_flag(env: &str, on: bool) -> Result<()> {
         match env {
             "LUMEN_GEMMA4_NORM_KERNELS" => crate::gemma4_norm_kernels::norm_kernels::set(on),
+            "LUMEN_GEMMA4_ROUTE_KERNEL" => crate::gemma4_route_kernel::route_kernel::set(on),
             other => return Err(anyhow!("no decode kernel flag named {other}")),
         }
         Ok(())
@@ -3138,6 +3139,9 @@ pub(crate) mod imp {
         /// Whether every norm weight and layer scalar the norm kernels read is bfloat16 of the
         /// shape they take (decided once at load; a checkpoint that is not keeps the composed ops).
         norm_kernel_weights_ok: bool,
+        /// Whether the route kernel serves this checkpoint's router (bfloat16 per-expert scales,
+        /// at most 1024 experts, a top-k of at most 128): decided once at load.
+        route_kernel_ok: bool,
         // True iff Wv / Wo were baked with the Haar rotation R at load
         // time. When set, the SlidingTurboquant forward path skips the
         // runtime V rotation matmul / the V_dq un-rotation matmul.
@@ -3445,6 +3449,15 @@ pub(crate) mod imp {
                         && lw.layer_scalar.size() == 1
                 });
 
+            let experts = cfg.text_config.num_experts as i32;
+            let route_kernel_ok = (1..=1024).contains(&experts)
+                && (1..=128.min(cfg.text_config.num_experts))
+                    .contains(&cfg.text_config.top_k_experts)
+                && layers.iter().all(|lw| {
+                    lw.router.per_expert_scale.dtype() == mlx_rs::Dtype::Bfloat16
+                        && lw.router.per_expert_scale.shape() == [experts]
+                });
+
             // Decide the sliding-window kernel now (a one-off self-check), not
             // inside the first request's forward.
             windowed_kernel_enabled();
@@ -3461,6 +3474,7 @@ pub(crate) mod imp {
                 const_last_idx_one,
                 const_rms_eps,
                 norm_kernel_weights_ok,
+                route_kernel_ok,
                 tq_bake_v_active,
                 tq_bake_o_active,
                 tq_bake_o_full_attn_active,
@@ -5757,6 +5771,41 @@ pub(crate) mod imp {
             Ok(h)
         }
 
+        /// The experts' output for the rows `router_in` (normed for the router) and `moe_in`
+        /// (normed for the experts) as the default path computes it on a decode-sized pass: the
+        /// routing tail, the experts and their combine in one compile slot for affine 4-bit
+        /// experts; the router's tail, then the expert GLU, otherwise.
+        fn experts_of_normed(
+            &self,
+            router_in: &Array,
+            moe_in: &Array,
+            lw: &ResolvedGemma4LayerWeights,
+        ) -> Result<Array> {
+            let (scores, indices) = self.router_scores_indices_of_normed(router_in, &lw.router)?;
+            let tokens = moe_in.shape()[1] as usize;
+            let routing_experts_slot = tokens * self.config.text_config.top_k_experts < 64
+                && gemma4_routing_experts_fuse_enabled()
+                && lw.experts.gate_proj.bits == 4
+                && lw.experts.gate_proj.group_size == 64
+                && lw.experts.gate_proj.mode == MODE_AFFINE;
+            let slot = routing_experts_slot.then(|| {
+                gemma4_routing_experts_fused(
+                    &scores,
+                    &indices,
+                    &lw.router.per_expert_scale,
+                    moe_in,
+                    &lw.experts,
+                )
+            });
+            match slot {
+                Some(Ok(out)) => Ok(out),
+                _ => {
+                    let weights = Self::routing_tail(&scores, &indices, &lw.router)?;
+                    self.experts_forward(moe_in, &indices, &weights, &lw.experts)
+                }
+            }
+        }
+
         /// [`Self::decoder_layer_forward`] with its norm-and-residual glue as the two kernels of
         /// [`crate::gemma4_norm_kernels`], for a decode-sized pass. `x_normed` is `x` already
         /// normed with this layer's input norm (the previous layer's kernel wrote it), or `None`
@@ -5801,31 +5850,27 @@ pub(crate) mod imp {
             let dense = Self::dense_mlp_forward(&dense_in, &lw.dense_mlp)?;
             stage_mark("dense mlp", &[&dense])?;
 
-            // The experts as the default path runs them on a decode-sized pass: the routing tail,
-            // the experts and their combine in one compile slot for affine 4-bit experts; the
-            // router's tail, then the expert GLU, otherwise.
-            let (scores, indices) = self.router_scores_indices_of_normed(&router_in, &lw.router)?;
-            let tokens = h.shape()[1] as usize;
-            let routing_experts_slot = tokens * cfg.top_k_experts < 64
-                && gemma4_routing_experts_fuse_enabled()
-                && lw.experts.gate_proj.bits == 4
-                && lw.experts.gate_proj.group_size == 64
-                && lw.experts.gate_proj.mode == MODE_AFFINE;
-            let slot = routing_experts_slot.then(|| {
-                gemma4_routing_experts_fused(
-                    &scores,
-                    &indices,
-                    &lw.router.per_expert_scale,
-                    &moe_in,
-                    &lw.experts,
-                )
-            });
-            let moe = match slot {
-                Some(Ok(out)) => out,
-                _ => {
-                    let weights = Self::routing_tail(&scores, &indices, &lw.router)?;
-                    self.experts_forward(&moe_in, &indices, &weights, &lw.experts)?
-                }
+            // With the route kernel, the projection's scores go straight to it (the top-k and the
+            // routing weights in one launch), then the expert GLU.
+            let routed = if self.route_kernel_ok && crate::gemma4_route_kernel::enabled() {
+                let scores = lw.router.proj.apply(&router_in)?;
+                (scores.dtype() == mlx_rs::Dtype::Bfloat16)
+                    .then(|| {
+                        crate::gemma4_route_kernel::route(
+                            &scores,
+                            &lw.router.per_expert_scale,
+                            cfg.top_k_experts as i32,
+                        )
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let moe = if let Some([indices, weights]) = routed {
+                stage_mark("router proj + route kernel", &[&indices, &weights])?;
+                self.experts_forward(&moe_in, &indices, &weights, &lw.experts)?
+            } else {
+                self.experts_of_normed(&router_in, &moe_in, lw)?
             };
             stage_mark("experts", &[&moe])?;
 
@@ -8419,17 +8464,16 @@ pub(crate) mod imp {
             }
         }
 
-        /// With `LUMEN_GEMMA4_NORM_KERNELS` the decoder layers' norm-and-residual glue runs as
-        /// kernels and each layer hands the next its input already normed. Teacher-forced on the
-        /// default path's own continuation, every decode step's logits and a verify-sized block's
-        /// are the default path's to the bit, and both kernels ran on every layer (a comparison
-        /// alone would pass with the kernels never chosen).
-        #[test]
-        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
-        fn norm_kernels_give_the_default_paths_logits_to_the_bit() {
+        /// Decode steps the kernel tests teacher-force, then the rows of a verify-sized block.
+        const KERNEL_TEST_STEPS: usize = 24;
+        const KERNEL_TEST_BLOCK: usize = 4;
+
+        /// The checkpoint at `LUMEN_GEMMA4_MODEL_DIR` and a prompt longer than a decode-sized pass
+        /// (so the kernels run on the decode passes only), or `None` to skip.
+        fn kernel_test_model() -> Option<(NativeGemma4Model, Vec<u32>)> {
             let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
                 eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR");
-                return;
+                return None;
             };
             let dir = Path::new(&dir);
             let model = NativeGemma4Model::load(dir).expect("load model");
@@ -8443,73 +8487,128 @@ pub(crate) mod imp {
                     false,
                 )
                 .expect("encode");
-            // A prefill chunk is not decode-sized, so the kernels run on the decode passes only.
             assert!(prompt.len() > crate::gemma4_norm_kernels::MAX_ROWS as usize);
-            const STEPS: usize = 24;
-            const BLOCK: usize = 4;
+            Some((model, prompt))
+        }
+
+        /// The logits' bits of every decode step after `prompt`, then of a block of
+        /// `KERNEL_TEST_BLOCK` rows, under the flags the caller pinned. `follow` is the
+        /// continuation to feed, or `None` to pick it greedily; returns the tokens fed.
+        fn decode_logits_bits(
+            model: &NativeGemma4Model,
+            prompt: &[u32],
+            follow: Option<&[u32]>,
+        ) -> (Vec<u32>, Vec<Vec<u32>>) {
             let bits = |logits: &Array| -> Vec<u32> {
                 logits_f32(logits).iter().map(|x| x.to_bits()).collect()
             };
-            // Each step's logits, then a block of `BLOCK` rows; `follow` is the continuation to
-            // feed (the default path's), or `None` to pick it greedily.
-            let run = |on: bool, follow: Option<&[u32]>| -> (Vec<u32>, Vec<Vec<u32>>) {
-                crate::gemma4_norm_kernels::norm_kernels::set(on);
-                let mut cache = model.make_cache();
-                let mut logits = model
-                    .forward_last_token(&prompt, &mut cache)
-                    .expect("prefill");
-                let (mut tokens, mut steps) = (Vec::new(), Vec::new());
-                for step in 0..STEPS {
-                    let row = bits(&logits);
-                    let next = match follow {
-                        Some(f) => f[step],
-                        None => {
-                            let wide = logits_f32(&logits);
-                            (0..wide.len())
-                                .max_by(|&a, &b| wide[a].total_cmp(&wide[b]))
-                                .expect("logits") as u32
-                        }
-                    };
-                    steps.push(row);
-                    tokens.push(next);
-                    logits = model
-                        .forward_last_token(&[next], &mut cache)
-                        .expect("decode");
-                }
-                let block = model
-                    .forward(&tokens[..BLOCK], &mut cache)
-                    .expect("verify-sized block");
-                steps.push(bits(&block));
-                (tokens, steps)
+            let mut cache = model.make_cache();
+            let mut logits = model
+                .forward_last_token(prompt, &mut cache)
+                .expect("prefill");
+            let (mut tokens, mut passes) = (Vec::new(), Vec::new());
+            for step in 0..KERNEL_TEST_STEPS {
+                let next = match follow {
+                    Some(f) => f[step],
+                    None => {
+                        let wide = logits_f32(&logits);
+                        (0..wide.len())
+                            .max_by(|&a, &b| wide[a].total_cmp(&wide[b]))
+                            .expect("logits") as u32
+                    }
+                };
+                passes.push(bits(&logits));
+                tokens.push(next);
+                logits = model
+                    .forward_last_token(&[next], &mut cache)
+                    .expect("decode");
+            }
+            let block = model
+                .forward(&tokens[..KERNEL_TEST_BLOCK], &mut cache)
+                .expect("verify-sized block");
+            passes.push(bits(&block));
+            (tokens, passes)
+        }
+
+        fn assert_same_logits(what: &str, want: &[Vec<u32>], got: &[Vec<u32>]) {
+            assert_eq!(want.len(), got.len(), "{what}: pass count");
+            for (pass, (w, g)) in want.iter().zip(got).enumerate() {
+                let differ = w.iter().zip(g).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ,
+                    0,
+                    "{what}, pass {pass} ({}): {differ} of {} logits differ",
+                    if pass < KERNEL_TEST_STEPS {
+                        "decode step"
+                    } else {
+                        "block"
+                    },
+                    w.len()
+                );
+            }
+        }
+
+        /// With `LUMEN_GEMMA4_NORM_KERNELS` the decoder layers' norm-and-residual glue runs as
+        /// kernels and each layer hands the next its input already normed. Teacher-forced on the
+        /// default path's own continuation, every decode step's logits and a verify-sized block's
+        /// are the composed path's to the bit, and both kernels ran on every layer (a comparison
+        /// alone would pass with the kernels never chosen).
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn norm_kernels_give_the_default_paths_logits_to_the_bit() {
+            use crate::gemma4_norm_kernels::{launches, norm_kernels};
+            let Some((model, prompt)) = kernel_test_model() else {
+                return;
             };
-            let before = crate::gemma4_norm_kernels::launches();
-            let (tokens, reference) = run(false, None);
+            let before = launches();
+            let (tokens, reference) =
+                norm_kernels::with(false, || decode_logits_bits(&model, &prompt, None));
             assert_eq!(
-                crate::gemma4_norm_kernels::launches(),
+                launches(),
                 before,
-                "the default path launched a norm kernel"
+                "the composed path launched a norm kernel"
             );
-            let (_, with_kernels) = run(true, Some(&tokens));
-            crate::gemma4_norm_kernels::norm_kernels::set(false);
-            let after = crate::gemma4_norm_kernels::launches();
-            // Every decode step and the block run each kernel once a layer.
-            let passes = STEPS + 1;
+            let (_, with_kernels) = norm_kernels::with(true, || {
+                crate::gemma4_route_kernel::route_kernel::with(false, || {
+                    decode_logits_bits(&model, &prompt, Some(&tokens))
+                })
+            });
+            let after = launches();
+            let passes = KERNEL_TEST_STEPS + 1;
             let layers = model.num_layers();
             assert_eq!(
                 [after[0] - before[0], after[1] - before[1]],
                 [passes * layers, passes * layers],
                 "each kernel runs once a layer on every decode-sized pass"
             );
-            for (step, (want, got)) in reference.iter().zip(&with_kernels).enumerate() {
-                let differ = want.iter().zip(got).filter(|(a, b)| a != b).count();
-                assert_eq!(
-                    differ,
-                    0,
-                    "pass {step} ({}): {differ} of {} logits differ",
-                    if step < STEPS { "decode step" } else { "block" },
-                    want.len()
-                );
-            }
+            assert_same_logits("norm kernels", &reference, &with_kernels);
+        }
+
+        /// With `LUMEN_GEMMA4_ROUTE_KERNEL` (inside the norm kernels' path) each layer's top-k and
+        /// routing weights come from one kernel. Teacher-forced as above, the logits are the
+        /// composed router's to the bit, and the kernel ran once a layer on every pass.
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn the_route_kernel_gives_the_composed_routers_logits_to_the_bit() {
+            use crate::gemma4_norm_kernels::norm_kernels;
+            use crate::gemma4_route_kernel::{launches, route_kernel};
+            let Some((model, prompt)) = kernel_test_model() else {
+                return;
+            };
+            let before = launches();
+            let (tokens, reference) = norm_kernels::with(true, || {
+                route_kernel::with(false, || decode_logits_bits(&model, &prompt, None))
+            });
+            assert_eq!(launches(), before, "the route kernel ran while off");
+            let (_, with_kernel) = norm_kernels::with(true, || {
+                route_kernel::with(true, || decode_logits_bits(&model, &prompt, Some(&tokens)))
+            });
+            assert_eq!(
+                launches() - before,
+                (KERNEL_TEST_STEPS + 1) * model.num_layers(),
+                "the route kernel runs once a layer on every decode-sized pass"
+            );
+            assert_same_logits("route kernel", &reference, &with_kernel);
         }
 
         fn parity_at(model: &NativeGemma4Model, prompt: &[u32]) {

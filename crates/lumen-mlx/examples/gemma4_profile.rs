@@ -200,6 +200,11 @@ fn ab(
         mean_diff / mean_off * 100.0,
         mean_diff.abs() / se.max(1e-12)
     );
+    // A block the machine disturbed (another GPU client, a build) moves the mean, not the median.
+    println!(
+        "median of the blocks' on - off: {:+.3} ms",
+        median(diffs.clone())
+    );
     let first = digests[0];
     let same = digests.iter().filter(|&&d| d == first).count();
     println!(

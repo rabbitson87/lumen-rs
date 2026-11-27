@@ -36,6 +36,8 @@ mod gemma4_mtp;
 #[cfg(feature = "mlx-native")]
 mod gemma4_norm_kernels;
 mod gemma4_response;
+#[cfg(feature = "mlx-native")]
+mod gemma4_route_kernel;
 mod gemma4_sampling;
 mod gemma4_thinking;
 /// Gemma 4's tool-call body grammar. Ungated on purpose — see the module docs.

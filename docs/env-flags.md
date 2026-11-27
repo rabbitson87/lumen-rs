@@ -24,6 +24,7 @@ value → on.
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
+| `LUMEN_GEMMA4_ROUTE_KERNEL` | off | Optimization | `lumen_mlx::gemma4_route_kernel::route_kernel` |
 | `LUMEN_GEMMA4_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::stage_sync` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
@@ -230,6 +231,22 @@ Run quantized-KV prefill (queries of more than one token) through
  bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
  at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
  `=0` restores the quantized matmuls.
+
+### `LUMEN_GEMMA4_ROUTE_KERNEL`
+
+*Optimization, default off.*
+
+Pick each token's experts and weigh them in one Metal kernel (the top-k, the chosen
+ scores' softmax and the per-expert scale): five dispatches a layer become one. Bit for bit
+ what `argpartition` and the routing tail give, in the same order. Runs inside the
+ decoder layers' kernel path, so it takes effect with `LUMEN_GEMMA4_NORM_KERNELS`;
+ decode-sized passes only.
+
+ Off until timed: 120 fewer dispatches a token and the same continuation in 80 of 80 runs
+ on gemma-4-26b-a4b NVFP4, but its only ABBA ran on a contended machine (+0.06 ms, paired
+ standard error 0.13). Its expert path for affine 4-bit checkpoints (the experts compile
+ slot with the combine outside it, instead of the routing-experts slot) has been checked by
+ the model-free tests only.
 
 ### `LUMEN_GEMMA4_STAGE_SYNC`
 

@@ -2349,6 +2349,88 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
         ..PLAIN
     },
+    Defect {
+        name: "gemma4-route-kernel-breaks-ties-toward-the-higher-expert",
+        symptom: "the route kernel ranked equal scores with the higher expert first where argpartition's stable sort puts the lower one first, so a tie at the top-k boundary picked another expert and a tie inside it reordered the experts' weighted sum",
+        revert: &[Mutation {
+            path: MLX,
+            find: "(!sorts_before(mine, other) && j < tid)",
+            replace: "(!sorts_before(mine, other) && j > tid) /* defect: ties toward the higher expert */",
+        }],
+        guards: &[mlx(
+            "gemma4_route_kernel::tests::ties_and_non_finite_scores_are_ordered_as_argpartition_orders_them",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-ranks-a-nan-first",
+        symptom: "the route kernel sorted a NaN score before every number where MLX's sort puts it last, so a token with a NaN score was routed to other experts than the composed router's",
+        revert: &[Mutation {
+            path: MLX,
+            find: "return (!an) & bn;",
+            replace: "return an & (!bn); // defect: NaN sorts first",
+        }],
+        guards: &[mlx(
+            "gemma4_route_kernel::tests::ties_and_non_finite_scores_are_ordered_as_argpartition_orders_them",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-skips-the-softmax-rounding",
+        symptom: "the route kernel multiplied the per-expert scale into the float softmax where the composed router rounds the softmax to bfloat16 first, so the routing weights differed in the last bits",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const bfloat16_t soft = static_cast<bfloat16_t>(ld[i] * normalizer);",
+            replace: "const float soft = ld[i] * normalizer; // defect: not rounded before the scale",
+        }],
+        guards: &[mlx(
+            "gemma4_route_kernel::tests::the_kernel_is_argpartition_and_the_routing_tail_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-forgets-the-expert-scale",
+        symptom: "the route kernel returned the softmax without each chosen expert's per_expert_scale, so every expert's output joined the sum at the wrong weight",
+        revert: &[Mutation {
+            path: MLX,
+            find: "weights[size_t(row) * K + r] = soft * scale[e];",
+            replace: "weights[size_t(row) * K + r] = soft; // defect: no per-expert scale",
+        }],
+        guards: &[mlx(
+            "gemma4_route_kernel::tests::the_kernel_is_argpartition_and_the_routing_tail_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-is-never-launched",
+        symptom: "the decoder layers kept the composed router although the route kernel was on, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let routed = if self.route_kernel_ok && crate::gemma4_route_kernel::enabled() {",
+            replace: "let routed = if false && self.route_kernel_ok && crate::gemma4_route_kernel::enabled() { // defect: never chosen",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::the_route_kernel_gives_the_composed_routers_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-runs-while-off",
+        symptom: "the decoder layers ran the route kernel although its flag was off, so the composed router the flag promised never ran",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let routed = if self.route_kernel_ok && crate::gemma4_route_kernel::enabled() {",
+            replace: "let routed = if self.route_kernel_ok { // defect: runs while off",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::the_route_kernel_gives_the_composed_routers_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2478,7 +2560,10 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "gemma4-norm-kernels-skip-the-final-norm")
         | (_, "gemma4-norm-kernels-are-never-launched")
         | (_, "gemma4-norm-kernels-run-while-off")
-        | (_, "gemma4-norm-kernels-take-prefill-sized-passes") => "gemma4_moe.rs",
+        | (_, "gemma4-norm-kernels-take-prefill-sized-passes")
+        | (_, "gemma4-route-kernel-is-never-launched")
+        | (_, "gemma4-route-kernel-runs-while-off") => "gemma4_moe.rs",
+        (_, n) if n.starts_with("gemma4-route-kernel-") => "gemma4_route_kernel.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)
