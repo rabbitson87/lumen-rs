@@ -20,6 +20,7 @@ value → on.
 | `LUMEN_GEMMA4_FUSE_ROUTER` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_router` |
 | `LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_routing_experts` |
 | `LUMEN_GEMMA4_FUSE_SOFTCAP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_softcap` |
+| `LUMEN_GEMMA4_NORM_KERNELS` | on | Optimization | `lumen_mlx::gemma4_norm_kernels::norm_kernels` |
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
@@ -169,6 +170,21 @@ Fuse routing into the expert dispatch, replacing the two-slot
 *Optimization, default on.*
 
 Fuse the attention logit softcap. Output-identical.
+
+### `LUMEN_GEMMA4_NORM_KERNELS`
+
+*Optimization, default on.*
+
+Run the norm-and-residual glue of each Gemma 4 decoder layer as two Metal kernels: after
+ the attention (post-attention norm, residual add, and the input norms of the dense MLP, the
+ router and the experts) and at the end of the layer (both branches' output norms, their
+ sum, the feed-forward norm, the residual add, the layer scalar and the next layer's input
+ norm). Twelve dispatches a layer become two. Bit for bit what the composed ops give.
+ Decode-sized passes only (an MTP verify block too); a prefill chunk keeps the composed ops.
+
+ On by default: a decode token 0.45 ms (2.8%) faster on gemma-4-26b-a4b NVFP4 (M3 Max,
+ 12 same-process ABBA blocks, paired standard error 0.017 ms), 301 fewer dispatches a token,
+ the same continuation in 48 of 48 runs. `=0` restores the composed ops.
 
 ### `LUMEN_GEMMA4_PREFILL_CHUNK_LOG`
 

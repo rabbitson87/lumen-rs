@@ -2369,6 +2369,16 @@ pub(crate) mod imp {
         quant_kv_fused_attn::set(on);
     }
 
+    /// Pin one of the decode kernels' flags process-wide, by its env name, for an in-process A/B
+    /// (`examples/gemma4_profile.rs --ab`). Errors on a name it does not know.
+    pub fn set_decode_kernel_flag(env: &str, on: bool) -> Result<()> {
+        match env {
+            "LUMEN_GEMMA4_NORM_KERNELS" => crate::gemma4_norm_kernels::norm_kernels::set(on),
+            other => return Err(anyhow!("no decode kernel flag named {other}")),
+        }
+        Ok(())
+    }
+
     /// Single-token attention over a quantized KV cache: the fused kernel when
     /// `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` is on and it reads this layout, the
     /// three-op path otherwise.
@@ -3123,6 +3133,11 @@ pub(crate) mod imp {
         const_softcap_inv: Array,
         const_softcap: Array,
         const_last_idx_one: Array, // last_pos index used by argmax_last_token_lazy in decode steps (L=1)
+        /// `rms_norm_eps` as one float32: the norm kernels' `eps` input.
+        const_rms_eps: Array,
+        /// Whether every norm weight and layer scalar the norm kernels read is bfloat16 of the
+        /// shape they take (decided once at load; a checkpoint that is not keeps the composed ops).
+        norm_kernel_weights_ok: bool,
         // True iff Wv / Wo were baked with the Haar rotation R at load
         // time. When set, the SlidingTurboquant forward path skips the
         // runtime V rotation matmul / the V_dq un-rotation matmul.
@@ -3408,6 +3423,28 @@ pub(crate) mod imp {
                 .find(|(_, k)| matches!(**k, NativeGemma4LayerType::SlidingAttention))
                 .map(|(i, _)| i);
 
+            let const_rms_eps = Array::from_slice(&[cfg.text_config.rms_norm_eps], &[1]);
+            let hidden = cfg.text_config.hidden_size as i32;
+            let norm_weight_ok =
+                |w: &Array| w.dtype() == mlx_rs::Dtype::Bfloat16 && w.shape() == [hidden];
+            let norm_kernel_weights_ok = norm_weight_ok(&final_norm)
+                && layers.iter().all(|lw| {
+                    [
+                        &lw.input_layernorm,
+                        &lw.post_attention_layernorm,
+                        &lw.pre_feedforward_layernorm,
+                        &lw.router.scaled_weight,
+                        &lw.pre_feedforward_layernorm_2,
+                        &lw.post_feedforward_layernorm_1,
+                        &lw.post_feedforward_layernorm_2,
+                        &lw.post_feedforward_layernorm,
+                    ]
+                    .into_iter()
+                    .all(norm_weight_ok)
+                        && lw.layer_scalar.dtype() == mlx_rs::Dtype::Bfloat16
+                        && lw.layer_scalar.size() == 1
+                });
+
             // Decide the sliding-window kernel now (a one-off self-check), not
             // inside the first request's forward.
             windowed_kernel_enabled();
@@ -3422,6 +3459,8 @@ pub(crate) mod imp {
                 const_softcap_inv,
                 const_softcap,
                 const_last_idx_one,
+                const_rms_eps,
+                norm_kernel_weights_ok,
                 tq_bake_v_active,
                 tq_bake_o_active,
                 tq_bake_o_full_attn_active,
@@ -5174,12 +5213,20 @@ pub(crate) mod imp {
             x: &Array,
             w: &ResolvedGemma4RouterWeights,
         ) -> Result<(Array, Array)> {
-            let cfg = &self.config.text_config;
-            let top_k = cfg.top_k_experts as i32;
-            let eps = cfg.rms_norm_eps;
-
+            let eps = self.config.text_config.rms_norm_eps;
             let normed = rms_norm(x, &w.scaled_weight, eps).context("router: rms_norm")?;
-            let scores = w.proj.apply(&normed)?;
+            self.router_scores_indices_of_normed(&normed, w)
+        }
+
+        /// [`Self::router_compute_scores_indices`] from the already normed row
+        /// (`rms_norm(x, scale * hidden^-0.5)`): projection, then top-k.
+        fn router_scores_indices_of_normed(
+            &self,
+            normed: &Array,
+            w: &ResolvedGemma4RouterWeights,
+        ) -> Result<(Array, Array)> {
+            let top_k = self.config.text_config.top_k_experts as i32;
+            let scores = w.proj.apply(normed)?;
             let last_axis = (scores.ndim() as i32) - 1;
             let num_experts = scores.shape()[last_axis as usize];
             let partitioned = mlx_rs::ops::argpartition_axis(&scores, -top_k, last_axis)
@@ -5204,6 +5251,17 @@ pub(crate) mod imp {
             //      stays outside the compile slot because mlx compile cannot
             //      infer its dynamic output shape; it carries no GPU work.
             let (scores, indices) = self.router_compute_scores_indices(x, w)?;
+            let weights = Self::routing_tail(&scores, &indices, w)?;
+            Ok((indices, weights))
+        }
+
+        /// The router's tail on its scores and top-k indices: the chosen scores' softmax, scaled
+        /// by each chosen expert's `per_expert_scale`. Returns the weights, `[B, L, top_k]`.
+        fn routing_tail(
+            scores: &Array,
+            indices: &Array,
+            w: &ResolvedGemma4RouterWeights,
+        ) -> Result<Array> {
             let last_axis = (scores.ndim() as i32) - 1;
 
             // 4-6. Fused tail: take_along → softmax(precise) →
@@ -5211,12 +5269,12 @@ pub(crate) mod imp {
             //      Default ON via LUMEN_GEMMA4_FUSE_ROUTER. Fallback path
             //      below runs the same 3 ops separately for A/B parity.
             if gemma4_router_fuse_enabled() {
-                let weights = gemma4_routing_fused_tail(&scores, &indices, &w.per_expert_scale)?;
+                let weights = gemma4_routing_fused_tail(scores, indices, &w.per_expert_scale)?;
                 stage_mark("router tail (softmax, scale)", &[&weights])?;
-                Ok((indices, weights))
+                Ok(weights)
             } else {
                 let top_logits = scores
-                    .take_along_axis(&indices, last_axis)
+                    .take_along_axis(indices, last_axis)
                     .context("router: take_along_axis(scores, indices) failed")?;
                 let weights = mlx_rs::ops::softmax_axis(
                     &top_logits,
@@ -5224,11 +5282,10 @@ pub(crate) mod imp {
                     /* precise */ Some(true),
                 )
                 .context("router: softmax over top-k failed")?;
-                let per_expert = mlx_rs::ops::indexing::take_axis(&w.per_expert_scale, &indices, 0)
+                let per_expert = mlx_rs::ops::indexing::take_axis(&w.per_expert_scale, indices, 0)
                     .context("router: take_axis(per_expert_scale, indices) failed")?;
-                let weights = mlx_rs::ops::multiply(&weights, &per_expert)
-                    .context("router: weights × per_expert_scale failed")?;
-                Ok((indices, weights))
+                mlx_rs::ops::multiply(&weights, &per_expert)
+                    .context("router: weights × per_expert_scale failed")
             }
         }
 
@@ -5698,6 +5755,95 @@ pub(crate) mod imp {
             };
             stage_mark("epilogue", &[&h])?;
             Ok(h)
+        }
+
+        /// [`Self::decoder_layer_forward`] with its norm-and-residual glue as the two kernels of
+        /// [`crate::gemma4_norm_kernels`], for a decode-sized pass. `x_normed` is `x` already
+        /// normed with this layer's input norm (the previous layer's kernel wrote it), or `None`
+        /// to norm it here; `next_norm` is the next layer's input norm (the final norm after the
+        /// last layer). Returns the layer's output and that output normed with `next_norm`.
+        ///
+        /// Between the kernels it runs the ops the default path runs, in the same order, on the
+        /// same rows, so the result is the default path's bit for bit.
+        fn decoder_layer_norm_kernels(
+            &self,
+            x: &Array,
+            x_normed: Option<Array>,
+            next_norm: &Array,
+            layer_idx: usize,
+            cache: &mut NativeGemma4LayerCache,
+        ) -> Result<(Array, Array)> {
+            let lw = &self.layers[layer_idx];
+            let cfg = &self.config.text_config;
+            let x_normed = match x_normed {
+                Some(normed) => normed,
+                None => rms_norm(x, &lw.input_layernorm, cfg.rms_norm_eps)
+                    .context("layer: input_layernorm")?,
+            };
+            stage_mark("input norm", &[&x_normed])?;
+            let attn = self.layer_attention_forward(&x_normed, layer_idx, cache)?;
+            let [h, dense_in, router_in, moe_in] = crate::gemma4_norm_kernels::attn_out(
+                &attn,
+                x,
+                [
+                    &lw.post_attention_layernorm,
+                    &lw.pre_feedforward_layernorm,
+                    &lw.router.scaled_weight,
+                    &lw.pre_feedforward_layernorm_2,
+                ],
+                &self.const_rms_eps,
+            )?;
+            stage_mark(
+                "attn-out norms (kernel)",
+                &[&h, &dense_in, &router_in, &moe_in],
+            )?;
+
+            let dense = Self::dense_mlp_forward(&dense_in, &lw.dense_mlp)?;
+            stage_mark("dense mlp", &[&dense])?;
+
+            // The experts as the default path runs them on a decode-sized pass: the routing tail,
+            // the experts and their combine in one compile slot for affine 4-bit experts; the
+            // router's tail, then the expert GLU, otherwise.
+            let (scores, indices) = self.router_scores_indices_of_normed(&router_in, &lw.router)?;
+            let tokens = h.shape()[1] as usize;
+            let routing_experts_slot = tokens * cfg.top_k_experts < 64
+                && gemma4_routing_experts_fuse_enabled()
+                && lw.experts.gate_proj.bits == 4
+                && lw.experts.gate_proj.group_size == 64
+                && lw.experts.gate_proj.mode == MODE_AFFINE;
+            let slot = routing_experts_slot.then(|| {
+                gemma4_routing_experts_fused(
+                    &scores,
+                    &indices,
+                    &lw.router.per_expert_scale,
+                    &moe_in,
+                    &lw.experts,
+                )
+            });
+            let moe = match slot {
+                Some(Ok(out)) => out,
+                _ => {
+                    let weights = Self::routing_tail(&scores, &indices, &lw.router)?;
+                    self.experts_forward(&moe_in, &indices, &weights, &lw.experts)?
+                }
+            };
+            stage_mark("experts", &[&moe])?;
+
+            let [out, out_normed] = crate::gemma4_norm_kernels::layer_out(
+                &dense,
+                &moe,
+                &h,
+                [
+                    &lw.post_feedforward_layernorm_1,
+                    &lw.post_feedforward_layernorm_2,
+                    &lw.post_feedforward_layernorm,
+                    next_norm,
+                ],
+                &lw.layer_scalar,
+                &self.const_rms_eps,
+            )?;
+            stage_mark("layer-out norms (kernel)", &[&out, &out_normed])?;
+            Ok((out, out_normed))
         }
 
         /// Phase 3: post-attention body of a decoder layer (post_attn_norm +
@@ -6377,11 +6523,34 @@ pub(crate) mod imp {
             let mut h = h;
             let n_layers = cfg.num_hidden_layers;
             let async_eval_every_k = gemma4_async_eval_every_k();
+            // On a decode-sized pass the layers' norm-and-residual glue runs as kernels, and each
+            // layer hands the next its input already normed (the last one, the final norm's).
+            let norm_kernels = crate::gemma4_norm_kernels::enabled()
+                && self.norm_kernel_weights_ok
+                && !gemma4_any_breakdown_active()
+                && crate::gemma4_norm_kernels::serves(&h);
+            let mut normed: Option<Array> = None;
             for idx in 0..n_layers {
                 let layer_cache = cache
                     .layer_mut(idx)
                     .ok_or_else(|| anyhow!("forward: missing cache slot {idx}"))?;
-                h = self.decoder_layer_forward(&h, idx, layer_cache)?;
+                if norm_kernels {
+                    let next_norm = self
+                        .layers
+                        .get(idx + 1)
+                        .map_or(&self.final_norm, |next| &next.input_layernorm);
+                    let (out, out_normed) = self.decoder_layer_norm_kernels(
+                        &h,
+                        normed.take(),
+                        next_norm,
+                        idx,
+                        layer_cache,
+                    )?;
+                    h = out;
+                    normed = Some(out_normed);
+                } else {
+                    h = self.decoder_layer_forward(&h, idx, layer_cache)?;
+                }
                 dump_hidden(&h, &format!("L{idx:02}"))?;
                 if async_eval_every_k > 0 && (idx + 1) % async_eval_every_k == 0 {
                     // Non-blocking GPU drain. Does NOT sync the CPU; just
@@ -6392,9 +6561,12 @@ pub(crate) mod imp {
                 }
             }
 
-            // (4) Final norm.
-            let h =
-                rms_norm(&h, &self.final_norm, cfg.rms_norm_eps).context("forward: final_norm")?;
+            // (4) Final norm (the last layer's kernel already wrote it).
+            let h = match normed {
+                Some(normed) => normed,
+                None => rms_norm(&h, &self.final_norm, cfg.rms_norm_eps)
+                    .context("forward: final_norm")?,
+            };
             stage_mark("final norm", &[&h])?;
             dump_hidden(&h, "final_norm")?;
 
@@ -8244,6 +8416,99 @@ pub(crate) mod imp {
             for n in sizes {
                 let n = n.min(ids.len());
                 parity_at(&model, &ids[..n]);
+            }
+        }
+
+        /// With `LUMEN_GEMMA4_NORM_KERNELS` the decoder layers' norm-and-residual glue runs as
+        /// kernels and each layer hands the next its input already normed. Teacher-forced on the
+        /// default path's own continuation, every decode step's logits and a verify-sized block's
+        /// are the default path's to the bit, and both kernels ran on every layer (a comparison
+        /// alone would pass with the kernels never chosen).
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn norm_kernels_give_the_default_paths_logits_to_the_bit() {
+            let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
+                eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR");
+                return;
+            };
+            let dir = Path::new(&dir);
+            let model = NativeGemma4Model::load(dir).expect("load model");
+            let tok =
+                crate::TextTokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+            let prompt = tok
+                .encode(
+                    "The keeper lived alone on a rocky island far from the mainland, and every \
+                     evening she climbed the spiral stairs of the old stone lighthouse to light \
+                     the great lamp before the night fell over the water.",
+                    false,
+                )
+                .expect("encode");
+            // A prefill chunk is not decode-sized, so the kernels run on the decode passes only.
+            assert!(prompt.len() > crate::gemma4_norm_kernels::MAX_ROWS as usize);
+            const STEPS: usize = 24;
+            const BLOCK: usize = 4;
+            let bits = |logits: &Array| -> Vec<u32> {
+                logits_f32(logits).iter().map(|x| x.to_bits()).collect()
+            };
+            // Each step's logits, then a block of `BLOCK` rows; `follow` is the continuation to
+            // feed (the default path's), or `None` to pick it greedily.
+            let run = |on: bool, follow: Option<&[u32]>| -> (Vec<u32>, Vec<Vec<u32>>) {
+                crate::gemma4_norm_kernels::norm_kernels::set(on);
+                let mut cache = model.make_cache();
+                let mut logits = model
+                    .forward_last_token(&prompt, &mut cache)
+                    .expect("prefill");
+                let (mut tokens, mut steps) = (Vec::new(), Vec::new());
+                for step in 0..STEPS {
+                    let row = bits(&logits);
+                    let next = match follow {
+                        Some(f) => f[step],
+                        None => {
+                            let wide = logits_f32(&logits);
+                            (0..wide.len())
+                                .max_by(|&a, &b| wide[a].total_cmp(&wide[b]))
+                                .expect("logits") as u32
+                        }
+                    };
+                    steps.push(row);
+                    tokens.push(next);
+                    logits = model
+                        .forward_last_token(&[next], &mut cache)
+                        .expect("decode");
+                }
+                let block = model
+                    .forward(&tokens[..BLOCK], &mut cache)
+                    .expect("verify-sized block");
+                steps.push(bits(&block));
+                (tokens, steps)
+            };
+            let before = crate::gemma4_norm_kernels::launches();
+            let (tokens, reference) = run(false, None);
+            assert_eq!(
+                crate::gemma4_norm_kernels::launches(),
+                before,
+                "the default path launched a norm kernel"
+            );
+            let (_, with_kernels) = run(true, Some(&tokens));
+            crate::gemma4_norm_kernels::norm_kernels::set(false);
+            let after = crate::gemma4_norm_kernels::launches();
+            // Every decode step and the block run each kernel once a layer.
+            let passes = STEPS + 1;
+            let layers = model.num_layers();
+            assert_eq!(
+                [after[0] - before[0], after[1] - before[1]],
+                [passes * layers, passes * layers],
+                "each kernel runs once a layer on every decode-sized pass"
+            );
+            for (step, (want, got)) in reference.iter().zip(&with_kernels).enumerate() {
+                let differ = want.iter().zip(got).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ,
+                    0,
+                    "pass {step} ({}): {differ} of {} logits differ",
+                    if step < STEPS { "decode step" } else { "block" },
+                    want.len()
+                );
             }
         }
 

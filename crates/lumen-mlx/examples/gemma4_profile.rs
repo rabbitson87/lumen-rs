@@ -6,7 +6,13 @@
 //! cargo run --release -p lumen-mlx --features mlx-native --example gemma4_profile -- \
 //!     <model_dir> [--steps N] [--warm W] ["<prompt>"]
 //! cargo run --release -p lumen-mlx --features mlx-native --example gemma4_profile -- --floor 2500
+//! cargo run --release -p lumen-mlx --features mlx-native --example gemma4_profile -- \
+//!     <model_dir> --ab LUMEN_GEMMA4_NORM_KERNELS [--rounds N]
 //! ```
+//!
+//! `--ab FLAG` loads the model once and times the pipelined loop in ABBA blocks with a decode
+//! kernel's flag off and on (`set_decode_kernel_flag`), then prints the paired difference and
+//! whether every run gave the same continuation.
 //!
 //! Two loops run over the same greedy continuation:
 //! - `pipelined`: the server's loop (`generate_with_cache_and_images`): build step N+1 and
@@ -146,6 +152,63 @@ fn pipelined(
     Ok((ms, generated))
 }
 
+/// Same-process ABBA blocks of the pipelined loop, `flag` off (A) and on (B), pinned through the
+/// flag's own setter so a latched flag cannot measure one side twice. Prints each block, then the
+/// mean of each arm, the paired difference with its standard error, and whether every run of both
+/// arms produced the same continuation.
+fn ab(
+    model: &NativeGemma4Model,
+    ids: &[u32],
+    flag: &str,
+    rounds: usize,
+    warm: usize,
+    steps: usize,
+) -> Result<()> {
+    println!("A/B {flag}: {rounds} ABBA blocks, {steps} timed steps a run after {warm} warm-up");
+    let run = |on: bool| -> Result<(f64, u64)> {
+        lumen_mlx::gemma4::set_decode_kernel_flag(flag, on)?;
+        let (ms, tokens) = pipelined(model, ids, warm, steps)?;
+        Ok((ms, digest(&tokens)))
+    };
+    // One unrecorded run of each arm: the first call of a kernel builds its pipeline.
+    run(false)?;
+    run(true)?;
+    let (mut offs, mut ons, mut diffs, mut digests) = (vec![], vec![], vec![], vec![]);
+    for block in 0..rounds {
+        let (a1, da1) = run(false)?;
+        let (b1, db1) = run(true)?;
+        let (b2, db2) = run(true)?;
+        let (a2, da2) = run(false)?;
+        let (a, b) = ((a1 + a2) / 2.0, (b1 + b2) / 2.0);
+        println!(
+            "  block {block}: off {a:.3} ms, on {b:.3} ms, on - off {:+.3}",
+            b - a
+        );
+        offs.push(a);
+        ons.push(b);
+        diffs.push(b - a);
+        digests.extend([da1, db1, db2, da2]);
+    }
+    let n = diffs.len() as f64;
+    let mean_diff = diffs.iter().sum::<f64>() / n;
+    let var = diffs.iter().map(|d| (d - mean_diff).powi(2)).sum::<f64>() / (n - 1.0).max(1.0);
+    let se = (var / n).sqrt();
+    let mean_off = mean(offs.iter().copied());
+    println!(
+        "off {mean_off:.3} ms, on {:.3} ms per token; on - off {mean_diff:+.3} ms ({:+.1}%), paired se {se:.3} ({:.1} se)",
+        mean(ons.iter().copied()),
+        mean_diff / mean_off * 100.0,
+        mean_diff.abs() / se.max(1e-12)
+    );
+    let first = digests[0];
+    let same = digests.iter().filter(|&&d| d == first).count();
+    println!(
+        "continuations: {same} of {} runs give digest {first:016x}",
+        digests.len()
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut flag_value = |name: &str| -> Option<String> {
@@ -163,6 +226,10 @@ fn main() -> Result<()> {
     let warm: usize = flag_value("--warm")
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
+    let ab_flag = flag_value("--ab");
+    let rounds: usize = flag_value("--rounds")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
     let dir = PathBuf::from(
         args.first()
             .ok_or_else(|| anyhow!("usage: <model_dir> [--steps N] [--warm W] [\"<prompt>\"]"))?,
@@ -177,6 +244,9 @@ fn main() -> Result<()> {
         .to_vec();
 
     let model = NativeGemma4Model::load(&dir).context("load the checkpoint")?;
+    if let Some(flag) = ab_flag {
+        return ab(&model, &ids, &flag, rounds, warm, steps);
+    }
     let n_layers = model.num_layers();
     println!(
         "{} prompt tokens, {n_layers} layers, decoding {steps} steps after {warm} warm-up steps",

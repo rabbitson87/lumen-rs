@@ -2209,6 +2209,146 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "gemma4-attn-out-kernel-skips-the-norm-rounding",
+        symptom: "the attention-out kernel multiplied the norm weight into the unrounded float row, where rms_norm rounds the normed row to bfloat16 first, so the residual stream left every layer a few bfloat16 steps away from the composed ops'",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const bfloat16_t normed = w_attn[wat + i] * static_cast<bfloat16_t>(t[i] * inv_a);",
+            replace: "const bfloat16_t normed = static_cast<bfloat16_t>(float(w_attn[wat + i]) * t[i] * inv_a); // defect: not rounded before the weight",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::the_kernels_are_the_composed_ops_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-attn-out-kernel-feeds-the-branches-the-attention",
+        symptom: "the attention-out kernel normed the post-attention row for the dense MLP, the router and the experts instead of the residual stream, so both feed-forward branches lost the layer's input",
+        revert: &[Mutation {
+            path: MLX,
+            find: "th[i] = float(sum);",
+            replace: "th[i] = float(normed); // defect: the branches read the normed attention",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::the_kernels_are_the_composed_ops_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-drop-the-epsilon",
+        symptom: "the norm kernels took rsqrt of the mean square alone, without rms_norm's epsilon, so a small row was scaled differently from the composed ops and a zero row became NaN",
+        revert: &[Mutation {
+            path: MLX,
+            find: "inv[0] = metal::precise::rsqrt(acc / axis_size + eps);",
+            replace: "inv[0] = metal::precise::rsqrt(acc / axis_size); // defect: no epsilon",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::the_kernels_are_the_composed_ops_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-layer-out-kernel-drops-the-layer-scalar",
+        symptom: "the layer-out kernel left the layer scalar out, so every decoder layer's output joined the stream unscaled",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const bfloat16_t scaled = with_residual * scale;",
+            replace: "const bfloat16_t scaled = with_residual; // defect: no layer scalar",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::the_kernels_are_the_composed_ops_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-layer-out-kernel-drops-the-residual",
+        symptom: "the layer-out kernel scaled the feed-forward norm's output without adding the residual stream, so each layer replaced the stream instead of adding to it",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const bfloat16_t with_residual = r[at + i] + ff;",
+            replace: "const bfloat16_t with_residual = ff; // defect: no residual",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::the_kernels_are_the_composed_ops_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-hand-on-this-layers-norm",
+        symptom: "with the norm kernels on, each layer handed the next its output normed with its own input norm instead of the next layer's, so every layer after the first attended over a wrongly scaled row",
+        revert: &[Mutation {
+            path: MLX,
+            find: ".map_or(&self.final_norm, |next| &next.input_layernorm);",
+            replace: ".map_or(&self.final_norm, |_| &self.layers[idx].input_layernorm); // defect: this layer's norm",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_give_the_default_paths_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-skip-the-final-norm",
+        symptom: "with the norm kernels on, the last layer handed the head its output normed with its own input norm instead of the final norm, so every logit was computed from a wrongly scaled row",
+        revert: &[Mutation {
+            path: MLX,
+            find: ".map_or(&self.final_norm, |next| &next.input_layernorm);",
+            replace: ".map_or(&self.layers[idx].input_layernorm, |next| &next.input_layernorm); // defect: no final norm",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_give_the_default_paths_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-are-never-launched",
+        symptom: "the decoder layers kept the composed glue although the norm kernels were on, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let norm_kernels = crate::gemma4_norm_kernels::enabled()",
+            replace: "let norm_kernels = false && crate::gemma4_norm_kernels::enabled() // defect: never chosen",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_give_the_default_paths_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-run-while-off",
+        symptom: "the decoder layers ran the norm kernels although the flag was off, so the default path was not the composed ops the flag promised",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let norm_kernels = crate::gemma4_norm_kernels::enabled()",
+            replace: "let norm_kernels = (true || crate::gemma4_norm_kernels::enabled()) // defect: runs while off",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_give_the_default_paths_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-take-prefill-sized-passes",
+        symptom: "the decoder layers took the norm-kernel path on a prefill chunk, which the kernels refuse, so every prompt longer than a verify block failed with the kernels on",
+        revert: &[Mutation {
+            path: MLX,
+            find: "&& crate::gemma4_norm_kernels::serves(&h);",
+            replace: "; // defect: not limited to decode-sized passes",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_give_the_default_paths_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2329,6 +2469,16 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "qwen-parser-drops-the-tail-held-for-a-delimiter") => "qwen3_5_tools.rs",
         (_, "runtime-kernel-needs-newer-metal") => "native_ssm.rs",
         (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
+        (_, "gemma4-attn-out-kernel-skips-the-norm-rounding")
+        | (_, "gemma4-attn-out-kernel-feeds-the-branches-the-attention")
+        | (_, "gemma4-norm-kernels-drop-the-epsilon")
+        | (_, "gemma4-layer-out-kernel-drops-the-layer-scalar")
+        | (_, "gemma4-layer-out-kernel-drops-the-residual") => "gemma4_norm_kernels.rs",
+        (_, "gemma4-norm-kernels-hand-on-this-layers-norm")
+        | (_, "gemma4-norm-kernels-skip-the-final-norm")
+        | (_, "gemma4-norm-kernels-are-never-launched")
+        | (_, "gemma4-norm-kernels-run-while-off")
+        | (_, "gemma4-norm-kernels-take-prefill-sized-passes") => "gemma4_moe.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)
