@@ -3119,6 +3119,18 @@ pub(crate) mod imp {
         Vec::new()
     }
 
+    /// The row indices `gather_qmm` builds by default for a one-row expert pass with `top_k`
+    /// experts: `arange(1)` as `[1, 1, 1]` for the gate and up projections (whose input is `[1, 1,
+    /// 1, 1, H]`) and `arange(top_k)` as `[1, 1, top_k]` for the down projection (whose input is
+    /// `[1, 1, top_k, 1, I]`). Built once and handed over, they spare an `arange` launch each.
+    pub(crate) fn decode_lhs_indices(top_k: i32) -> (Array, Array) {
+        let down: Vec<u32> = (0..top_k as u32).collect();
+        (
+            Array::from_slice(&[0u32], &[1, 1, 1]),
+            Array::from_slice(&down, &[1, 1, top_k]),
+        )
+    }
+
     pub struct NativeGemma4Model {
         config: NativeGemma4Config,
         embed_tokens: EmbedTokensWeights,
@@ -3142,6 +3154,9 @@ pub(crate) mod imp {
         /// Whether the route kernel serves this checkpoint's router (bfloat16 per-expert scales,
         /// at most 1024 experts, a top-k of at most 128): decided once at load.
         route_kernel_ok: bool,
+        /// `gather_qmm`'s row indices for a one-row expert pass ([`decode_lhs_indices`]).
+        const_lhs_gate_up: Array,
+        const_lhs_down: Array,
         // True iff Wv / Wo were baked with the Haar rotation R at load
         // time. When set, the SlidingTurboquant forward path skips the
         // runtime V rotation matmul / the V_dq un-rotation matmul.
@@ -3458,6 +3473,9 @@ pub(crate) mod imp {
                         && lw.router.per_expert_scale.shape() == [experts]
                 });
 
+            let (const_lhs_gate_up, const_lhs_down) =
+                decode_lhs_indices(cfg.text_config.top_k_experts as i32);
+
             // Decide the sliding-window kernel now (a one-off self-check), not
             // inside the first request's forward.
             windowed_kernel_enabled();
@@ -3475,6 +3493,8 @@ pub(crate) mod imp {
                 const_rms_eps,
                 norm_kernel_weights_ok,
                 route_kernel_ok,
+                const_lhs_gate_up,
+                const_lhs_down,
                 tq_bake_v_active,
                 tq_bake_o_active,
                 tq_bake_o_full_attn_active,
@@ -5374,9 +5394,14 @@ pub(crate) mod imp {
             } else {
                 None
             };
+            // A one-row pass hands `gather_qmm` its row indices rather than letting it build an
+            // `arange` for each of the three projections: the same values, one launch fewer each.
+            let lhs = (!do_sort && b * l == 1)
+                .then_some((&self.const_lhs_gate_up, &self.const_lhs_down))
+                .filter(|(_, down)| down.shape() == [1, 1, k]);
             let down = match fused {
                 Some(down) => down,
-                None => Self::experts_unfused(&x_for_qmm, &idx_for_qmm, w, do_sort)?,
+                None => Self::experts_unfused(&x_for_qmm, &idx_for_qmm, w, do_sort, lhs)?,
             };
             stage_mark("experts (gather_qmm x3 + geglu)", &[&down])?;
 
@@ -5409,20 +5434,24 @@ pub(crate) mod imp {
 
         /// The unfused expert GLU: `gather_qmm_with_mode` gate / up → GeGLU →
         /// down, each projection at its own quant params. `sorted` says
-        /// whether `idx` was sorted by expert (the prefill branch).
+        /// whether `idx` was sorted by expert (the prefill branch). `lhs` are
+        /// the row indices of the gate / up and of the down projection when
+        /// the caller has them ([`decode_lhs_indices`]); `None` lets
+        /// `gather_qmm` build its default `arange`.
         fn experts_unfused(
             x: &Array,
             idx: &Array,
             w: &ResolvedGemma4ExpertsWeights,
             sorted: bool,
+            lhs: Option<(&Array, &Array)>,
         ) -> Result<Array> {
-            let gqmm = |xi: &Array, lin: &ResolvedLinear, name: &str| {
+            let gqmm = |xi: &Array, lin: &ResolvedLinear, rows: Option<&Array>, name: &str| {
                 gather_qmm_with_mode(
                     xi,
                     &lin.weight,
                     &lin.scales,
                     lin.biases.as_ref(),
-                    None,
+                    rows,
                     Some(idx),
                     true,
                     lin.group_size,
@@ -5432,10 +5461,11 @@ pub(crate) mod imp {
                 )
                 .with_context(|| format!("experts: gather_qmm({name}) failed"))
             };
-            let x_gate = gqmm(x, &w.gate_proj, "gate_proj")?;
-            let x_up = gqmm(x, &w.up_proj, "up_proj")?;
+            let (gate_up_rows, down_rows) = lhs.unzip();
+            let x_gate = gqmm(x, &w.gate_proj, gate_up_rows, "gate_proj")?;
+            let x_up = gqmm(x, &w.up_proj, gate_up_rows, "up_proj")?;
             let activated = Self::geglu_apply(&x_gate, &x_up)?;
-            gqmm(&activated, &w.down_proj, "down_proj")
+            gqmm(&activated, &w.down_proj, down_rows, "down_proj")
         }
 
         /// The dense branch of a decoder layer, unfused:
@@ -8609,6 +8639,72 @@ pub(crate) mod imp {
                 "the route kernel runs once a layer on every decode-sized pass"
             );
             assert_same_logits("route kernel", &reference, &with_kernel);
+        }
+
+        /// The row indices handed to `gather_qmm` on a one-row expert pass are the ones it builds
+        /// by default: the gate / up projection over `[1, 1, 1, 1, H]` and the down projection over
+        /// `[1, 1, k, 1, I]` give the default's output to the bit, for repeated experts too.
+        #[test]
+        fn decode_lhs_indices_are_gather_qmms_default() {
+            let (hidden, inter, experts, k) = (128i32, 64i32, 16i32, 8i32);
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            let mut values = |shape: &[i32]| {
+                let n: i32 = shape.iter().product();
+                let v: Vec<f32> = (0..n)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        ((state >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+                    })
+                    .collect();
+                Array::from_slice(&v, shape)
+            };
+            let bf16 = |a: Array| a.as_dtype(mlx_rs::Dtype::Bfloat16).expect("cast");
+            let bits =
+                |a: &Array| -> Vec<u32> { logits_f32(a).iter().map(|x| x.to_bits()).collect() };
+            let (gate_rows, down_rows) = decode_lhs_indices(k);
+            let experts_of = |rows: &[u32]| Array::from_slice(rows, &[1, 1, k]);
+            for picked in [[3u32, 0, 15, 7, 9, 1, 12, 4], [5, 5, 2, 2, 14, 0, 0, 8]] {
+                let idx = experts_of(&picked);
+                for (x, w_shape, rows) in [
+                    (
+                        bf16(values(&[1, 1, 1, 1, hidden])),
+                        [experts, inter, hidden],
+                        &gate_rows,
+                    ),
+                    (
+                        bf16(values(&[1, 1, k, 1, inter])),
+                        [experts, hidden, inter],
+                        &down_rows,
+                    ),
+                ] {
+                    let (wq, scales, biases) =
+                        mlx_rs::ops::quantize(bf16(values(&w_shape)), 64, 4).expect("quantize");
+                    let qmm = |lhs: Option<&Array>| {
+                        gather_qmm_with_mode(
+                            &x,
+                            &wq,
+                            &scales,
+                            Some(&biases),
+                            lhs,
+                            Some(&idx),
+                            true,
+                            64,
+                            4,
+                            MODE_AFFINE,
+                            false,
+                        )
+                        .expect("gather_qmm")
+                    };
+                    assert_eq!(
+                        bits(&qmm(Some(rows))),
+                        bits(&qmm(None)),
+                        "experts {picked:?}, input {:?}",
+                        x.shape()
+                    );
+                }
+            }
         }
 
         fn parity_at(model: &NativeGemma4Model, prompt: &[u32]) {

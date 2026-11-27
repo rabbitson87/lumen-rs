@@ -2431,6 +2431,19 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
         ..PLAIN
     },
+    Defect {
+        name: "gemma4-expert-down-rows-all-read-the-first-expert",
+        symptom: "a one-row expert pass handed gather_qmm row 0 for every expert's down projection where its default arange gives each expert its own row, so all the chosen experts projected the first expert's activation",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let down: Vec<u32> = (0..top_k as u32).collect();",
+            replace: "let down: Vec<u32> = (0..top_k as u32).map(|_| 0).collect(); // defect: one row for all",
+        }],
+        guards: &[mlx(
+            "gemma4_moe::imp::tests::decode_lhs_indices_are_gather_qmms_default",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2564,6 +2577,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "gemma4-route-kernel-is-never-launched")
         | (_, "gemma4-route-kernel-runs-while-off") => "gemma4_moe.rs",
         (_, n) if n.starts_with("gemma4-route-kernel-") => "gemma4_route_kernel.rs",
+        (_, "gemma4-expert-down-rows-all-read-the-first-expert") => "gemma4_moe.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)
