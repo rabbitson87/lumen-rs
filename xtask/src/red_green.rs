@@ -2444,6 +2444,103 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "gemma4-qkv-kernel-rotates-with-the-wrong-partner",
+        symptom: "the q/k/v kernel rotated each element with its neighbour instead of the element half a head away, where MLX's non-traditional RoPE pairs j with j + D / 2, so every query and key was rotated wrongly",
+        revert: &[Mutation {
+            path: MLX,
+            find: "float x2 = static_cast<float>(normed[j + half_d]);",
+            replace: "float x2 = static_cast<float>(normed[j ^ 1]); // defect: the wrong partner",
+        }],
+        guards: &[mlx(
+            "gemma4_qkv_kernel::tests::the_kernel_is_the_composed_norms_and_rope_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-norms-q-with-the-k-weight",
+        symptom: "the q/k/v kernel normed the query heads with k_norm's weight, so every query was scaled per element as a key is",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const bfloat16_t w = is_q ? q_norm[lid * N + i] : k_norm[lid * N + i];",
+            replace: "const bfloat16_t w = is_q ? k_norm[lid * N + i] : k_norm[lid * N + i]; // defect: q takes k's weight",
+        }],
+        guards: &[mlx(
+            "gemma4_qkv_kernel::tests::the_kernel_is_the_composed_norms_and_rope_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-ignores-the-position",
+        symptom: "the q/k/v kernel rotated every token as if it sat at position 0, so attention lost all positional information after the first token",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float position = 1.0f * static_cast<float>(offset[0]);",
+            replace: "const float position = 0.0f; // defect: no position",
+        }],
+        guards: &[mlx(
+            "gemma4_qkv_kernel::tests::the_kernel_is_the_composed_norms_and_rope_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-reads-one-frequency",
+        symptom: "the q/k/v kernel rotated every pair of a full-attention head by the first frequency of the table instead of its own, so the partly rotated heads of the full-attention layers were rotated wrongly and their unrotated tail rotated",
+        revert: &[Mutation {
+            path: MLX,
+            find: "inv_freq = 1.0 / (rope[j]);",
+            replace: "inv_freq = 1.0 / (rope[0]); // defect: one frequency for every pair",
+        }],
+        guards: &[mlx(
+            "gemma4_qkv_kernel::tests::the_kernel_is_the_composed_norms_and_rope_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-is-never-launched",
+        symptom: "the attention kept the composed norms and RoPE although the q/k/v kernel was on, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "&& crate::gemma4_qkv_kernel::enabled()",
+            replace: "&& false && crate::gemma4_qkv_kernel::enabled() // defect: never chosen",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::the_qkv_kernel_gives_the_composed_attention_inputs_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-takes-verify-blocks",
+        symptom: "the attention handed a verify block of several rows to the q/k/v kernel, which takes one row (MLX's single-row RoPE), so every MTP verify pass failed with the kernel on",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let qkv_kernel = l == 1",
+            replace: "let qkv_kernel = l >= 1 // defect: not limited to one-row passes",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::the_qkv_kernel_gives_the_composed_attention_inputs_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-swaps-the-rope-of-the-layer-kinds",
+        symptom: "the q/k/v kernel rotated the sliding layers with the full-attention layers' frequency table, so the sliding layers' queries and keys were rotated by another theta over a quarter of each head",
+        revert: &[Mutation {
+            path: MLX,
+            find: "NativeGemma4LayerType::SlidingAttention => 0,",
+            replace: "NativeGemma4LayerType::SlidingAttention => 1, // defect: the full layers' rotation",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::the_qkv_kernel_gives_the_composed_attention_inputs_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2577,7 +2674,11 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "gemma4-route-kernel-is-never-launched")
         | (_, "gemma4-route-kernel-runs-while-off") => "gemma4_moe.rs",
         (_, n) if n.starts_with("gemma4-route-kernel-") => "gemma4_route_kernel.rs",
-        (_, "gemma4-expert-down-rows-all-read-the-first-expert") => "gemma4_moe.rs",
+        (_, "gemma4-expert-down-rows-all-read-the-first-expert")
+        | (_, "gemma4-qkv-kernel-is-never-launched")
+        | (_, "gemma4-qkv-kernel-takes-verify-blocks")
+        | (_, "gemma4-qkv-kernel-swaps-the-rope-of-the-layer-kinds") => "gemma4_moe.rs",
+        (_, n) if n.starts_with("gemma4-qkv-kernel-") => "gemma4_qkv_kernel.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)

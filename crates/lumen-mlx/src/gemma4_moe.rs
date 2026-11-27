@@ -2375,6 +2375,7 @@ pub(crate) mod imp {
         match env {
             "LUMEN_GEMMA4_NORM_KERNELS" => crate::gemma4_norm_kernels::norm_kernels::set(on),
             "LUMEN_GEMMA4_ROUTE_KERNEL" => crate::gemma4_route_kernel::route_kernel::set(on),
+            "LUMEN_GEMMA4_QKV_KERNEL" => crate::gemma4_qkv_kernel::qkv_kernel::set(on),
             other => return Err(anyhow!("no decode kernel flag named {other}")),
         }
         Ok(())
@@ -3154,6 +3155,14 @@ pub(crate) mod imp {
         /// Whether the route kernel serves this checkpoint's router (bfloat16 per-expert scales,
         /// at most 1024 experts, a top-k of at most 128): decided once at load.
         route_kernel_ok: bool,
+        /// The q/k/v kernel's rotation constants, by layer kind (sliding, full): `log2(theta)` as
+        /// `RoPE::eval_gpu` computes it, and the frequency table of a partly rotated head (`None`
+        /// when the whole head rotates). Built as `layer_attention_forward` builds them per call.
+        const_rope_base_log2: [Array; 2],
+        const_rope_freqs: [Option<Array>; 2],
+        /// Whether every layer's q and k norm weights are bfloat16 of the head width and the
+        /// widths are ones the q/k/v kernel takes (decided once at load).
+        qkv_kernel_ok: bool,
         /// `gather_qmm`'s row indices for a one-row expert pass ([`decode_lhs_indices`]).
         const_lhs_gate_up: Array,
         const_lhs_down: Array,
@@ -3473,6 +3482,41 @@ pub(crate) mod imp {
                         && lw.router.per_expert_scale.shape() == [experts]
                 });
 
+            let kinds = [
+                NativeGemma4LayerType::SlidingAttention,
+                NativeGemma4LayerType::FullAttention,
+            ];
+            let rope_consts = kinds.map(|kind| {
+                let head_dim = cfg.text_config.head_dim_for(kind) as i32;
+                let params = cfg.text_config.rope_for(kind);
+                let rope_dim = (head_dim as f32 * params.partial_rotary_factor) as i32;
+                let rope_base = params.rope_theta;
+                let base_log2 = Array::from_slice(&[rope_base.log2()], &[1]);
+                let freqs = (rope_dim != head_dim).then(|| {
+                    let half_rot = (rope_dim / 2) as usize;
+                    let half_inf = ((head_dim - rope_dim) / 2) as usize;
+                    let mut freqs_vals: Vec<f32> = Vec::with_capacity(half_rot + half_inf);
+                    for i in 0..half_rot {
+                        let exp = (2 * i) as f32 / head_dim as f32;
+                        freqs_vals.push(rope_base.powf(exp));
+                    }
+                    freqs_vals.extend(std::iter::repeat_n(f32::INFINITY, half_inf));
+                    Array::from_slice(&freqs_vals, &[freqs_vals.len() as i32])
+                });
+                (base_log2, freqs)
+            });
+            let [(sliding_log2, sliding_freqs), (full_log2, full_freqs)] = rope_consts;
+            let const_rope_base_log2 = [sliding_log2, full_log2];
+            let const_rope_freqs = [sliding_freqs, full_freqs];
+            let qkv_kernel_ok = layers.iter().all(|lw| {
+                let head_dim = cfg.text_config.head_dim_for(lw.kind) as i32;
+                head_dim % 4 == 0
+                    && (128..=1024).contains(&head_dim)
+                    && [&lw.attn.q_norm, &lw.attn.k_norm]
+                        .into_iter()
+                        .all(|w| w.dtype() == mlx_rs::Dtype::Bfloat16 && w.shape() == [head_dim])
+            });
+
             let (const_lhs_gate_up, const_lhs_down) =
                 decode_lhs_indices(cfg.text_config.top_k_experts as i32);
 
@@ -3493,6 +3537,9 @@ pub(crate) mod imp {
                 const_rms_eps,
                 norm_kernel_weights_ok,
                 route_kernel_ok,
+                const_rope_base_log2,
+                const_rope_freqs,
+                qkv_kernel_ok,
                 const_lhs_gate_up,
                 const_lhs_down,
                 tq_bake_v_active,
@@ -4005,6 +4052,19 @@ pub(crate) mod imp {
         /// Array cached at model load. Previous impl allocated a fresh
         /// `ones([head_dim])` on every call — 30 per decode step (one
         /// per attention layer).
+        /// The q/k/v kernel's rotation for a layer kind: the frequency table of a partly rotated
+        /// head, or `log2(theta)`.
+        fn rope_consts(&self, kind: NativeGemma4LayerType) -> crate::gemma4_qkv_kernel::Rope<'_> {
+            let i = match kind {
+                NativeGemma4LayerType::SlidingAttention => 0,
+                NativeGemma4LayerType::FullAttention => 1,
+            };
+            match &self.const_rope_freqs[i] {
+                Some(freqs) => crate::gemma4_qkv_kernel::Rope::Freqs(freqs),
+                None => crate::gemma4_qkv_kernel::Rope::BaseLog2(&self.const_rope_base_log2[i]),
+            }
+        }
+
         fn rms_norm_no_scale(&self, x: &Array, head_dim: i32, eps: f32) -> Result<Array> {
             let ones = if head_dim == self.config.text_config.global_head_dim as i32 {
                 &self.const_ones_head_dim_full
@@ -4078,86 +4138,117 @@ pub(crate) mod imp {
                 bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
 
-            // (4) Norms on Q/K/V + 3× transpose. Bucketed as "norms" since
-            // transpose_axes is metadata-only (constant cost vs ctx).
-            //
-            // Phase 1.8 M2.5 (`LUMEN_GEMMA4_FUSED_QKNORM=1`) fused
-            // `rms_norm + transpose_axes` into one Metal dispatch, but
-            // bridge-dispatch sync cost overwhelmed the fusion savings
-            // (+34 ms regression at PROMPT_LEN=4096). Removed 2026-05-14;
-            // future fusion work must use the M4.8 mlx Primitive pattern,
-            // not the bridge.
-            let norms_start = if time_substages {
-                Some(Instant::now())
+            // (4+5) The norms on Q/K/V and RoPE on Q and K. A one-row pass takes the q/k/v
+            // kernel, the same arithmetic in one launch; anything else, the composed ops.
+            let qkv_kernel = l == 1
+                && b == 1
+                && !time_substages
+                && self.qkv_kernel_ok
+                && crate::gemma4_qkv_kernel::enabled()
+                && [&q, &k_4d, &v_4d]
+                    .iter()
+                    .all(|a| a.dtype() == mlx_rs::Dtype::Bfloat16);
+            let (q_rope, k_rope, v_t) = if qkv_kernel {
+                let ones = if head_dim == cfg.global_head_dim as i32 {
+                    &self.const_ones_head_dim_full
+                } else {
+                    &self.const_ones_head_dim_sliding
+                };
+                let [q, k, v] = crate::gemma4_qkv_kernel::project_tail(
+                    &q,
+                    &k_4d,
+                    &v_4d,
+                    &lw.attn.q_norm,
+                    &lw.attn.k_norm,
+                    ones,
+                    &Array::from_slice(&[kv_offset], &[1]),
+                    self.rope_consts(kind),
+                    &self.const_rms_eps,
+                )?;
+                (q, k, v)
             } else {
-                None
-            };
+                // (4) Norms on Q/K/V + 3× transpose. Bucketed as "norms" since
+                // transpose_axes is metadata-only (constant cost vs ctx).
+                //
+                // Phase 1.8 M2.5 (`LUMEN_GEMMA4_FUSED_QKNORM=1`) fused
+                // `rms_norm + transpose_axes` into one Metal dispatch, but
+                // bridge-dispatch sync cost overwhelmed the fusion savings
+                // (+34 ms regression at PROMPT_LEN=4096). Removed 2026-05-14;
+                // future fusion work must use the M4.8 mlx Primitive pattern,
+                // not the bridge.
+                let norms_start = if time_substages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
 
-            let q_n = rms_norm(&q, &lw.attn.q_norm, eps).context("attn: q_norm")?;
-            let k_n = rms_norm(&k_4d, &lw.attn.k_norm, eps).context("attn: k_norm")?;
-            let q_t = mlx_rs::ops::transpose_axes(&q_n, &[0, 2, 1, 3])
-                .context("attn: transpose Q failed")?;
-            let k_t = mlx_rs::ops::transpose_axes(&k_n, &[0, 2, 1, 3])
-                .context("attn: transpose K failed")?;
+                let q_n = rms_norm(&q, &lw.attn.q_norm, eps).context("attn: q_norm")?;
+                let k_n = rms_norm(&k_4d, &lw.attn.k_norm, eps).context("attn: k_norm")?;
+                let q_t = mlx_rs::ops::transpose_axes(&q_n, &[0, 2, 1, 3])
+                    .context("attn: transpose Q failed")?;
+                let k_t = mlx_rs::ops::transpose_axes(&k_n, &[0, 2, 1, 3])
+                    .context("attn: transpose K failed")?;
 
-            let v_n = self.rms_norm_no_scale(&v_4d, head_dim, eps)?;
-            let v_t = mlx_rs::ops::transpose_axes(&v_n, &[0, 2, 1, 3])
-                .context("attn: transpose V failed")?;
-            if let Some(t0) = norms_start {
-                bump_gemma4_attn_norms_ms(t0.elapsed().as_secs_f64() * 1e3);
-            }
-
-            // (5) RoPE on Q and K (partial-rotary, per-kind theta + dim).
-            // documented `LUMEN_GEMMA4_ROPE_PRECOMPUTE_FREQS=1`
-            // as WASH (no perf gain vs per-call arange+pow); precompute path
-            // removed 2026-05-14.
-            let rope_start = if time_substages {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            // Full attention layers use mlx_lm's `ProportionalRoPE`: freqs are
-            // computed against the FULL head_dim (denominator = head_dim, NOT
-            // the partial rope_dim), with `(head_dim - rope_dim)/2` trailing
-            // entries of `inf` so the un-rotated tail still gets a freq slot
-            // but `1/inf=0` makes its rotation a no-op. Sliding layers have
-            // `partial_rotary_factor=1.0` so the default freqs-less path
-            // remains correct (denominator = rope_dim = head_dim).
-            //
-            // Pre-fix: we called `rope(..., dimensions=rope_dim, base, ...)`
-            // for both kinds. For full attention that put the freq exponent
-            // denominator at `rope_dim` (128) instead of `head_dim` (512),
-            // producing wrong rotation frequencies. Prefill drift was masked
-            // by bf16 noise; decode position accumulation exposed it as a
-            // max|Δ|=15 spike at L29 (the only full-attention layer in 26B-A4B).
-            let (q_rope, k_rope) = if rope_dim == head_dim {
-                let q = rope(&q_t, rope_dim, false, rope_base, 1.0, kv_offset)
-                    .context("attn: rope(Q)")?;
-                let k = rope(&k_t, rope_dim, false, rope_base, 1.0, kv_offset)
-                    .context("attn: rope(K)")?;
-                (q, k)
-            } else {
-                let half_rot = (rope_dim / 2) as usize;
-                let half_inf = ((head_dim - rope_dim) / 2) as usize;
-                let mut freqs_vals: Vec<f32> = Vec::with_capacity(half_rot + half_inf);
-                for i in 0..half_rot {
-                    let exp = (2 * i) as f32 / head_dim as f32;
-                    freqs_vals.push(rope_base.powf(exp));
+                let v_n = self.rms_norm_no_scale(&v_4d, head_dim, eps)?;
+                let v_t = mlx_rs::ops::transpose_axes(&v_n, &[0, 2, 1, 3])
+                    .context("attn: transpose V failed")?;
+                if let Some(t0) = norms_start {
+                    bump_gemma4_attn_norms_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                for _ in 0..half_inf {
-                    freqs_vals.push(f32::INFINITY);
+
+                // (5) RoPE on Q and K (partial-rotary, per-kind theta + dim).
+                // documented `LUMEN_GEMMA4_ROPE_PRECOMPUTE_FREQS=1`
+                // as WASH (no perf gain vs per-call arange+pow); precompute path
+                // removed 2026-05-14.
+                let rope_start = if time_substages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                // Full attention layers use mlx_lm's `ProportionalRoPE`: freqs are
+                // computed against the FULL head_dim (denominator = head_dim, NOT
+                // the partial rope_dim), with `(head_dim - rope_dim)/2` trailing
+                // entries of `inf` so the un-rotated tail still gets a freq slot
+                // but `1/inf=0` makes its rotation a no-op. Sliding layers have
+                // `partial_rotary_factor=1.0` so the default freqs-less path
+                // remains correct (denominator = rope_dim = head_dim).
+                //
+                // Pre-fix: we called `rope(..., dimensions=rope_dim, base, ...)`
+                // for both kinds. For full attention that put the freq exponent
+                // denominator at `rope_dim` (128) instead of `head_dim` (512),
+                // producing wrong rotation frequencies. Prefill drift was masked
+                // by bf16 noise; decode position accumulation exposed it as a
+                // max|Δ|=15 spike at L29 (the only full-attention layer in 26B-A4B).
+                let (q_rope, k_rope) = if rope_dim == head_dim {
+                    let q = rope(&q_t, rope_dim, false, rope_base, 1.0, kv_offset)
+                        .context("attn: rope(Q)")?;
+                    let k = rope(&k_t, rope_dim, false, rope_base, 1.0, kv_offset)
+                        .context("attn: rope(K)")?;
+                    (q, k)
+                } else {
+                    let half_rot = (rope_dim / 2) as usize;
+                    let half_inf = ((head_dim - rope_dim) / 2) as usize;
+                    let mut freqs_vals: Vec<f32> = Vec::with_capacity(half_rot + half_inf);
+                    for i in 0..half_rot {
+                        let exp = (2 * i) as f32 / head_dim as f32;
+                        freqs_vals.push(rope_base.powf(exp));
+                    }
+                    for _ in 0..half_inf {
+                        freqs_vals.push(f32::INFINITY);
+                    }
+                    let freqs = Array::from_slice(&freqs_vals, &[freqs_vals.len() as i32]);
+                    let q = rope_with_freqs(&q_t, head_dim, false, 1.0, kv_offset, &freqs)
+                        .context("attn: rope_with_freqs(Q)")?;
+                    let k = rope_with_freqs(&k_t, head_dim, false, 1.0, kv_offset, &freqs)
+                        .context("attn: rope_with_freqs(K)")?;
+                    (q, k)
+                };
+                if let Some(t0) = rope_start {
+                    bump_gemma4_attn_rope_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                let freqs = Array::from_slice(&freqs_vals, &[freqs_vals.len() as i32]);
-                let q = rope_with_freqs(&q_t, head_dim, false, 1.0, kv_offset, &freqs)
-                    .context("attn: rope_with_freqs(Q)")?;
-                let k = rope_with_freqs(&k_t, head_dim, false, 1.0, kv_offset, &freqs)
-                    .context("attn: rope_with_freqs(K)")?;
-                (q, k)
+                (q_rope, k_rope, v_t)
             };
             stage_mark("q/k/v norms + rope", &[&q_rope, &k_rope, &v_t])?;
-            if let Some(t0) = rope_start {
-                bump_gemma4_attn_rope_ms(t0.elapsed().as_secs_f64() * 1e3);
-            }
 
             // (6) Cache update.
             // Tier 1B (2026-05-16) — quantized full-attn early branch.
@@ -8705,6 +8796,31 @@ pub(crate) mod imp {
                     );
                 }
             }
+        }
+
+        /// With `LUMEN_GEMMA4_QKV_KERNEL` a one-row pass norms and rotates q, k and v in one
+        /// kernel. Teacher-forced as above, the logits are the composed ops' to the bit; the kernel
+        /// ran once a layer on every decode step and not on the verify-sized block, which is not a
+        /// one-row pass.
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn the_qkv_kernel_gives_the_composed_attention_inputs_logits_to_the_bit() {
+            use crate::gemma4_qkv_kernel::{launches, qkv_kernel};
+            let Some((model, prompt)) = kernel_test_model() else {
+                return;
+            };
+            let before = launches();
+            let (tokens, reference) =
+                qkv_kernel::with(false, || decode_logits_bits(&model, &prompt, None));
+            assert_eq!(launches(), before, "the q/k/v kernel ran while off");
+            let (_, with_kernel) =
+                qkv_kernel::with(true, || decode_logits_bits(&model, &prompt, Some(&tokens)));
+            assert_eq!(
+                launches() - before,
+                KERNEL_TEST_STEPS * model.num_layers(),
+                "the q/k/v kernel runs once a layer on every one-row pass, and only on those"
+            );
+            assert_same_logits("q/k/v kernel", &reference, &with_kernel);
         }
 
         fn parity_at(model: &NativeGemma4Model, prompt: &[u32]) {

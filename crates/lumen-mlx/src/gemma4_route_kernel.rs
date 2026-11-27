@@ -31,9 +31,13 @@ lumen_flags::flag! {
     /// decoder layers' kernel path, so it takes effect with `LUMEN_GEMMA4_NORM_KERNELS`;
     /// decode-sized passes only.
     ///
-    /// Off until timed: 120 fewer dispatches a token and the same continuation in 80 of 80 runs
-    /// on gemma-4-26b-a4b NVFP4, but its only ABBA ran on a contended machine (+0.06 ms, paired
-    /// standard error 0.13). Its expert path for affine 4-bit checkpoints (the experts compile
+    /// Off: 120 fewer dispatches a token and the same continuation in 80 of 80 runs on
+    /// gemma-4-26b-a4b NVFP4, but no measurable speed-up. Over the undisturbed blocks of the ABBA
+    /// runs it is about 0.04 ms a token faster, where the q/k/v kernel, removing as many
+    /// dispatches, is 0.25 ms. A likely reason, not yet tested: MLX encodes concurrently and the
+    /// experts' `gather_qmm` needs only the indices, so the composed tail overlapped the experts,
+    /// while the kernel makes them wait for its weights too. Its expert path for affine 4-bit
+    /// checkpoints (the experts compile
     /// slot with the combine outside it, instead of the routing-experts slot) has been checked by
     /// the model-free tests only.
     pub(crate) route_kernel {

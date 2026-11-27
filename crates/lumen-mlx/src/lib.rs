@@ -35,6 +35,8 @@ mod gemma4_moe;
 mod gemma4_mtp;
 #[cfg(feature = "mlx-native")]
 mod gemma4_norm_kernels;
+#[cfg(feature = "mlx-native")]
+mod gemma4_qkv_kernel;
 mod gemma4_response;
 #[cfg(feature = "mlx-native")]
 mod gemma4_route_kernel;

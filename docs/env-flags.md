@@ -22,6 +22,7 @@ value → on.
 | `LUMEN_GEMMA4_FUSE_SOFTCAP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_softcap` |
 | `LUMEN_GEMMA4_NORM_KERNELS` | on | Optimization | `lumen_mlx::gemma4_norm_kernels::norm_kernels` |
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
+| `LUMEN_GEMMA4_QKV_KERNEL` | on | Optimization | `lumen_mlx::gemma4_qkv_kernel::qkv_kernel` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
 | `LUMEN_GEMMA4_ROUTE_KERNEL` | off | Optimization | `lumen_mlx::gemma4_route_kernel::route_kernel` |
@@ -198,6 +199,19 @@ Log each chunked-prefill chunk's wall time and MLX memory (active,
  returned logits are no longer lazy; every chunk already ends in an
  eval, so no barrier is added inside a forward.
 
+### `LUMEN_GEMMA4_QKV_KERNEL`
+
+*Optimization, default on.*
+
+Run the Gemma 4 attention's q/k/v norms and RoPE as one Metal kernel on a one-row decode
+ pass: five dispatches a layer become one. Bit for bit what `rms_norm` and `rope` give.
+ Every KV-cache kind takes its output; a verify block or a prefill chunk keeps the composed
+ ops.
+
+ On by default: a decode token 0.25 ms (1.6%) faster on gemma-4-26b-a4b NVFP4 (M3 Max,
+ 20 same-process ABBA blocks, every block faster, paired standard error 0.028 ms), 120 fewer
+ dispatches a token, the same continuation in 80 of 80 runs. `=0` restores the composed ops.
+
 ### `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN`
 
 *Behavior, default on.*
@@ -242,9 +256,13 @@ Pick each token's experts and weigh them in one Metal kernel (the top-k, the cho
  decoder layers' kernel path, so it takes effect with `LUMEN_GEMMA4_NORM_KERNELS`;
  decode-sized passes only.
 
- Off until timed: 120 fewer dispatches a token and the same continuation in 80 of 80 runs
- on gemma-4-26b-a4b NVFP4, but its only ABBA ran on a contended machine (+0.06 ms, paired
- standard error 0.13). Its expert path for affine 4-bit checkpoints (the experts compile
+ Off: 120 fewer dispatches a token and the same continuation in 80 of 80 runs on
+ gemma-4-26b-a4b NVFP4, but no measurable speed-up. Over the undisturbed blocks of the ABBA
+ runs it is about 0.04 ms a token faster, where the q/k/v kernel, removing as many
+ dispatches, is 0.25 ms. A likely reason, not yet tested: MLX encodes concurrently and the
+ experts' `gather_qmm` needs only the indices, so the composed tail overlapped the experts,
+ while the kernel makes them wait for its weights too. Its expert path for affine 4-bit
+ checkpoints (the experts compile
  slot with the combine outside it, instead of the routing-experts slot) has been checked by
  the model-free tests only.
 
