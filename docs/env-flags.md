@@ -256,15 +256,15 @@ Pick each token's experts and weigh them in one Metal kernel (the top-k, the cho
  decoder layers' kernel path, so it takes effect with `LUMEN_GEMMA4_NORM_KERNELS`;
  decode-sized passes only.
 
- Off: 120 fewer dispatches a token and the same continuation in 80 of 80 runs on
- gemma-4-26b-a4b NVFP4, but no measurable speed-up. Over the undisturbed blocks of the ABBA
- runs it is about 0.04 ms a token faster, where the q/k/v kernel, removing as many
- dispatches, is 0.25 ms. A likely reason, not yet tested: MLX encodes concurrently and the
- experts' `gather_qmm` needs only the indices, so the composed tail overlapped the experts,
- while the kernel makes them wait for its weights too. Its expert path for affine 4-bit
- checkpoints (the experts compile
- slot with the combine outside it, instead of the routing-experts slot) has been checked by
- the model-free tests only.
+ Off: 120 fewer dispatches a token and the same continuation in every run on
+ gemma-4-26b-a4b NVFP4, but only 0.06 ms a token faster, at 1.9 paired standard errors (16
+ same-process ABBA blocks on a quiet machine), where the q/k/v kernel, removing as many
+ dispatches, is 0.25 ms. The kernel itself is the cost: a GPU shader timeline shows it
+ running 7.1 µs a call, against the 9.3 µs sort plus the softmax, gather and multiply it
+ replaces, because one threadgroup ranks every expert against every other. A decode step's
+ kernels run one at a time, so that time is the step's. A top-k of `k` rounds of `simd_max`
+ would be the faster shape. Bit for bit on an affine 4-bit checkpoint too, where the
+ experts run in their compile slot with the combine outside it.
 
 ### `LUMEN_GEMMA4_STAGE_SYNC`
 
