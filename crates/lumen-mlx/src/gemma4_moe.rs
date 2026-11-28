@@ -3132,6 +3132,14 @@ pub(crate) mod imp {
         )
     }
 
+    /// Whether an expert pass may take [`decode_lhs_indices`]: only an unsorted pass of one row,
+    /// the shape those indices describe. A pass of more rows (a verify block, a batch) needs the
+    /// indices `gather_qmm` builds itself, one per row, or every row would gather the first row's
+    /// activation.
+    pub(crate) fn takes_decode_lhs_indices(do_sort: bool, batch: i32, rows: i32) -> bool {
+        !do_sort && batch * rows == 1
+    }
+
     pub struct NativeGemma4Model {
         config: NativeGemma4Config,
         embed_tokens: EmbedTokensWeights,
@@ -5487,7 +5495,7 @@ pub(crate) mod imp {
             };
             // A one-row pass hands `gather_qmm` its row indices rather than letting it build an
             // `arange` for each of the three projections: the same values, one launch fewer each.
-            let lhs = (!do_sort && b * l == 1)
+            let lhs = takes_decode_lhs_indices(do_sort, b, l)
                 .then_some((&self.const_lhs_gate_up, &self.const_lhs_down))
                 .filter(|(_, down)| down.shape() == [1, 1, k]);
             let down = match fused {
@@ -8795,6 +8803,30 @@ pub(crate) mod imp {
                         x.shape()
                     );
                 }
+            }
+        }
+
+        /// Only an unsorted pass of one row takes the cached row indices. A verify block (MTP
+        /// sends about seven rows), a prefill-sized pass or a batch has a row per token, and the
+        /// one-row indices would hand every row the first row's activation; a sorted pass reorders
+        /// its rows itself.
+        #[test]
+        fn only_an_unsorted_one_row_pass_takes_the_decode_lhs_indices() {
+            assert!(takes_decode_lhs_indices(false, 1, 1));
+            for (do_sort, batch, rows) in [
+                (true, 1, 1),
+                (false, 1, 2),
+                (false, 1, 4),
+                (false, 1, 7),
+                (false, 1, 16),
+                (false, 2, 1),
+                (false, 4, 2),
+                (true, 1, 16),
+            ] {
+                assert!(
+                    !takes_decode_lhs_indices(do_sort, batch, rows),
+                    "sorted {do_sort}, batch {batch}, rows {rows}"
+                );
             }
         }
 

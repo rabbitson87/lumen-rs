@@ -2445,6 +2445,19 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "gemma4-expert-blocks-take-the-one-row-indices",
+        symptom: "expert passes of up to four rows took the row indices cached for a one-row pass, so every row of a verify block gathered the first row's activation and the block's logits were the first token's",
+        revert: &[Mutation {
+            path: MLX,
+            find: "!do_sort && batch * rows == 1",
+            replace: "!do_sort && batch * rows <= 4 // defect: blocks take the one-row indices",
+        }],
+        guards: &[mlx(
+            "gemma4_moe::imp::tests::only_an_unsorted_one_row_pass_takes_the_decode_lhs_indices",
+        )],
+        ..PLAIN
+    },
+    Defect {
         name: "gemma4-qkv-kernel-rotates-with-the-wrong-partner",
         symptom: "the q/k/v kernel rotated each element with its neighbour instead of the element half a head away, where MLX's non-traditional RoPE pairs j with j + D / 2, so every query and key was rotated wrongly",
         revert: &[Mutation {
@@ -2675,6 +2688,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "gemma4-route-kernel-runs-while-off") => "gemma4_moe.rs",
         (_, n) if n.starts_with("gemma4-route-kernel-") => "gemma4_route_kernel.rs",
         (_, "gemma4-expert-down-rows-all-read-the-first-expert")
+        | (_, "gemma4-expert-blocks-take-the-one-row-indices")
         | (_, "gemma4-qkv-kernel-is-never-launched")
         | (_, "gemma4-qkv-kernel-takes-verify-blocks")
         | (_, "gemma4-qkv-kernel-swaps-the-rope-of-the-layer-kinds") => "gemma4_moe.rs",
