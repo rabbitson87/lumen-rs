@@ -18,6 +18,12 @@
 //! `Optimization`. They serve bfloat16 rows of at most [`MAX_ROWS`] rows (a decode step, an MTP
 //! verify block) and widths `rms_norm` reduces in one threadgroup (a multiple of four up to 4096);
 //! a prefill chunk and anything else keep the composed ops.
+//!
+//! [`serves`] vouches for a pass's input. What a layer computes from it has its shape but takes
+//! the type of the weights' scales and of the routing scale, which a checkpoint may store wider
+//! than bfloat16, so a caller asks [`serves_type`] of every state it is about to hand a kernel. A
+//! wider one goes to [`attn_out_composed`] or [`layer_out_composed`], the ops MLX composes, which
+//! promote it.
 
 use std::cell::OnceCell;
 
@@ -25,6 +31,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use mlx_rs::{Array, Dtype};
 
 use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
+use crate::native_norm::rms_norm;
 
 lumen_flags::flag! {
     /// Run the norm-and-residual glue of each Gemma 4 decoder layer as two Metal kernels: after
@@ -70,7 +77,13 @@ fn threads_for(hidden: i32) -> i32 {
 pub(crate) fn serves(x: &Array) -> bool {
     matches!(x.shape(), &[1, rows, hidden]
         if (1..=MAX_ROWS).contains(&rows) && hidden % 4 == 0 && (4..=MAX_HIDDEN).contains(&hidden))
-        && x.dtype() == Dtype::Bfloat16
+        && serves_type(x)
+}
+
+/// Whether a state has the one type the kernels read and write. A layer asks it of each state it
+/// computed from an input [`serves`] vouched for: the shape is the input's, the type need not be.
+pub(crate) fn serves_type(state: &Array) -> bool {
+    state.dtype() == Dtype::Bfloat16
 }
 
 /// The inverse RMS of a row, as `rms_single_row` reduces it: `acc` is this thread's sum of
@@ -413,10 +426,46 @@ pub(crate) fn layer_out(
         .map_err(|_| anyhow!("the layer-out kernel returned the wrong number of outputs"))
 }
 
+/// [`attn_out`] as the ops `decoder_layer_forward` composes, for states the kernel does not serve
+/// (see the module's note on wider states); they take any float type and promote as MLX does.
+pub(crate) fn attn_out_composed(
+    a: &Array,
+    x: &Array,
+    weights: [&Array; 4],
+    eps: f32,
+) -> Result<[Array; 4]> {
+    let [w_attn, w_dense, w_router, w_moe] = weights;
+    let normed = rms_norm(a, w_attn, eps).context("layer: post_attention_layernorm")?;
+    let h = mlx_rs::ops::add(x, &normed).context("layer: +residual (attn)")?;
+    let dense = rms_norm(&h, w_dense, eps).context("layer: pre_feedforward_layernorm")?;
+    let router = rms_norm(&h, w_router, eps).context("router: rms_norm")?;
+    let moe = rms_norm(&h, w_moe, eps).context("layer: pre_feedforward_layernorm_2")?;
+    Ok([h, dense, router, moe])
+}
+
+/// [`layer_out`] as the composed ops, then the next norm, for states the kernel does not serve.
+pub(crate) fn layer_out_composed(
+    d: &Array,
+    m: &Array,
+    h: &Array,
+    weights: [&Array; 4],
+    scalar: &Array,
+    eps: f32,
+) -> Result<[Array; 2]> {
+    let [w1, w2, w_ff, w_next] = weights;
+    let h1 = rms_norm(d, w1, eps).context("layer: post_feedforward_layernorm_1")?;
+    let h2 = rms_norm(m, w2, eps).context("layer: post_feedforward_layernorm_2")?;
+    let sum = mlx_rs::ops::add(&h1, &h2).context("layer: h1 + h2")?;
+    let ff = rms_norm(&sum, w_ff, eps).context("layer: post_feedforward_layernorm")?;
+    let with_residual = mlx_rs::ops::add(h, &ff).context("layer: +residual (ff)")?;
+    let out = mlx_rs::ops::multiply(&with_residual, scalar).context("layer: × layer_scalar")?;
+    let next = rms_norm(&out, w_next, eps).context("layer: the next norm")?;
+    Ok([out, next])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_norm::rms_norm;
 
     const EPS: f32 = 1e-6;
 
@@ -478,12 +527,7 @@ mod tests {
 
     /// The composed ops `decoder_layer_forward` runs after the attention.
     fn attn_out_composed(a: &Array, x: &Array, w: [&Array; 4]) -> [Array; 4] {
-        let normed = rms_norm(a, w[0], EPS).unwrap();
-        let h = mlx_rs::ops::add(x, &normed).unwrap();
-        let dense = rms_norm(&h, w[1], EPS).unwrap();
-        let router = rms_norm(&h, w[2], EPS).unwrap();
-        let moe = rms_norm(&h, w[3], EPS).unwrap();
-        [h, dense, router, moe]
+        super::attn_out_composed(a, x, w, EPS).expect("the composed attention-out ops")
     }
 
     /// The composed ops at the end of a layer, then the next layer's input norm.
@@ -494,14 +538,7 @@ mod tests {
         w: [&Array; 4],
         scalar: &Array,
     ) -> [Array; 2] {
-        let h1 = rms_norm(d, w[0], EPS).unwrap();
-        let h2 = rms_norm(m, w[1], EPS).unwrap();
-        let sum = mlx_rs::ops::add(&h1, &h2).unwrap();
-        let ff = rms_norm(&sum, w[2], EPS).unwrap();
-        let with_residual = mlx_rs::ops::add(h, &ff).unwrap();
-        let out = mlx_rs::ops::multiply(&with_residual, scalar).unwrap();
-        let next = rms_norm(&out, w[3], EPS).unwrap();
-        [out, next]
+        super::layer_out_composed(d, m, h, w, scalar, EPS).expect("the composed layer-out ops")
     }
 
     /// Both kernels are the composed ops to the bit over widths that fill whole simdgroups (2816,
@@ -582,6 +619,42 @@ mod tests {
             x_composed = out_c;
         }
         assert_same("30 chained layers", &x_kernel, &x_composed);
+    }
+
+    /// A state wider than bfloat16 (what a layer computes from float32 scales or a float32 routing
+    /// scale) is not served, whichever input it is, and the composed ops take it without a launch
+    /// and hand back the promoted type, as the layer's own ops would.
+    #[test]
+    fn a_wider_state_is_not_served_and_the_composed_ops_take_it() {
+        let hidden = 2816;
+        let ws: Vec<Array> = (0..4)
+            .map(|i| values(700 + i, &[hidden], 1.0, 0.5))
+            .collect();
+        let w4 = [&ws[0], &ws[1], &ws[2], &ws[3]];
+        let scalar = values(710, &[1], 0.8, 0.1);
+        let x = values(720, &[1, 1, hidden], 0.0, 1.0);
+        let wide = values(721, &[1, 1, hidden], 0.0, 3.0)
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        assert!(serves(&x) && !serves(&wide));
+        assert!(serves_type(&x) && !serves_type(&wide));
+
+        let before = launches();
+        for (a, r) in [(&wide, &x), (&x, &wide)] {
+            assert!(attn_out(a, r, w4, &eps()).is_err(), "the kernel refuses it");
+            for out in super::attn_out_composed(a, r, w4, EPS).expect("composed") {
+                assert_eq!(out.dtype(), Dtype::Float32);
+                assert_eq!(out.shape(), [1, 1, hidden]);
+            }
+        }
+        for (d, m, h) in [(&wide, &x, &x), (&x, &wide, &x), (&x, &x, &wide)] {
+            assert!(layer_out(d, m, h, w4, &scalar, &eps()).is_err());
+            for out in super::layer_out_composed(d, m, h, w4, &scalar, EPS).expect("composed") {
+                assert_eq!(out.dtype(), Dtype::Float32);
+                assert_eq!(out.shape(), [1, 1, hidden]);
+            }
+        }
+        assert_eq!(launches(), before, "a refused state launched a kernel");
     }
 
     /// What the kernels do not serve is an error, never a wrong answer.

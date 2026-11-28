@@ -5943,6 +5943,12 @@ pub(crate) mod imp {
         ///
         /// Between the kernels it runs the ops the default path runs, in the same order, on the
         /// same rows, so the result is the default path's bit for bit.
+        ///
+        /// A kernel runs only on states of the type it reads. The caller vouched for the first
+        /// layer's input; the attention's and the two branches' outputs take the type of their
+        /// weights' scales and of the routing scale, which a checkpoint may store wider than
+        /// bfloat16, and from the first such layer the residual stream is wider too. Those go to
+        /// the composed ops, which promote them as the default path does.
         fn decoder_layer_norm_kernels(
             &self,
             x: &Array,
@@ -5959,22 +5965,27 @@ pub(crate) mod imp {
                     .context("layer: input_layernorm")?,
             };
             stage_mark("input norm", &[&x_normed])?;
+            use crate::gemma4_norm_kernels as glue;
             let attn = self.layer_attention_forward(&x_normed, layer_idx, cache)?;
-            let [h, dense_in, router_in, moe_in] = crate::gemma4_norm_kernels::attn_out(
-                &attn,
-                x,
-                [
-                    &lw.post_attention_layernorm,
-                    &lw.pre_feedforward_layernorm,
-                    &lw.router.scaled_weight,
-                    &lw.pre_feedforward_layernorm_2,
-                ],
-                &self.const_rms_eps,
-            )?;
-            stage_mark(
-                "attn-out norms (kernel)",
-                &[&h, &dense_in, &router_in, &moe_in],
-            )?;
+            let attn_norms = [
+                &lw.post_attention_layernorm,
+                &lw.pre_feedforward_layernorm,
+                &lw.router.scaled_weight,
+                &lw.pre_feedforward_layernorm_2,
+            ];
+            let (stage, [h, dense_in, router_in, moe_in]) =
+                if glue::serves_type(&attn) && glue::serves_type(x) {
+                    (
+                        "attn-out norms (kernel)",
+                        glue::attn_out(&attn, x, attn_norms, &self.const_rms_eps)?,
+                    )
+                } else {
+                    (
+                        "attn-out norms (composed)",
+                        glue::attn_out_composed(&attn, x, attn_norms, cfg.rms_norm_eps)?,
+                    )
+                };
+            stage_mark(stage, &[&h, &dense_in, &router_in, &moe_in])?;
 
             let dense = Self::dense_mlp_forward(&dense_in, &lw.dense_mlp)?;
             stage_mark("dense mlp", &[&dense])?;
@@ -6003,20 +6014,39 @@ pub(crate) mod imp {
             };
             stage_mark("experts", &[&moe])?;
 
-            let [out, out_normed] = crate::gemma4_norm_kernels::layer_out(
-                &dense,
-                &moe,
-                &h,
-                [
-                    &lw.post_feedforward_layernorm_1,
-                    &lw.post_feedforward_layernorm_2,
-                    &lw.post_feedforward_layernorm,
-                    next_norm,
-                ],
-                &lw.layer_scalar,
-                &self.const_rms_eps,
-            )?;
-            stage_mark("layer-out norms (kernel)", &[&out, &out_normed])?;
+            let out_norms = [
+                &lw.post_feedforward_layernorm_1,
+                &lw.post_feedforward_layernorm_2,
+                &lw.post_feedforward_layernorm,
+                next_norm,
+            ];
+            let (stage, [out, out_normed]) =
+                if [&dense, &moe, &h].into_iter().all(glue::serves_type) {
+                    (
+                        "layer-out norms (kernel)",
+                        glue::layer_out(
+                            &dense,
+                            &moe,
+                            &h,
+                            out_norms,
+                            &lw.layer_scalar,
+                            &self.const_rms_eps,
+                        )?,
+                    )
+                } else {
+                    (
+                        "layer-out norms (composed)",
+                        glue::layer_out_composed(
+                            &dense,
+                            &moe,
+                            &h,
+                            out_norms,
+                            &lw.layer_scalar,
+                            cfg.rms_norm_eps,
+                        )?,
+                    )
+                };
+            stage_mark(stage, &[&out, &out_normed])?;
             Ok((out, out_normed))
         }
 
@@ -8711,6 +8741,39 @@ pub(crate) mod imp {
                 "each kernel runs once a layer on every decode-sized pass"
             );
             assert_same_logits("norm kernels", &reference, &with_kernels);
+        }
+
+        /// A checkpoint may store a routing scale (or a linear's scales) wider than bfloat16. The
+        /// experts' output of that layer is then float32, and so is the residual stream from
+        /// there on. The kernels serve the layers before it (and that layer's attention-out,
+        /// whose inputs are still bfloat16); the rest goes to the composed ops, and the logits
+        /// are the composed path's to the bit, where the kernels alone would refuse the pass.
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn norm_kernels_leave_a_wider_layer_to_the_composed_ops() {
+            use crate::gemma4_norm_kernels::{launches, norm_kernels};
+            const WIDE_LAYER: usize = 3;
+            let Some((mut model, prompt)) = kernel_test_model() else {
+                return;
+            };
+            let scale = &mut model.layers[WIDE_LAYER].router.per_expert_scale;
+            *scale = scale.as_dtype(mlx_rs::Dtype::Float32).expect("widen");
+            let (tokens, reference) =
+                norm_kernels::with(false, || decode_logits_bits(&model, &prompt, None));
+            let before = launches();
+            let (_, with_kernels) = norm_kernels::with(true, || {
+                crate::gemma4_route_kernel::route_kernel::with(false, || {
+                    decode_logits_bits(&model, &prompt, Some(&tokens))
+                })
+            });
+            let after = launches();
+            let passes = KERNEL_TEST_STEPS + 1;
+            assert_eq!(
+                [after[0] - before[0], after[1] - before[1]],
+                [passes * (WIDE_LAYER + 1), passes * WIDE_LAYER],
+                "the kernels run up to where the stream widens and not after"
+            );
+            assert_same_logits("a float32 routing scale", &reference, &with_kernels);
         }
 
         /// With `LUMEN_GEMMA4_ROUTE_KERNEL` (inside the norm kernels' path) each layer's top-k and

@@ -2350,6 +2350,49 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "gemma4-norm-kernels-count-a-wider-state-as-theirs",
+        symptom: "the norm kernels' type check passed a float32 state, so a layer's float32 output (a checkpoint with float32 scales or a float32 routing scale) was handed to kernels that read bfloat16 only and every decode step failed",
+        revert: &[Mutation {
+            path: MLX,
+            find: "state.dtype() == Dtype::Bfloat16",
+            replace: "(true || state.dtype() == Dtype::Bfloat16) // defect: any type counts",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::a_wider_state_is_not_served_and_the_composed_ops_take_it",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-attn-out-kernel-takes-a-wider-stream",
+        symptom: "after the attention a decoder layer launched its kernel without asking the type of the attention's output and of the residual stream, so from the first layer with a float32 routing scale on, every decode step failed where the composed ops promote",
+        revert: &[Mutation {
+            path: MLX,
+            find: "if glue::serves_type(&attn) && glue::serves_type(x) {",
+            replace: "if true || (glue::serves_type(&attn) && glue::serves_type(x)) { // defect: unasked",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_leave_a_wider_layer_to_the_composed_ops",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-layer-out-kernel-takes-a-wider-branch",
+        symptom: "the end of a decoder layer launched its kernel without asking the type of the two branches' outputs, so a layer whose routing scale is float32, and whose experts' output therefore is, failed every decode step where the composed ops promote",
+        revert: &[Mutation {
+            path: MLX,
+            find: "if [&dense, &moe, &h].into_iter().all(glue::serves_type) {",
+            replace: "if true || [&dense, &moe, &h].into_iter().all(glue::serves_type) { // defect: unasked",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_leave_a_wider_layer_to_the_composed_ops",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
         name: "gemma4-route-kernel-breaks-ties-toward-the-higher-expert",
         symptom: "the route kernel ranked equal scores with the higher expert first where argpartition's stable sort puts the lower one first, so a tie at the top-k boundary picked another expert and a tie inside it reordered the experts' weighted sum",
         revert: &[Mutation {
@@ -2677,6 +2720,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "gemma4-attn-out-kernel-skips-the-norm-rounding")
         | (_, "gemma4-attn-out-kernel-feeds-the-branches-the-attention")
         | (_, "gemma4-norm-kernels-drop-the-epsilon")
+        | (_, "gemma4-norm-kernels-count-a-wider-state-as-theirs")
         | (_, "gemma4-layer-out-kernel-drops-the-layer-scalar")
         | (_, "gemma4-layer-out-kernel-drops-the-residual") => "gemma4_norm_kernels.rs",
         (_, "gemma4-norm-kernels-hand-on-this-layers-norm")
@@ -2684,6 +2728,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "gemma4-norm-kernels-are-never-launched")
         | (_, "gemma4-norm-kernels-run-while-off")
         | (_, "gemma4-norm-kernels-take-prefill-sized-passes")
+        | (_, "gemma4-attn-out-kernel-takes-a-wider-stream")
+        | (_, "gemma4-layer-out-kernel-takes-a-wider-branch")
         | (_, "gemma4-route-kernel-is-never-launched")
         | (_, "gemma4-route-kernel-runs-while-off") => "gemma4_moe.rs",
         (_, n) if n.starts_with("gemma4-route-kernel-") => "gemma4_route_kernel.rs",
