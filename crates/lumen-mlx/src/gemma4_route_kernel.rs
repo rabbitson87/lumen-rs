@@ -159,7 +159,11 @@ const SOURCE: &str = r#"
         for (int i = 0; i < R; i++) {
             const int r = base + i;
             if (r < K) {
-                const uint e = picked[r];
+                // Every slot of `picked` is written only while the ranks are a permutation, which
+                // the comparator's total order gives. Clamped, so that an edit to the comparator
+                // can at worst pick a wrong expert: `gather_qmm` does not check the ids it is
+                // handed, and an unwritten slot would send it past the expert weights.
+                const uint e = min(picked[r], uint(E - 1));
                 const bfloat16_t soft = static_cast<bfloat16_t>(ld[i] * normalizer);
                 weights[size_t(row) * K + r] = soft * scale[e];
                 inds[size_t(row) * K + r] = e;
