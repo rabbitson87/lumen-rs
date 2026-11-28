@@ -20,9 +20,13 @@ value → on.
 | `LUMEN_GEMMA4_FUSE_ROUTER` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_router` |
 | `LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_routing_experts` |
 | `LUMEN_GEMMA4_FUSE_SOFTCAP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_softcap` |
+| `LUMEN_GEMMA4_NORM_KERNELS` | on | Optimization | `lumen_mlx::gemma4_norm_kernels::norm_kernels` |
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
+| `LUMEN_GEMMA4_QKV_KERNEL` | on | Optimization | `lumen_mlx::gemma4_qkv_kernel::qkv_kernel` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
+| `LUMEN_GEMMA4_ROUTE_KERNEL` | off | Optimization | `lumen_mlx::gemma4_route_kernel::route_kernel` |
+| `LUMEN_GEMMA4_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::stage_sync` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
 | `LUMEN_MEMORY_PLAN_RECLAIMABLE` | on | Behavior | `lumen_mlx::qwen4_exp::runner::plan_reclaimable` |
@@ -169,6 +173,21 @@ Fuse routing into the expert dispatch, replacing the two-slot
 
 Fuse the attention logit softcap. Output-identical.
 
+### `LUMEN_GEMMA4_NORM_KERNELS`
+
+*Optimization, default on.*
+
+Run the norm-and-residual glue of each Gemma 4 decoder layer as two Metal kernels: after
+ the attention (post-attention norm, residual add, and the input norms of the dense MLP, the
+ router and the experts) and at the end of the layer (both branches' output norms, their
+ sum, the feed-forward norm, the residual add, the layer scalar and the next layer's input
+ norm). Twelve dispatches a layer become two. Bit for bit what the composed ops give.
+ Decode-sized passes only (an MTP verify block too); a prefill chunk keeps the composed ops.
+
+ On by default: a decode token 0.45 ms (2.8%) faster on gemma-4-26b-a4b NVFP4 (M3 Max,
+ 12 same-process ABBA blocks, paired standard error 0.017 ms), 301 fewer dispatches a token,
+ the same continuation in 48 of 48 runs. `=0` restores the composed ops.
+
 ### `LUMEN_GEMMA4_PREFILL_CHUNK_LOG`
 
 *Diagnostic, default off.*
@@ -179,6 +198,19 @@ Log each chunked-prefill chunk's wall time and MLX memory (active,
  costs as the context grows. The last chunk is evaluated too, so the
  returned logits are no longer lazy; every chunk already ends in an
  eval, so no barrier is added inside a forward.
+
+### `LUMEN_GEMMA4_QKV_KERNEL`
+
+*Optimization, default on.*
+
+Run the Gemma 4 attention's q/k/v norms and RoPE as one Metal kernel on a one-row decode
+ pass: five dispatches a layer become one. Bit for bit what `rms_norm` and `rope` give.
+ Every KV-cache kind takes its output; a verify block or a prefill chunk keeps the composed
+ ops.
+
+ On by default: a decode token 0.25 ms (1.6%) faster on gemma-4-26b-a4b NVFP4 (M3 Max,
+ 20 same-process ABBA blocks, every block faster, paired standard error 0.028 ms), 120 fewer
+ dispatches a token, the same continuation in 80 of 80 runs. `=0` restores the composed ops.
 
 ### `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN`
 
@@ -213,6 +245,35 @@ Run quantized-KV prefill (queries of more than one token) through
  bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
  at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
  `=0` restores the quantized matmuls.
+
+### `LUMEN_GEMMA4_ROUTE_KERNEL`
+
+*Optimization, default off.*
+
+Pick each token's experts and weigh them in one Metal kernel (the top-k, the chosen
+ scores' softmax and the per-expert scale): five dispatches a layer become one. Bit for bit
+ what `argpartition` and the routing tail give, in the same order. Runs inside the
+ decoder layers' kernel path, so it takes effect with `LUMEN_GEMMA4_NORM_KERNELS`;
+ decode-sized passes only.
+
+ Off: 120 fewer dispatches a token and the same continuation in every run on
+ gemma-4-26b-a4b NVFP4, but only 0.06 ms a token faster, at 1.9 paired standard errors (16
+ same-process ABBA blocks on a quiet machine), where the q/k/v kernel, removing as many
+ dispatches, is 0.25 ms. The kernel itself is the cost: a GPU shader timeline shows it
+ running 7.1 µs a call, against the 9.3 µs sort plus the softmax, gather and multiply it
+ replaces, because one threadgroup ranks every expert against every other. A decode step's
+ kernels run one at a time, so that time is the step's. A top-k of `k` rounds of `simd_max`
+ would be the faster shape. Bit for bit on an affine 4-bit checkpoint too, where the
+ experts run in their compile slot with the combine outside it.
+
+### `LUMEN_GEMMA4_STAGE_SYNC`
+
+*Diagnostic, default off.*
+
+Evaluate every Gemma 4 decode step stage by stage (embed, attention projections, norms
+ and RoPE, cache, SDPA, the two feed-forward branches, router, experts, epilogue, head)
+ and record each stage's build time, evaluation time and MLX's primitive and dispatch
+ counts. Costs a sync per stage; for diagnosis only (`examples/gemma4_profile.rs`).
 
 ### `LUMEN_JOINT_PREFILL`
 

@@ -33,7 +33,13 @@ pub mod gemma4_config;
 mod gemma4_critical_correction;
 mod gemma4_moe;
 mod gemma4_mtp;
+#[cfg(feature = "mlx-native")]
+mod gemma4_norm_kernels;
+#[cfg(feature = "mlx-native")]
+mod gemma4_qkv_kernel;
 mod gemma4_response;
+#[cfg(feature = "mlx-native")]
+mod gemma4_route_kernel;
 mod gemma4_sampling;
 mod gemma4_thinking;
 /// Gemma 4's tool-call body grammar. Ungated on purpose — see the module docs.
@@ -211,8 +217,8 @@ pub mod gemma4 {
     pub use crate::gemma4_moe::imp::{
         Gemma4Breakdown, GenerateConfig, GenerateStats, MtpStepOutput, NativeGemma4Config,
         NativeGemma4Model, NativeGemma4PromptCache, NativeGemma4Weights, quant_params_for,
-        set_forward_step, set_quant_kv_fused_attn, set_quant_kv_prefill_dequant,
-        take_gemma4_breakdown,
+        set_decode_kernel_flag, set_forward_step, set_quant_kv_fused_attn,
+        set_quant_kv_prefill_dequant, stage_report, stage_reset, take_gemma4_breakdown,
     };
     pub use crate::gemma4_response::imp::{
         ParseState, ParsedResponse, ParsedToolCall, ResponseParser, TOK_TOOL_CALL_CLOSE,
@@ -278,6 +284,8 @@ mod decode_probe;
 mod moe_routed_probe;
 #[cfg(feature = "mlx-native")]
 mod offload;
+#[cfg(feature = "mlx-native")]
+mod stage_profile;
 /// Build the contiguous expert pack of a Flash-Next checkpoint (`lumen-server --pack-experts`).
 #[cfg(feature = "mlx-native")]
 pub use offload::build_expert_pack;

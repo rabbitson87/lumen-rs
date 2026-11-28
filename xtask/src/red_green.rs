@@ -2209,6 +2209,394 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "gemma4-attn-out-kernel-skips-the-norm-rounding",
+        symptom: "the attention-out kernel multiplied the norm weight into the unrounded float row, where rms_norm rounds the normed row to bfloat16 first, so the residual stream left every layer a few bfloat16 steps away from the composed ops'",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const bfloat16_t normed = w_attn[wat + i] * static_cast<bfloat16_t>(t[i] * inv_a);",
+            replace: "const bfloat16_t normed = static_cast<bfloat16_t>(float(w_attn[wat + i]) * t[i] * inv_a); // defect: not rounded before the weight",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::the_kernels_are_the_composed_ops_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-attn-out-kernel-feeds-the-branches-the-attention",
+        symptom: "the attention-out kernel normed the post-attention row for the dense MLP, the router and the experts instead of the residual stream, so both feed-forward branches lost the layer's input",
+        revert: &[Mutation {
+            path: MLX,
+            find: "th[i] = float(sum);",
+            replace: "th[i] = float(normed); // defect: the branches read the normed attention",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::the_kernels_are_the_composed_ops_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-drop-the-epsilon",
+        symptom: "the norm kernels took rsqrt of the mean square alone, without rms_norm's epsilon, so a small row was scaled differently from the composed ops and a zero row became NaN",
+        revert: &[Mutation {
+            path: MLX,
+            find: "inv[0] = metal::precise::rsqrt(acc / axis_size + eps);",
+            replace: "inv[0] = metal::precise::rsqrt(acc / axis_size); // defect: no epsilon",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::the_kernels_are_the_composed_ops_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-layer-out-kernel-drops-the-layer-scalar",
+        symptom: "the layer-out kernel left the layer scalar out, so every decoder layer's output joined the stream unscaled",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const bfloat16_t scaled = with_residual * scale;",
+            replace: "const bfloat16_t scaled = with_residual; // defect: no layer scalar",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::the_kernels_are_the_composed_ops_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-layer-out-kernel-drops-the-residual",
+        symptom: "the layer-out kernel scaled the feed-forward norm's output without adding the residual stream, so each layer replaced the stream instead of adding to it",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const bfloat16_t with_residual = r[at + i] + ff;",
+            replace: "const bfloat16_t with_residual = ff; // defect: no residual",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::the_kernels_are_the_composed_ops_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-hand-on-this-layers-norm",
+        symptom: "with the norm kernels on, each layer handed the next its output normed with its own input norm instead of the next layer's, so every layer after the first attended over a wrongly scaled row",
+        revert: &[Mutation {
+            path: MLX,
+            find: ".map_or(&self.final_norm, |next| &next.input_layernorm);",
+            replace: ".map_or(&self.final_norm, |_| &self.layers[idx].input_layernorm); // defect: this layer's norm",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_give_the_default_paths_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-skip-the-final-norm",
+        symptom: "with the norm kernels on, the last layer handed the head its output normed with its own input norm instead of the final norm, so every logit was computed from a wrongly scaled row",
+        revert: &[Mutation {
+            path: MLX,
+            find: ".map_or(&self.final_norm, |next| &next.input_layernorm);",
+            replace: ".map_or(&self.layers[idx].input_layernorm, |next| &next.input_layernorm); // defect: no final norm",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_give_the_default_paths_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-are-never-launched",
+        symptom: "the decoder layers kept the composed glue although the norm kernels were on, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let norm_kernels = crate::gemma4_norm_kernels::enabled()",
+            replace: "let norm_kernels = false && crate::gemma4_norm_kernels::enabled() // defect: never chosen",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_give_the_default_paths_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-run-while-off",
+        symptom: "the decoder layers ran the norm kernels although the flag was off, so the default path was not the composed ops the flag promised",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let norm_kernels = crate::gemma4_norm_kernels::enabled()",
+            replace: "let norm_kernels = (true || crate::gemma4_norm_kernels::enabled()) // defect: runs while off",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_give_the_default_paths_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-take-prefill-sized-passes",
+        symptom: "the decoder layers took the norm-kernel path on a prefill chunk, which the kernels refuse, so every prompt longer than a verify block failed with the kernels on",
+        revert: &[Mutation {
+            path: MLX,
+            find: "&& crate::gemma4_norm_kernels::serves(&h);",
+            replace: "; // defect: not limited to decode-sized passes",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_give_the_default_paths_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-norm-kernels-count-a-wider-state-as-theirs",
+        symptom: "the norm kernels' type check passed a float32 state, so a layer's float32 output (a checkpoint with float32 scales or a float32 routing scale) was handed to kernels that read bfloat16 only and every decode step failed",
+        revert: &[Mutation {
+            path: MLX,
+            find: "state.dtype() == Dtype::Bfloat16",
+            replace: "(true || state.dtype() == Dtype::Bfloat16) // defect: any type counts",
+        }],
+        guards: &[mlx(
+            "gemma4_norm_kernels::tests::a_wider_state_is_not_served_and_the_composed_ops_take_it",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-attn-out-kernel-takes-a-wider-stream",
+        symptom: "after the attention a decoder layer launched its kernel without asking the type of the attention's output and of the residual stream, so from the first layer with a float32 routing scale on, every decode step failed where the composed ops promote",
+        revert: &[Mutation {
+            path: MLX,
+            find: "if glue::serves_type(&attn) && glue::serves_type(x) {",
+            replace: "if true || (glue::serves_type(&attn) && glue::serves_type(x)) { // defect: unasked",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_leave_a_wider_layer_to_the_composed_ops",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-layer-out-kernel-takes-a-wider-branch",
+        symptom: "the end of a decoder layer launched its kernel without asking the type of the two branches' outputs, so a layer whose routing scale is float32, and whose experts' output therefore is, failed every decode step where the composed ops promote",
+        revert: &[Mutation {
+            path: MLX,
+            find: "if [&dense, &moe, &h].into_iter().all(glue::serves_type) {",
+            replace: "if true || [&dense, &moe, &h].into_iter().all(glue::serves_type) { // defect: unasked",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::norm_kernels_leave_a_wider_layer_to_the_composed_ops",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-breaks-ties-toward-the-higher-expert",
+        symptom: "the route kernel ranked equal scores with the higher expert first where argpartition's stable sort puts the lower one first, so a tie at the top-k boundary picked another expert and a tie inside it reordered the experts' weighted sum",
+        revert: &[Mutation {
+            path: MLX,
+            find: "(!sorts_before(mine, other) && j < tid)",
+            replace: "(!sorts_before(mine, other) && j > tid) /* defect: ties toward the higher expert */",
+        }],
+        guards: &[mlx(
+            "gemma4_route_kernel::tests::ties_and_non_finite_scores_are_ordered_as_argpartition_orders_them",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-ranks-a-nan-first",
+        symptom: "the route kernel sorted a NaN score before every number where MLX's sort puts it last, so a token with a NaN score was routed to other experts than the composed router's",
+        revert: &[Mutation {
+            path: MLX,
+            find: "return (!an) & bn;",
+            replace: "return an & (!bn); // defect: NaN sorts first",
+        }],
+        guards: &[mlx(
+            "gemma4_route_kernel::tests::ties_and_non_finite_scores_are_ordered_as_argpartition_orders_them",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-skips-the-softmax-rounding",
+        symptom: "the route kernel multiplied the per-expert scale into the float softmax where the composed router rounds the softmax to bfloat16 first, so the routing weights differed in the last bits",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const bfloat16_t soft = static_cast<bfloat16_t>(ld[i] * normalizer);",
+            replace: "const float soft = ld[i] * normalizer; // defect: not rounded before the scale",
+        }],
+        guards: &[mlx(
+            "gemma4_route_kernel::tests::the_kernel_is_argpartition_and_the_routing_tail_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-forgets-the-expert-scale",
+        symptom: "the route kernel returned the softmax without each chosen expert's per_expert_scale, so every expert's output joined the sum at the wrong weight",
+        revert: &[Mutation {
+            path: MLX,
+            find: "weights[size_t(row) * K + r] = soft * scale[e];",
+            replace: "weights[size_t(row) * K + r] = soft; // defect: no per-expert scale",
+        }],
+        guards: &[mlx(
+            "gemma4_route_kernel::tests::the_kernel_is_argpartition_and_the_routing_tail_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-is-never-launched",
+        symptom: "the decoder layers kept the composed router although the route kernel was on, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let routed = if self.route_kernel_ok && crate::gemma4_route_kernel::enabled() {",
+            replace: "let routed = if false && self.route_kernel_ok && crate::gemma4_route_kernel::enabled() { // defect: never chosen",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::the_route_kernel_gives_the_composed_routers_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-route-kernel-runs-while-off",
+        symptom: "the decoder layers ran the route kernel although its flag was off, so the composed router the flag promised never ran",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let routed = if self.route_kernel_ok && crate::gemma4_route_kernel::enabled() {",
+            replace: "let routed = if self.route_kernel_ok { // defect: runs while off",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::the_route_kernel_gives_the_composed_routers_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-expert-down-rows-all-read-the-first-expert",
+        symptom: "a one-row expert pass handed gather_qmm row 0 for every expert's down projection where its default arange gives each expert its own row, so all the chosen experts projected the first expert's activation",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let down: Vec<u32> = (0..top_k as u32).collect();",
+            replace: "let down: Vec<u32> = (0..top_k as u32).map(|_| 0).collect(); // defect: one row for all",
+        }],
+        guards: &[mlx(
+            "gemma4_moe::imp::tests::decode_lhs_indices_are_gather_qmms_default",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-expert-blocks-take-the-one-row-indices",
+        symptom: "expert passes of up to four rows took the row indices cached for a one-row pass, so every row of a verify block gathered the first row's activation and the block's logits were the first token's",
+        revert: &[Mutation {
+            path: MLX,
+            find: "!do_sort && batch * rows == 1",
+            replace: "!do_sort && batch * rows <= 4 // defect: blocks take the one-row indices",
+        }],
+        guards: &[mlx(
+            "gemma4_moe::imp::tests::only_an_unsorted_one_row_pass_takes_the_decode_lhs_indices",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-rotates-with-the-wrong-partner",
+        symptom: "the q/k/v kernel rotated each element with its neighbour instead of the element half a head away, where MLX's non-traditional RoPE pairs j with j + D / 2, so every query and key was rotated wrongly",
+        revert: &[Mutation {
+            path: MLX,
+            find: "float x2 = static_cast<float>(normed[j + half_d]);",
+            replace: "float x2 = static_cast<float>(normed[j ^ 1]); // defect: the wrong partner",
+        }],
+        guards: &[mlx(
+            "gemma4_qkv_kernel::tests::the_kernel_is_the_composed_norms_and_rope_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-norms-q-with-the-k-weight",
+        symptom: "the q/k/v kernel normed the query heads with k_norm's weight, so every query was scaled per element as a key is",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const bfloat16_t w = is_q ? q_norm[lid * N + i] : k_norm[lid * N + i];",
+            replace: "const bfloat16_t w = is_q ? k_norm[lid * N + i] : k_norm[lid * N + i]; // defect: q takes k's weight",
+        }],
+        guards: &[mlx(
+            "gemma4_qkv_kernel::tests::the_kernel_is_the_composed_norms_and_rope_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-ignores-the-position",
+        symptom: "the q/k/v kernel rotated every token as if it sat at position 0, so attention lost all positional information after the first token",
+        revert: &[Mutation {
+            path: MLX,
+            find: "const float position = 1.0f * static_cast<float>(offset[0]);",
+            replace: "const float position = 0.0f; // defect: no position",
+        }],
+        guards: &[mlx(
+            "gemma4_qkv_kernel::tests::the_kernel_is_the_composed_norms_and_rope_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-reads-one-frequency",
+        symptom: "the q/k/v kernel rotated every pair of a full-attention head by the first frequency of the table instead of its own, so the partly rotated heads of the full-attention layers were rotated wrongly and their unrotated tail rotated",
+        revert: &[Mutation {
+            path: MLX,
+            find: "inv_freq = 1.0 / (rope[j]);",
+            replace: "inv_freq = 1.0 / (rope[0]); // defect: one frequency for every pair",
+        }],
+        guards: &[mlx(
+            "gemma4_qkv_kernel::tests::the_kernel_is_the_composed_norms_and_rope_to_the_bit",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-is-never-launched",
+        symptom: "the attention kept the composed norms and RoPE although the q/k/v kernel was on, so the flag changed nothing",
+        revert: &[Mutation {
+            path: MLX,
+            find: "&& crate::gemma4_qkv_kernel::enabled()",
+            replace: "&& false && crate::gemma4_qkv_kernel::enabled() // defect: never chosen",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::the_qkv_kernel_gives_the_composed_attention_inputs_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-takes-verify-blocks",
+        symptom: "the attention handed a verify block of several rows to the q/k/v kernel, which takes one row (MLX's single-row RoPE), so every MTP verify pass failed with the kernel on",
+        revert: &[Mutation {
+            path: MLX,
+            find: "let qkv_kernel = l == 1",
+            replace: "let qkv_kernel = l >= 1 // defect: not limited to one-row passes",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::the_qkv_kernel_gives_the_composed_attention_inputs_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-qkv-kernel-swaps-the-rope-of-the-layer-kinds",
+        symptom: "the q/k/v kernel rotated the sliding layers with the full-attention layers' frequency table, so the sliding layers' queries and keys were rotated by another theta over a quarter of each head",
+        revert: &[Mutation {
+            path: MLX,
+            find: "NativeGemma4LayerType::SlidingAttention => 0,",
+            replace: "NativeGemma4LayerType::SlidingAttention => 1, // defect: the full layers' rotation",
+        }],
+        guards: &[mlx_checkpoint(
+            "gemma4_moe::imp::tests::the_qkv_kernel_gives_the_composed_attention_inputs_logits_to_the_bit",
+        )],
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2329,6 +2717,28 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "qwen-parser-drops-the-tail-held-for-a-delimiter") => "qwen3_5_tools.rs",
         (_, "runtime-kernel-needs-newer-metal") => "native_ssm.rs",
         (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
+        (_, "gemma4-attn-out-kernel-skips-the-norm-rounding")
+        | (_, "gemma4-attn-out-kernel-feeds-the-branches-the-attention")
+        | (_, "gemma4-norm-kernels-drop-the-epsilon")
+        | (_, "gemma4-norm-kernels-count-a-wider-state-as-theirs")
+        | (_, "gemma4-layer-out-kernel-drops-the-layer-scalar")
+        | (_, "gemma4-layer-out-kernel-drops-the-residual") => "gemma4_norm_kernels.rs",
+        (_, "gemma4-norm-kernels-hand-on-this-layers-norm")
+        | (_, "gemma4-norm-kernels-skip-the-final-norm")
+        | (_, "gemma4-norm-kernels-are-never-launched")
+        | (_, "gemma4-norm-kernels-run-while-off")
+        | (_, "gemma4-norm-kernels-take-prefill-sized-passes")
+        | (_, "gemma4-attn-out-kernel-takes-a-wider-stream")
+        | (_, "gemma4-layer-out-kernel-takes-a-wider-branch")
+        | (_, "gemma4-route-kernel-is-never-launched")
+        | (_, "gemma4-route-kernel-runs-while-off") => "gemma4_moe.rs",
+        (_, n) if n.starts_with("gemma4-route-kernel-") => "gemma4_route_kernel.rs",
+        (_, "gemma4-expert-down-rows-all-read-the-first-expert")
+        | (_, "gemma4-expert-blocks-take-the-one-row-indices")
+        | (_, "gemma4-qkv-kernel-is-never-launched")
+        | (_, "gemma4-qkv-kernel-takes-verify-blocks")
+        | (_, "gemma4-qkv-kernel-swaps-the-rope-of-the-layer-kinds") => "gemma4_moe.rs",
+        (_, n) if n.starts_with("gemma4-qkv-kernel-") => "gemma4_qkv_kernel.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     repo_root().join(m.path).join(leaf)

@@ -360,6 +360,24 @@ pub(crate) mod imp {
     // shape from a dynamic start (`num_experts - top_k`). Keeping the slice
     // out trims the fuse to 4 ops, which still saves 3 FFI dispatches per
     // layer (×30 layers per decode step).
+    lumen_flags::flag! {
+        /// Evaluate every Gemma 4 decode step stage by stage (embed, attention projections, norms
+        /// and RoPE, cache, SDPA, the two feed-forward branches, router, experts, epilogue, head)
+        /// and record each stage's build time, evaluation time and MLX's primitive and dispatch
+        /// counts. Costs a sync per stage; for diagnosis only (`examples/gemma4_profile.rs`).
+        pub(crate) stage_sync {
+            env: "LUMEN_GEMMA4_STAGE_SYNC",
+            default: false,
+            kind: Diagnostic,
+        }
+    }
+
+    /// Passes of at most this many rows are profiled as decode steps (an MTP verify block too).
+    const PROFILE_DECODE_ROWS: usize = 8;
+
+    use crate::stage_profile::mark as stage_mark;
+    pub use crate::stage_profile::{stage_report, stage_reset};
+
     fn gemma4_routing_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
         // args[0] = scores  (post-projection logits, [B, L, num_experts])
         // args[1] = indices ([B, L, top_k] — sliced from argpartition outside)
@@ -2351,6 +2369,18 @@ pub(crate) mod imp {
         quant_kv_fused_attn::set(on);
     }
 
+    /// Pin one of the decode kernels' flags process-wide, by its env name, for an in-process A/B
+    /// (`examples/gemma4_profile.rs --ab`). Errors on a name it does not know.
+    pub fn set_decode_kernel_flag(env: &str, on: bool) -> Result<()> {
+        match env {
+            "LUMEN_GEMMA4_NORM_KERNELS" => crate::gemma4_norm_kernels::norm_kernels::set(on),
+            "LUMEN_GEMMA4_ROUTE_KERNEL" => crate::gemma4_route_kernel::route_kernel::set(on),
+            "LUMEN_GEMMA4_QKV_KERNEL" => crate::gemma4_qkv_kernel::qkv_kernel::set(on),
+            other => return Err(anyhow!("no decode kernel flag named {other}")),
+        }
+        Ok(())
+    }
+
     /// Single-token attention over a quantized KV cache: the fused kernel when
     /// `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` is on and it reads this layout, the
     /// three-op path otherwise.
@@ -3090,6 +3120,26 @@ pub(crate) mod imp {
         Vec::new()
     }
 
+    /// The row indices `gather_qmm` builds by default for a one-row expert pass with `top_k`
+    /// experts: `arange(1)` as `[1, 1, 1]` for the gate and up projections (whose input is `[1, 1,
+    /// 1, 1, H]`) and `arange(top_k)` as `[1, 1, top_k]` for the down projection (whose input is
+    /// `[1, 1, top_k, 1, I]`). Built once and handed over, they spare an `arange` launch each.
+    pub(crate) fn decode_lhs_indices(top_k: i32) -> (Array, Array) {
+        let down: Vec<u32> = (0..top_k as u32).collect();
+        (
+            Array::from_slice(&[0u32], &[1, 1, 1]),
+            Array::from_slice(&down, &[1, 1, top_k]),
+        )
+    }
+
+    /// Whether an expert pass may take [`decode_lhs_indices`]: only an unsorted pass of one row,
+    /// the shape those indices describe. A pass of more rows (a verify block, a batch) needs the
+    /// indices `gather_qmm` builds itself, one per row, or every row would gather the first row's
+    /// activation.
+    pub(crate) fn takes_decode_lhs_indices(do_sort: bool, batch: i32, rows: i32) -> bool {
+        !do_sort && batch * rows == 1
+    }
+
     pub struct NativeGemma4Model {
         config: NativeGemma4Config,
         embed_tokens: EmbedTokensWeights,
@@ -3105,6 +3155,25 @@ pub(crate) mod imp {
         const_softcap_inv: Array,
         const_softcap: Array,
         const_last_idx_one: Array, // last_pos index used by argmax_last_token_lazy in decode steps (L=1)
+        /// `rms_norm_eps` as one float32: the norm kernels' `eps` input.
+        const_rms_eps: Array,
+        /// Whether every norm weight and layer scalar the norm kernels read is bfloat16 of the
+        /// shape they take (decided once at load; a checkpoint that is not keeps the composed ops).
+        norm_kernel_weights_ok: bool,
+        /// Whether the route kernel serves this checkpoint's router (bfloat16 per-expert scales,
+        /// at most 1024 experts, a top-k of at most 128): decided once at load.
+        route_kernel_ok: bool,
+        /// The q/k/v kernel's rotation constants, by layer kind (sliding, full): `log2(theta)` as
+        /// `RoPE::eval_gpu` computes it, and the frequency table of a partly rotated head (`None`
+        /// when the whole head rotates). Built as `layer_attention_forward` builds them per call.
+        const_rope_base_log2: [Array; 2],
+        const_rope_freqs: [Option<Array>; 2],
+        /// Whether every layer's q and k norm weights are bfloat16 of the head width and the
+        /// widths are ones the q/k/v kernel takes (decided once at load).
+        qkv_kernel_ok: bool,
+        /// `gather_qmm`'s row indices for a one-row expert pass ([`decode_lhs_indices`]).
+        const_lhs_gate_up: Array,
+        const_lhs_down: Array,
         // True iff Wv / Wo were baked with the Haar rotation R at load
         // time. When set, the SlidingTurboquant forward path skips the
         // runtime V rotation matmul / the V_dq un-rotation matmul.
@@ -3390,6 +3459,75 @@ pub(crate) mod imp {
                 .find(|(_, k)| matches!(**k, NativeGemma4LayerType::SlidingAttention))
                 .map(|(i, _)| i);
 
+            let const_rms_eps = Array::from_slice(&[cfg.text_config.rms_norm_eps], &[1]);
+            let hidden = cfg.text_config.hidden_size as i32;
+            let norm_weight_ok =
+                |w: &Array| w.dtype() == mlx_rs::Dtype::Bfloat16 && w.shape() == [hidden];
+            let norm_kernel_weights_ok = norm_weight_ok(&final_norm)
+                && layers.iter().all(|lw| {
+                    [
+                        &lw.input_layernorm,
+                        &lw.post_attention_layernorm,
+                        &lw.pre_feedforward_layernorm,
+                        &lw.router.scaled_weight,
+                        &lw.pre_feedforward_layernorm_2,
+                        &lw.post_feedforward_layernorm_1,
+                        &lw.post_feedforward_layernorm_2,
+                        &lw.post_feedforward_layernorm,
+                    ]
+                    .into_iter()
+                    .all(norm_weight_ok)
+                        && lw.layer_scalar.dtype() == mlx_rs::Dtype::Bfloat16
+                        && lw.layer_scalar.size() == 1
+                });
+
+            let experts = cfg.text_config.num_experts as i32;
+            let route_kernel_ok = (1..=1024).contains(&experts)
+                && (1..=128.min(cfg.text_config.num_experts))
+                    .contains(&cfg.text_config.top_k_experts)
+                && layers.iter().all(|lw| {
+                    lw.router.per_expert_scale.dtype() == mlx_rs::Dtype::Bfloat16
+                        && lw.router.per_expert_scale.shape() == [experts]
+                });
+
+            let kinds = [
+                NativeGemma4LayerType::SlidingAttention,
+                NativeGemma4LayerType::FullAttention,
+            ];
+            let rope_consts = kinds.map(|kind| {
+                let head_dim = cfg.text_config.head_dim_for(kind) as i32;
+                let params = cfg.text_config.rope_for(kind);
+                let rope_dim = (head_dim as f32 * params.partial_rotary_factor) as i32;
+                let rope_base = params.rope_theta;
+                let base_log2 = Array::from_slice(&[rope_base.log2()], &[1]);
+                let freqs = (rope_dim != head_dim).then(|| {
+                    let half_rot = (rope_dim / 2) as usize;
+                    let half_inf = ((head_dim - rope_dim) / 2) as usize;
+                    let mut freqs_vals: Vec<f32> = Vec::with_capacity(half_rot + half_inf);
+                    for i in 0..half_rot {
+                        let exp = (2 * i) as f32 / head_dim as f32;
+                        freqs_vals.push(rope_base.powf(exp));
+                    }
+                    freqs_vals.extend(std::iter::repeat_n(f32::INFINITY, half_inf));
+                    Array::from_slice(&freqs_vals, &[freqs_vals.len() as i32])
+                });
+                (base_log2, freqs)
+            });
+            let [(sliding_log2, sliding_freqs), (full_log2, full_freqs)] = rope_consts;
+            let const_rope_base_log2 = [sliding_log2, full_log2];
+            let const_rope_freqs = [sliding_freqs, full_freqs];
+            let qkv_kernel_ok = layers.iter().all(|lw| {
+                let head_dim = cfg.text_config.head_dim_for(lw.kind) as i32;
+                head_dim % 4 == 0
+                    && (128..=1024).contains(&head_dim)
+                    && [&lw.attn.q_norm, &lw.attn.k_norm]
+                        .into_iter()
+                        .all(|w| w.dtype() == mlx_rs::Dtype::Bfloat16 && w.shape() == [head_dim])
+            });
+
+            let (const_lhs_gate_up, const_lhs_down) =
+                decode_lhs_indices(cfg.text_config.top_k_experts as i32);
+
             // Decide the sliding-window kernel now (a one-off self-check), not
             // inside the first request's forward.
             windowed_kernel_enabled();
@@ -3404,6 +3542,14 @@ pub(crate) mod imp {
                 const_softcap_inv,
                 const_softcap,
                 const_last_idx_one,
+                const_rms_eps,
+                norm_kernel_weights_ok,
+                route_kernel_ok,
+                const_rope_base_log2,
+                const_rope_freqs,
+                qkv_kernel_ok,
+                const_lhs_gate_up,
+                const_lhs_down,
                 tq_bake_v_active,
                 tq_bake_o_active,
                 tq_bake_o_full_attn_active,
@@ -3914,6 +4060,19 @@ pub(crate) mod imp {
         /// Array cached at model load. Previous impl allocated a fresh
         /// `ones([head_dim])` on every call — 30 per decode step (one
         /// per attention layer).
+        /// The q/k/v kernel's rotation for a layer kind: the frequency table of a partly rotated
+        /// head, or `log2(theta)`.
+        fn rope_consts(&self, kind: NativeGemma4LayerType) -> crate::gemma4_qkv_kernel::Rope<'_> {
+            let i = match kind {
+                NativeGemma4LayerType::SlidingAttention => 0,
+                NativeGemma4LayerType::FullAttention => 1,
+            };
+            match &self.const_rope_freqs[i] {
+                Some(freqs) => crate::gemma4_qkv_kernel::Rope::Freqs(freqs),
+                None => crate::gemma4_qkv_kernel::Rope::BaseLog2(&self.const_rope_base_log2[i]),
+            }
+        }
+
         fn rms_norm_no_scale(&self, x: &Array, head_dim: i32, eps: f32) -> Result<Array> {
             let ones = if head_dim == self.config.text_config.global_head_dim as i32 {
                 &self.const_ones_head_dim_full
@@ -3982,89 +4141,122 @@ pub(crate) mod imp {
                 }
                 None => k_4d.clone(),
             };
+            stage_mark("q/k/v matmul", &[&q, &k_4d, &v_4d])?;
             if let Some(t0) = qkvo_start {
                 bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
 
-            // (4) Norms on Q/K/V + 3× transpose. Bucketed as "norms" since
-            // transpose_axes is metadata-only (constant cost vs ctx).
-            //
-            // Phase 1.8 M2.5 (`LUMEN_GEMMA4_FUSED_QKNORM=1`) fused
-            // `rms_norm + transpose_axes` into one Metal dispatch, but
-            // bridge-dispatch sync cost overwhelmed the fusion savings
-            // (+34 ms regression at PROMPT_LEN=4096). Removed 2026-05-14;
-            // future fusion work must use the M4.8 mlx Primitive pattern,
-            // not the bridge.
-            let norms_start = if time_substages {
-                Some(Instant::now())
+            // (4+5) The norms on Q/K/V and RoPE on Q and K. A one-row pass takes the q/k/v
+            // kernel, the same arithmetic in one launch; anything else, the composed ops.
+            let qkv_kernel = l == 1
+                && b == 1
+                && !time_substages
+                && self.qkv_kernel_ok
+                && crate::gemma4_qkv_kernel::enabled()
+                && [&q, &k_4d, &v_4d]
+                    .iter()
+                    .all(|a| a.dtype() == mlx_rs::Dtype::Bfloat16);
+            let (q_rope, k_rope, v_t) = if qkv_kernel {
+                let ones = if head_dim == cfg.global_head_dim as i32 {
+                    &self.const_ones_head_dim_full
+                } else {
+                    &self.const_ones_head_dim_sliding
+                };
+                let [q, k, v] = crate::gemma4_qkv_kernel::project_tail(
+                    &q,
+                    &k_4d,
+                    &v_4d,
+                    &lw.attn.q_norm,
+                    &lw.attn.k_norm,
+                    ones,
+                    &Array::from_slice(&[kv_offset], &[1]),
+                    self.rope_consts(kind),
+                    &self.const_rms_eps,
+                )?;
+                (q, k, v)
             } else {
-                None
-            };
+                // (4) Norms on Q/K/V + 3× transpose. Bucketed as "norms" since
+                // transpose_axes is metadata-only (constant cost vs ctx).
+                //
+                // Phase 1.8 M2.5 (`LUMEN_GEMMA4_FUSED_QKNORM=1`) fused
+                // `rms_norm + transpose_axes` into one Metal dispatch, but
+                // bridge-dispatch sync cost overwhelmed the fusion savings
+                // (+34 ms regression at PROMPT_LEN=4096). Removed 2026-05-14;
+                // future fusion work must use the M4.8 mlx Primitive pattern,
+                // not the bridge.
+                let norms_start = if time_substages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
 
-            let q_n = rms_norm(&q, &lw.attn.q_norm, eps).context("attn: q_norm")?;
-            let k_n = rms_norm(&k_4d, &lw.attn.k_norm, eps).context("attn: k_norm")?;
-            let q_t = mlx_rs::ops::transpose_axes(&q_n, &[0, 2, 1, 3])
-                .context("attn: transpose Q failed")?;
-            let k_t = mlx_rs::ops::transpose_axes(&k_n, &[0, 2, 1, 3])
-                .context("attn: transpose K failed")?;
+                let q_n = rms_norm(&q, &lw.attn.q_norm, eps).context("attn: q_norm")?;
+                let k_n = rms_norm(&k_4d, &lw.attn.k_norm, eps).context("attn: k_norm")?;
+                let q_t = mlx_rs::ops::transpose_axes(&q_n, &[0, 2, 1, 3])
+                    .context("attn: transpose Q failed")?;
+                let k_t = mlx_rs::ops::transpose_axes(&k_n, &[0, 2, 1, 3])
+                    .context("attn: transpose K failed")?;
 
-            let v_n = self.rms_norm_no_scale(&v_4d, head_dim, eps)?;
-            let v_t = mlx_rs::ops::transpose_axes(&v_n, &[0, 2, 1, 3])
-                .context("attn: transpose V failed")?;
-            if let Some(t0) = norms_start {
-                bump_gemma4_attn_norms_ms(t0.elapsed().as_secs_f64() * 1e3);
-            }
-
-            // (5) RoPE on Q and K (partial-rotary, per-kind theta + dim).
-            // documented `LUMEN_GEMMA4_ROPE_PRECOMPUTE_FREQS=1`
-            // as WASH (no perf gain vs per-call arange+pow); precompute path
-            // removed 2026-05-14.
-            let rope_start = if time_substages {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            // Full attention layers use mlx_lm's `ProportionalRoPE`: freqs are
-            // computed against the FULL head_dim (denominator = head_dim, NOT
-            // the partial rope_dim), with `(head_dim - rope_dim)/2` trailing
-            // entries of `inf` so the un-rotated tail still gets a freq slot
-            // but `1/inf=0` makes its rotation a no-op. Sliding layers have
-            // `partial_rotary_factor=1.0` so the default freqs-less path
-            // remains correct (denominator = rope_dim = head_dim).
-            //
-            // Pre-fix: we called `rope(..., dimensions=rope_dim, base, ...)`
-            // for both kinds. For full attention that put the freq exponent
-            // denominator at `rope_dim` (128) instead of `head_dim` (512),
-            // producing wrong rotation frequencies. Prefill drift was masked
-            // by bf16 noise; decode position accumulation exposed it as a
-            // max|Δ|=15 spike at L29 (the only full-attention layer in 26B-A4B).
-            let (q_rope, k_rope) = if rope_dim == head_dim {
-                let q = rope(&q_t, rope_dim, false, rope_base, 1.0, kv_offset)
-                    .context("attn: rope(Q)")?;
-                let k = rope(&k_t, rope_dim, false, rope_base, 1.0, kv_offset)
-                    .context("attn: rope(K)")?;
-                (q, k)
-            } else {
-                let half_rot = (rope_dim / 2) as usize;
-                let half_inf = ((head_dim - rope_dim) / 2) as usize;
-                let mut freqs_vals: Vec<f32> = Vec::with_capacity(half_rot + half_inf);
-                for i in 0..half_rot {
-                    let exp = (2 * i) as f32 / head_dim as f32;
-                    freqs_vals.push(rope_base.powf(exp));
+                let v_n = self.rms_norm_no_scale(&v_4d, head_dim, eps)?;
+                let v_t = mlx_rs::ops::transpose_axes(&v_n, &[0, 2, 1, 3])
+                    .context("attn: transpose V failed")?;
+                if let Some(t0) = norms_start {
+                    bump_gemma4_attn_norms_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                for _ in 0..half_inf {
-                    freqs_vals.push(f32::INFINITY);
+
+                // (5) RoPE on Q and K (partial-rotary, per-kind theta + dim).
+                // documented `LUMEN_GEMMA4_ROPE_PRECOMPUTE_FREQS=1`
+                // as WASH (no perf gain vs per-call arange+pow); precompute path
+                // removed 2026-05-14.
+                let rope_start = if time_substages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                // Full attention layers use mlx_lm's `ProportionalRoPE`: freqs are
+                // computed against the FULL head_dim (denominator = head_dim, NOT
+                // the partial rope_dim), with `(head_dim - rope_dim)/2` trailing
+                // entries of `inf` so the un-rotated tail still gets a freq slot
+                // but `1/inf=0` makes its rotation a no-op. Sliding layers have
+                // `partial_rotary_factor=1.0` so the default freqs-less path
+                // remains correct (denominator = rope_dim = head_dim).
+                //
+                // Pre-fix: we called `rope(..., dimensions=rope_dim, base, ...)`
+                // for both kinds. For full attention that put the freq exponent
+                // denominator at `rope_dim` (128) instead of `head_dim` (512),
+                // producing wrong rotation frequencies. Prefill drift was masked
+                // by bf16 noise; decode position accumulation exposed it as a
+                // max|Δ|=15 spike at L29 (the only full-attention layer in 26B-A4B).
+                let (q_rope, k_rope) = if rope_dim == head_dim {
+                    let q = rope(&q_t, rope_dim, false, rope_base, 1.0, kv_offset)
+                        .context("attn: rope(Q)")?;
+                    let k = rope(&k_t, rope_dim, false, rope_base, 1.0, kv_offset)
+                        .context("attn: rope(K)")?;
+                    (q, k)
+                } else {
+                    let half_rot = (rope_dim / 2) as usize;
+                    let half_inf = ((head_dim - rope_dim) / 2) as usize;
+                    let mut freqs_vals: Vec<f32> = Vec::with_capacity(half_rot + half_inf);
+                    for i in 0..half_rot {
+                        let exp = (2 * i) as f32 / head_dim as f32;
+                        freqs_vals.push(rope_base.powf(exp));
+                    }
+                    for _ in 0..half_inf {
+                        freqs_vals.push(f32::INFINITY);
+                    }
+                    let freqs = Array::from_slice(&freqs_vals, &[freqs_vals.len() as i32]);
+                    let q = rope_with_freqs(&q_t, head_dim, false, 1.0, kv_offset, &freqs)
+                        .context("attn: rope_with_freqs(Q)")?;
+                    let k = rope_with_freqs(&k_t, head_dim, false, 1.0, kv_offset, &freqs)
+                        .context("attn: rope_with_freqs(K)")?;
+                    (q, k)
+                };
+                if let Some(t0) = rope_start {
+                    bump_gemma4_attn_rope_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                let freqs = Array::from_slice(&freqs_vals, &[freqs_vals.len() as i32]);
-                let q = rope_with_freqs(&q_t, head_dim, false, 1.0, kv_offset, &freqs)
-                    .context("attn: rope_with_freqs(Q)")?;
-                let k = rope_with_freqs(&k_t, head_dim, false, 1.0, kv_offset, &freqs)
-                    .context("attn: rope_with_freqs(K)")?;
-                (q, k)
+                (q_rope, k_rope, v_t)
             };
-            if let Some(t0) = rope_start {
-                bump_gemma4_attn_rope_ms(t0.elapsed().as_secs_f64() * 1e3);
-            }
+            stage_mark("q/k/v norms + rope", &[&q_rope, &k_rope, &v_t])?;
 
             // (6) Cache update.
             // Tier 1B (2026-05-16) — quantized full-attn early branch.
@@ -4811,6 +5003,7 @@ pub(crate) mod imp {
                     unreachable!("FullTurboquant handled in early return above")
                 }
             };
+            stage_mark("kv cache update", &[&k_full, &v_full])?;
             if let Some(t0) = cache_start {
                 bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -5077,6 +5270,7 @@ pub(crate) mod imp {
                 bump_gemma4_attn_sdpa_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
 
+            stage_mark("sdpa", &[&attn_out])?;
             // (8) Reshape back to [B, L, n_heads * head_dim] and apply o_proj.
             // Bucketed under qkvo since o_proj is one of the 4 projections.
             let oproj_start = if time_substages {
@@ -5089,6 +5283,7 @@ pub(crate) mod imp {
             let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
                 .context("attn: reshape output failed")?;
             let out = lw.attn.o_proj.apply(&attn_flat)?;
+            stage_mark("o_proj", &[&out])?;
             if let Some(t0) = oproj_start {
                 bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -5151,18 +5346,27 @@ pub(crate) mod imp {
             x: &Array,
             w: &ResolvedGemma4RouterWeights,
         ) -> Result<(Array, Array)> {
-            let cfg = &self.config.text_config;
-            let top_k = cfg.top_k_experts as i32;
-            let eps = cfg.rms_norm_eps;
-
+            let eps = self.config.text_config.rms_norm_eps;
             let normed = rms_norm(x, &w.scaled_weight, eps).context("router: rms_norm")?;
-            let scores = w.proj.apply(&normed)?;
+            self.router_scores_indices_of_normed(&normed, w)
+        }
+
+        /// [`Self::router_compute_scores_indices`] from the already normed row
+        /// (`rms_norm(x, scale * hidden^-0.5)`): projection, then top-k.
+        fn router_scores_indices_of_normed(
+            &self,
+            normed: &Array,
+            w: &ResolvedGemma4RouterWeights,
+        ) -> Result<(Array, Array)> {
+            let top_k = self.config.text_config.top_k_experts as i32;
+            let scores = w.proj.apply(normed)?;
             let last_axis = (scores.ndim() as i32) - 1;
             let num_experts = scores.shape()[last_axis as usize];
             let partitioned = mlx_rs::ops::argpartition_axis(&scores, -top_k, last_axis)
                 .context("router: argpartition_axis failed")?;
             let start = num_experts - top_k;
             let indices = partitioned.index((Ellipsis, start..));
+            stage_mark("router norm + proj + top-k", &[&scores, &indices])?;
             Ok((scores, indices))
         }
 
@@ -5180,6 +5384,17 @@ pub(crate) mod imp {
             //      stays outside the compile slot because mlx compile cannot
             //      infer its dynamic output shape; it carries no GPU work.
             let (scores, indices) = self.router_compute_scores_indices(x, w)?;
+            let weights = Self::routing_tail(&scores, &indices, w)?;
+            Ok((indices, weights))
+        }
+
+        /// The router's tail on its scores and top-k indices: the chosen scores' softmax, scaled
+        /// by each chosen expert's `per_expert_scale`. Returns the weights, `[B, L, top_k]`.
+        fn routing_tail(
+            scores: &Array,
+            indices: &Array,
+            w: &ResolvedGemma4RouterWeights,
+        ) -> Result<Array> {
             let last_axis = (scores.ndim() as i32) - 1;
 
             // 4-6. Fused tail: take_along → softmax(precise) →
@@ -5187,11 +5402,12 @@ pub(crate) mod imp {
             //      Default ON via LUMEN_GEMMA4_FUSE_ROUTER. Fallback path
             //      below runs the same 3 ops separately for A/B parity.
             if gemma4_router_fuse_enabled() {
-                let weights = gemma4_routing_fused_tail(&scores, &indices, &w.per_expert_scale)?;
-                Ok((indices, weights))
+                let weights = gemma4_routing_fused_tail(scores, indices, &w.per_expert_scale)?;
+                stage_mark("router tail (softmax, scale)", &[&weights])?;
+                Ok(weights)
             } else {
                 let top_logits = scores
-                    .take_along_axis(&indices, last_axis)
+                    .take_along_axis(indices, last_axis)
                     .context("router: take_along_axis(scores, indices) failed")?;
                 let weights = mlx_rs::ops::softmax_axis(
                     &top_logits,
@@ -5199,11 +5415,10 @@ pub(crate) mod imp {
                     /* precise */ Some(true),
                 )
                 .context("router: softmax over top-k failed")?;
-                let per_expert = mlx_rs::ops::indexing::take_axis(&w.per_expert_scale, &indices, 0)
+                let per_expert = mlx_rs::ops::indexing::take_axis(&w.per_expert_scale, indices, 0)
                     .context("router: take_axis(per_expert_scale, indices) failed")?;
-                let weights = mlx_rs::ops::multiply(&weights, &per_expert)
-                    .context("router: weights × per_expert_scale failed")?;
-                Ok((indices, weights))
+                mlx_rs::ops::multiply(&weights, &per_expert)
+                    .context("router: weights × per_expert_scale failed")
             }
         }
 
@@ -5278,10 +5493,16 @@ pub(crate) mod imp {
             } else {
                 None
             };
+            // A one-row pass hands `gather_qmm` its row indices rather than letting it build an
+            // `arange` for each of the three projections: the same values, one launch fewer each.
+            let lhs = takes_decode_lhs_indices(do_sort, b, l)
+                .then_some((&self.const_lhs_gate_up, &self.const_lhs_down))
+                .filter(|(_, down)| down.shape() == [1, 1, k]);
             let down = match fused {
                 Some(down) => down,
-                None => Self::experts_unfused(&x_for_qmm, &idx_for_qmm, w, do_sort)?,
+                None => Self::experts_unfused(&x_for_qmm, &idx_for_qmm, w, do_sort, lhs)?,
             };
+            stage_mark("experts (gather_qmm x3 + geglu)", &[&down])?;
 
             // Unsort + reshape to [B, L, K, 1, hidden], squeeze axis -2.
             let recombined = if let Some(inv_order) = inv_order_opt {
@@ -5306,25 +5527,30 @@ pub(crate) mod imp {
                 .context("experts: weighted multiply failed")?;
             let summed = mlx_rs::ops::sum_axis(&weighted, -2, /* keep_dims */ false)
                 .context("experts: sum(axis=-2) failed")?;
+            stage_mark("experts combine", &[&summed])?;
             Ok(summed)
         }
 
         /// The unfused expert GLU: `gather_qmm_with_mode` gate / up → GeGLU →
         /// down, each projection at its own quant params. `sorted` says
-        /// whether `idx` was sorted by expert (the prefill branch).
+        /// whether `idx` was sorted by expert (the prefill branch). `lhs` are
+        /// the row indices of the gate / up and of the down projection when
+        /// the caller has them ([`decode_lhs_indices`]); `None` lets
+        /// `gather_qmm` build its default `arange`.
         fn experts_unfused(
             x: &Array,
             idx: &Array,
             w: &ResolvedGemma4ExpertsWeights,
             sorted: bool,
+            lhs: Option<(&Array, &Array)>,
         ) -> Result<Array> {
-            let gqmm = |xi: &Array, lin: &ResolvedLinear, name: &str| {
+            let gqmm = |xi: &Array, lin: &ResolvedLinear, rows: Option<&Array>, name: &str| {
                 gather_qmm_with_mode(
                     xi,
                     &lin.weight,
                     &lin.scales,
                     lin.biases.as_ref(),
-                    None,
+                    rows,
                     Some(idx),
                     true,
                     lin.group_size,
@@ -5334,10 +5560,11 @@ pub(crate) mod imp {
                 )
                 .with_context(|| format!("experts: gather_qmm({name}) failed"))
             };
-            let x_gate = gqmm(x, &w.gate_proj, "gate_proj")?;
-            let x_up = gqmm(x, &w.up_proj, "up_proj")?;
+            let (gate_up_rows, down_rows) = lhs.unzip();
+            let x_gate = gqmm(x, &w.gate_proj, gate_up_rows, "gate_proj")?;
+            let x_up = gqmm(x, &w.up_proj, gate_up_rows, "up_proj")?;
             let activated = Self::geglu_apply(&x_gate, &x_up)?;
-            gqmm(&activated, &w.down_proj, "down_proj")
+            gqmm(&activated, &w.down_proj, down_rows, "down_proj")
         }
 
         /// The dense branch of a decoder layer, unfused:
@@ -5401,6 +5628,7 @@ pub(crate) mod imp {
             // (~325 ns/layer × 48 layers/step ≈ 15.6 μs/step saved).
             let residual: &Array = x;
             let h = rms_norm(x, &lw.input_layernorm, eps).context("layer: input_layernorm")?;
+            stage_mark("input norm", &[&h])?;
 
             let attn_start = if time_stages {
                 Some(Instant::now())
@@ -5425,6 +5653,7 @@ pub(crate) mod imp {
             let h = rms_norm(&h, &lw.post_attention_layernorm, eps)
                 .context("layer: post_attention_layernorm")?;
             let h = mlx_rs::ops::add(residual, &h).context("layer: +residual (attn)")?;
+            stage_mark("post-attn norm + residual", &[&h])?;
 
             // 2. Dual feed-forward (Dense MLP + MoE).
             // borrow current `h` for the post-FF residual add
@@ -5455,6 +5684,7 @@ pub(crate) mod imp {
             } else {
                 Self::dense_branch_unfused(&h, lw, eps)?
             };
+            stage_mark("dense branch (norms + mlp)", &[&h1])?;
             if let Some(t0) = dense_start {
                 if !skip_eval_barriers {
                     h1.eval().context("breakdown: eval after dense_mlp")?;
@@ -5568,6 +5798,7 @@ pub(crate) mod imp {
                 }
                 let h2 = rms_norm(&h, &lw.pre_feedforward_layernorm_2, eps)
                     .context("layer: pre_feedforward_layernorm_2")?;
+                stage_mark("moe pre norm", &[&h2])?;
                 let experts_start = if time_stages {
                     Some(Instant::now())
                 } else {
@@ -5620,6 +5851,7 @@ pub(crate) mod imp {
 
                 let h2 = rms_norm(&h, &lw.pre_feedforward_layernorm_2, eps)
                     .context("layer: pre_feedforward_layernorm_2")?;
+                stage_mark("moe pre norm", &[&h2])?;
                 let experts_start = if time_stages {
                     Some(Instant::now())
                 } else {
@@ -5641,6 +5873,7 @@ pub(crate) mod imp {
             } else {
                 h2
             };
+            stage_mark("moe post norm", &[&h2])?;
 
             // Epilogue: add(h1, h2) → rms_norm(post_ff) → +residual → ×layer_scalar.
             // Opt-in fuse path (LUMEN_GEMMA4_FUSE_LAYER_EPILOGUE=1) collapses
@@ -5663,7 +5896,158 @@ pub(crate) mod imp {
             } else {
                 Self::epilogue_unfused(&h1, &h2, residual, lw, eps)?
             };
+            stage_mark("epilogue", &[&h])?;
             Ok(h)
+        }
+
+        /// The experts' output for the rows `router_in` (normed for the router) and `moe_in`
+        /// (normed for the experts) as the default path computes it on a decode-sized pass: the
+        /// routing tail, the experts and their combine in one compile slot for affine 4-bit
+        /// experts; the router's tail, then the expert GLU, otherwise.
+        fn experts_of_normed(
+            &self,
+            router_in: &Array,
+            moe_in: &Array,
+            lw: &ResolvedGemma4LayerWeights,
+        ) -> Result<Array> {
+            let (scores, indices) = self.router_scores_indices_of_normed(router_in, &lw.router)?;
+            let tokens = moe_in.shape()[1] as usize;
+            let routing_experts_slot = tokens * self.config.text_config.top_k_experts < 64
+                && gemma4_routing_experts_fuse_enabled()
+                && lw.experts.gate_proj.bits == 4
+                && lw.experts.gate_proj.group_size == 64
+                && lw.experts.gate_proj.mode == MODE_AFFINE;
+            let slot = routing_experts_slot.then(|| {
+                gemma4_routing_experts_fused(
+                    &scores,
+                    &indices,
+                    &lw.router.per_expert_scale,
+                    moe_in,
+                    &lw.experts,
+                )
+            });
+            match slot {
+                Some(Ok(out)) => Ok(out),
+                _ => {
+                    let weights = Self::routing_tail(&scores, &indices, &lw.router)?;
+                    self.experts_forward(moe_in, &indices, &weights, &lw.experts)
+                }
+            }
+        }
+
+        /// [`Self::decoder_layer_forward`] with its norm-and-residual glue as the two kernels of
+        /// [`crate::gemma4_norm_kernels`], for a decode-sized pass. `x_normed` is `x` already
+        /// normed with this layer's input norm (the previous layer's kernel wrote it), or `None`
+        /// to norm it here; `next_norm` is the next layer's input norm (the final norm after the
+        /// last layer). Returns the layer's output and that output normed with `next_norm`.
+        ///
+        /// Between the kernels it runs the ops the default path runs, in the same order, on the
+        /// same rows, so the result is the default path's bit for bit.
+        ///
+        /// A kernel runs only on states of the type it reads. The caller vouched for the first
+        /// layer's input; the attention's and the two branches' outputs take the type of their
+        /// weights' scales and of the routing scale, which a checkpoint may store wider than
+        /// bfloat16, and from the first such layer the residual stream is wider too. Those go to
+        /// the composed ops, which promote them as the default path does.
+        fn decoder_layer_norm_kernels(
+            &self,
+            x: &Array,
+            x_normed: Option<Array>,
+            next_norm: &Array,
+            layer_idx: usize,
+            cache: &mut NativeGemma4LayerCache,
+        ) -> Result<(Array, Array)> {
+            let lw = &self.layers[layer_idx];
+            let cfg = &self.config.text_config;
+            let x_normed = match x_normed {
+                Some(normed) => normed,
+                None => rms_norm(x, &lw.input_layernorm, cfg.rms_norm_eps)
+                    .context("layer: input_layernorm")?,
+            };
+            stage_mark("input norm", &[&x_normed])?;
+            use crate::gemma4_norm_kernels as glue;
+            let attn = self.layer_attention_forward(&x_normed, layer_idx, cache)?;
+            let attn_norms = [
+                &lw.post_attention_layernorm,
+                &lw.pre_feedforward_layernorm,
+                &lw.router.scaled_weight,
+                &lw.pre_feedforward_layernorm_2,
+            ];
+            let (stage, [h, dense_in, router_in, moe_in]) =
+                if glue::serves_type(&attn) && glue::serves_type(x) {
+                    (
+                        "attn-out norms (kernel)",
+                        glue::attn_out(&attn, x, attn_norms, &self.const_rms_eps)?,
+                    )
+                } else {
+                    (
+                        "attn-out norms (composed)",
+                        glue::attn_out_composed(&attn, x, attn_norms, cfg.rms_norm_eps)?,
+                    )
+                };
+            stage_mark(stage, &[&h, &dense_in, &router_in, &moe_in])?;
+
+            let dense = Self::dense_mlp_forward(&dense_in, &lw.dense_mlp)?;
+            stage_mark("dense mlp", &[&dense])?;
+
+            // With the route kernel, the projection's scores go straight to it (the top-k and the
+            // routing weights in one launch), then the expert GLU.
+            let routed = if self.route_kernel_ok && crate::gemma4_route_kernel::enabled() {
+                let scores = lw.router.proj.apply(&router_in)?;
+                (scores.dtype() == mlx_rs::Dtype::Bfloat16)
+                    .then(|| {
+                        crate::gemma4_route_kernel::route(
+                            &scores,
+                            &lw.router.per_expert_scale,
+                            cfg.top_k_experts as i32,
+                        )
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let moe = if let Some([indices, weights]) = routed {
+                stage_mark("router proj + route kernel", &[&indices, &weights])?;
+                self.experts_forward(&moe_in, &indices, &weights, &lw.experts)?
+            } else {
+                self.experts_of_normed(&router_in, &moe_in, lw)?
+            };
+            stage_mark("experts", &[&moe])?;
+
+            let out_norms = [
+                &lw.post_feedforward_layernorm_1,
+                &lw.post_feedforward_layernorm_2,
+                &lw.post_feedforward_layernorm,
+                next_norm,
+            ];
+            let (stage, [out, out_normed]) =
+                if [&dense, &moe, &h].into_iter().all(glue::serves_type) {
+                    (
+                        "layer-out norms (kernel)",
+                        glue::layer_out(
+                            &dense,
+                            &moe,
+                            &h,
+                            out_norms,
+                            &lw.layer_scalar,
+                            &self.const_rms_eps,
+                        )?,
+                    )
+                } else {
+                    (
+                        "layer-out norms (composed)",
+                        glue::layer_out_composed(
+                            &dense,
+                            &moe,
+                            &h,
+                            out_norms,
+                            &lw.layer_scalar,
+                            cfg.rms_norm_eps,
+                        )?,
+                    )
+                };
+            stage_mark(stage, &[&out, &out_normed])?;
+            Ok((out, out_normed))
         }
 
         /// Phase 3: post-attention body of a decoder layer (post_attn_norm +
@@ -6316,6 +6700,8 @@ pub(crate) mod imp {
             // (2) h *= sqrt(hidden_size) — Phase 1.5 P8: cached const_embed_scale.
             let h = mlx_rs::ops::multiply(&h, &self.const_embed_scale)
                 .context("forward: × sqrt(hidden_size)")?;
+            crate::stage_profile::begin(l as usize <= PROFILE_DECODE_ROWS && stage_sync::get());
+            stage_mark("embed", &[&h])?;
 
             // (2b) Vision splice. Upstream applies the embed scale to the text
             // embeddings and then `masked_scatter`s the image features over
@@ -6341,11 +6727,34 @@ pub(crate) mod imp {
             let mut h = h;
             let n_layers = cfg.num_hidden_layers;
             let async_eval_every_k = gemma4_async_eval_every_k();
+            // On a decode-sized pass the layers' norm-and-residual glue runs as kernels, and each
+            // layer hands the next its input already normed (the last one, the final norm's).
+            let norm_kernels = crate::gemma4_norm_kernels::enabled()
+                && self.norm_kernel_weights_ok
+                && !gemma4_any_breakdown_active()
+                && crate::gemma4_norm_kernels::serves(&h);
+            let mut normed: Option<Array> = None;
             for idx in 0..n_layers {
                 let layer_cache = cache
                     .layer_mut(idx)
                     .ok_or_else(|| anyhow!("forward: missing cache slot {idx}"))?;
-                h = self.decoder_layer_forward(&h, idx, layer_cache)?;
+                if norm_kernels {
+                    let next_norm = self
+                        .layers
+                        .get(idx + 1)
+                        .map_or(&self.final_norm, |next| &next.input_layernorm);
+                    let (out, out_normed) = self.decoder_layer_norm_kernels(
+                        &h,
+                        normed.take(),
+                        next_norm,
+                        idx,
+                        layer_cache,
+                    )?;
+                    h = out;
+                    normed = Some(out_normed);
+                } else {
+                    h = self.decoder_layer_forward(&h, idx, layer_cache)?;
+                }
                 dump_hidden(&h, &format!("L{idx:02}"))?;
                 if async_eval_every_k > 0 && (idx + 1) % async_eval_every_k == 0 {
                     // Non-blocking GPU drain. Does NOT sync the CPU; just
@@ -6356,9 +6765,13 @@ pub(crate) mod imp {
                 }
             }
 
-            // (4) Final norm.
-            let h =
-                rms_norm(&h, &self.final_norm, cfg.rms_norm_eps).context("forward: final_norm")?;
+            // (4) Final norm (the last layer's kernel already wrote it).
+            let h = match normed {
+                Some(normed) => normed,
+                None => rms_norm(&h, &self.final_norm, cfg.rms_norm_eps)
+                    .context("forward: final_norm")?,
+            };
+            stage_mark("final norm", &[&h])?;
             dump_hidden(&h, "final_norm")?;
 
             // MTP capture hook — when the drafter is active and the MTP
@@ -6402,6 +6815,7 @@ pub(crate) mod imp {
 
             // (5+6) Tied lm_head + softcap.
             let logits = self.tied_lm_head_plus_softcap(&h_for_lm_head)?;
+            stage_mark("lm_head + softcap", &[&logits])?;
 
             dump_hidden(&logits, "logits")?;
             Ok(logits)
@@ -8207,6 +8621,301 @@ pub(crate) mod imp {
                 let n = n.min(ids.len());
                 parity_at(&model, &ids[..n]);
             }
+        }
+
+        /// Decode steps the kernel tests teacher-force, then the rows of a verify-sized block.
+        const KERNEL_TEST_STEPS: usize = 24;
+        const KERNEL_TEST_BLOCK: usize = 4;
+
+        /// The checkpoint at `LUMEN_GEMMA4_MODEL_DIR` and a prompt longer than a decode-sized pass
+        /// (so the kernels run on the decode passes only), or `None` to skip.
+        fn kernel_test_model() -> Option<(NativeGemma4Model, Vec<u32>)> {
+            let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
+                eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR");
+                return None;
+            };
+            let dir = Path::new(&dir);
+            let model = NativeGemma4Model::load(dir).expect("load model");
+            let tok =
+                crate::TextTokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+            let prompt = tok
+                .encode(
+                    "The keeper lived alone on a rocky island far from the mainland, and every \
+                     evening she climbed the spiral stairs of the old stone lighthouse to light \
+                     the great lamp before the night fell over the water.",
+                    false,
+                )
+                .expect("encode");
+            assert!(prompt.len() > crate::gemma4_norm_kernels::MAX_ROWS as usize);
+            Some((model, prompt))
+        }
+
+        /// The logits' bits of every decode step after `prompt`, then of a block of
+        /// `KERNEL_TEST_BLOCK` rows, under the flags the caller pinned. `follow` is the
+        /// continuation to feed, or `None` to pick it greedily; returns the tokens fed.
+        fn decode_logits_bits(
+            model: &NativeGemma4Model,
+            prompt: &[u32],
+            follow: Option<&[u32]>,
+        ) -> (Vec<u32>, Vec<Vec<u32>>) {
+            let bits = |logits: &Array| -> Vec<u32> {
+                logits_f32(logits).iter().map(|x| x.to_bits()).collect()
+            };
+            let mut cache = model.make_cache();
+            let mut logits = model
+                .forward_last_token(prompt, &mut cache)
+                .expect("prefill");
+            let (mut tokens, mut passes) = (Vec::new(), Vec::new());
+            for step in 0..KERNEL_TEST_STEPS {
+                let next = match follow {
+                    Some(f) => f[step],
+                    None => {
+                        let wide = logits_f32(&logits);
+                        (0..wide.len())
+                            .max_by(|&a, &b| wide[a].total_cmp(&wide[b]))
+                            .expect("logits") as u32
+                    }
+                };
+                passes.push(bits(&logits));
+                tokens.push(next);
+                logits = model
+                    .forward_last_token(&[next], &mut cache)
+                    .expect("decode");
+            }
+            let block = model
+                .forward(&tokens[..KERNEL_TEST_BLOCK], &mut cache)
+                .expect("verify-sized block");
+            passes.push(bits(&block));
+            (tokens, passes)
+        }
+
+        fn assert_same_logits(what: &str, want: &[Vec<u32>], got: &[Vec<u32>]) {
+            assert_eq!(want.len(), got.len(), "{what}: pass count");
+            for (pass, (w, g)) in want.iter().zip(got).enumerate() {
+                let differ = w.iter().zip(g).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ,
+                    0,
+                    "{what}, pass {pass} ({}): {differ} of {} logits differ",
+                    if pass < KERNEL_TEST_STEPS {
+                        "decode step"
+                    } else {
+                        "block"
+                    },
+                    w.len()
+                );
+            }
+        }
+
+        /// With `LUMEN_GEMMA4_NORM_KERNELS` the decoder layers' norm-and-residual glue runs as
+        /// kernels and each layer hands the next its input already normed. Teacher-forced on the
+        /// default path's own continuation, every decode step's logits and a verify-sized block's
+        /// are the composed path's to the bit, and both kernels ran on every layer (a comparison
+        /// alone would pass with the kernels never chosen).
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn norm_kernels_give_the_default_paths_logits_to_the_bit() {
+            use crate::gemma4_norm_kernels::{launches, norm_kernels};
+            let Some((model, prompt)) = kernel_test_model() else {
+                return;
+            };
+            let before = launches();
+            let (tokens, reference) =
+                norm_kernels::with(false, || decode_logits_bits(&model, &prompt, None));
+            assert_eq!(
+                launches(),
+                before,
+                "the composed path launched a norm kernel"
+            );
+            let (_, with_kernels) = norm_kernels::with(true, || {
+                crate::gemma4_route_kernel::route_kernel::with(false, || {
+                    decode_logits_bits(&model, &prompt, Some(&tokens))
+                })
+            });
+            let after = launches();
+            let passes = KERNEL_TEST_STEPS + 1;
+            let layers = model.num_layers();
+            assert_eq!(
+                [after[0] - before[0], after[1] - before[1]],
+                [passes * layers, passes * layers],
+                "each kernel runs once a layer on every decode-sized pass"
+            );
+            assert_same_logits("norm kernels", &reference, &with_kernels);
+        }
+
+        /// A checkpoint may store a routing scale (or a linear's scales) wider than bfloat16. The
+        /// experts' output of that layer is then float32, and so is the residual stream from
+        /// there on. The kernels serve the layers before it (and that layer's attention-out,
+        /// whose inputs are still bfloat16); the rest goes to the composed ops, and the logits
+        /// are the composed path's to the bit, where the kernels alone would refuse the pass.
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn norm_kernels_leave_a_wider_layer_to_the_composed_ops() {
+            use crate::gemma4_norm_kernels::{launches, norm_kernels};
+            const WIDE_LAYER: usize = 3;
+            let Some((mut model, prompt)) = kernel_test_model() else {
+                return;
+            };
+            let scale = &mut model.layers[WIDE_LAYER].router.per_expert_scale;
+            *scale = scale.as_dtype(mlx_rs::Dtype::Float32).expect("widen");
+            let (tokens, reference) =
+                norm_kernels::with(false, || decode_logits_bits(&model, &prompt, None));
+            let before = launches();
+            let (_, with_kernels) = norm_kernels::with(true, || {
+                crate::gemma4_route_kernel::route_kernel::with(false, || {
+                    decode_logits_bits(&model, &prompt, Some(&tokens))
+                })
+            });
+            let after = launches();
+            let passes = KERNEL_TEST_STEPS + 1;
+            assert_eq!(
+                [after[0] - before[0], after[1] - before[1]],
+                [passes * (WIDE_LAYER + 1), passes * WIDE_LAYER],
+                "the kernels run up to where the stream widens and not after"
+            );
+            assert_same_logits("a float32 routing scale", &reference, &with_kernels);
+        }
+
+        /// With `LUMEN_GEMMA4_ROUTE_KERNEL` (inside the norm kernels' path) each layer's top-k and
+        /// routing weights come from one kernel. Teacher-forced as above, the logits are the
+        /// composed router's to the bit, and the kernel ran once a layer on every pass.
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn the_route_kernel_gives_the_composed_routers_logits_to_the_bit() {
+            use crate::gemma4_norm_kernels::norm_kernels;
+            use crate::gemma4_route_kernel::{launches, route_kernel};
+            let Some((model, prompt)) = kernel_test_model() else {
+                return;
+            };
+            let before = launches();
+            let (tokens, reference) = norm_kernels::with(true, || {
+                route_kernel::with(false, || decode_logits_bits(&model, &prompt, None))
+            });
+            assert_eq!(launches(), before, "the route kernel ran while off");
+            let (_, with_kernel) = norm_kernels::with(true, || {
+                route_kernel::with(true, || decode_logits_bits(&model, &prompt, Some(&tokens)))
+            });
+            assert_eq!(
+                launches() - before,
+                (KERNEL_TEST_STEPS + 1) * model.num_layers(),
+                "the route kernel runs once a layer on every decode-sized pass"
+            );
+            assert_same_logits("route kernel", &reference, &with_kernel);
+        }
+
+        /// The row indices handed to `gather_qmm` on a one-row expert pass are the ones it builds
+        /// by default: the gate / up projection over `[1, 1, 1, 1, H]` and the down projection over
+        /// `[1, 1, k, 1, I]` give the default's output to the bit, for repeated experts too.
+        #[test]
+        fn decode_lhs_indices_are_gather_qmms_default() {
+            let (hidden, inter, experts, k) = (128i32, 64i32, 16i32, 8i32);
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            let mut values = |shape: &[i32]| {
+                let n: i32 = shape.iter().product();
+                let v: Vec<f32> = (0..n)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        ((state >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+                    })
+                    .collect();
+                Array::from_slice(&v, shape)
+            };
+            let bf16 = |a: Array| a.as_dtype(mlx_rs::Dtype::Bfloat16).expect("cast");
+            let bits =
+                |a: &Array| -> Vec<u32> { logits_f32(a).iter().map(|x| x.to_bits()).collect() };
+            let (gate_rows, down_rows) = decode_lhs_indices(k);
+            let experts_of = |rows: &[u32]| Array::from_slice(rows, &[1, 1, k]);
+            for picked in [[3u32, 0, 15, 7, 9, 1, 12, 4], [5, 5, 2, 2, 14, 0, 0, 8]] {
+                let idx = experts_of(&picked);
+                for (x, w_shape, rows) in [
+                    (
+                        bf16(values(&[1, 1, 1, 1, hidden])),
+                        [experts, inter, hidden],
+                        &gate_rows,
+                    ),
+                    (
+                        bf16(values(&[1, 1, k, 1, inter])),
+                        [experts, hidden, inter],
+                        &down_rows,
+                    ),
+                ] {
+                    let (wq, scales, biases) =
+                        mlx_rs::ops::quantize(bf16(values(&w_shape)), 64, 4).expect("quantize");
+                    let qmm = |lhs: Option<&Array>| {
+                        gather_qmm_with_mode(
+                            &x,
+                            &wq,
+                            &scales,
+                            Some(&biases),
+                            lhs,
+                            Some(&idx),
+                            true,
+                            64,
+                            4,
+                            MODE_AFFINE,
+                            false,
+                        )
+                        .expect("gather_qmm")
+                    };
+                    assert_eq!(
+                        bits(&qmm(Some(rows))),
+                        bits(&qmm(None)),
+                        "experts {picked:?}, input {:?}",
+                        x.shape()
+                    );
+                }
+            }
+        }
+
+        /// Only an unsorted pass of one row takes the cached row indices. A verify block (MTP
+        /// sends about seven rows), a prefill-sized pass or a batch has a row per token, and the
+        /// one-row indices would hand every row the first row's activation; a sorted pass reorders
+        /// its rows itself.
+        #[test]
+        fn only_an_unsorted_one_row_pass_takes_the_decode_lhs_indices() {
+            assert!(takes_decode_lhs_indices(false, 1, 1));
+            for (do_sort, batch, rows) in [
+                (true, 1, 1),
+                (false, 1, 2),
+                (false, 1, 4),
+                (false, 1, 7),
+                (false, 1, 16),
+                (false, 2, 1),
+                (false, 4, 2),
+                (true, 1, 16),
+            ] {
+                assert!(
+                    !takes_decode_lhs_indices(do_sort, batch, rows),
+                    "sorted {do_sort}, batch {batch}, rows {rows}"
+                );
+            }
+        }
+
+        /// With `LUMEN_GEMMA4_QKV_KERNEL` a one-row pass norms and rotates q, k and v in one
+        /// kernel. Teacher-forced as above, the logits are the composed ops' to the bit; the kernel
+        /// ran once a layer on every decode step and not on the verify-sized block, which is not a
+        /// one-row pass.
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn the_qkv_kernel_gives_the_composed_attention_inputs_logits_to_the_bit() {
+            use crate::gemma4_qkv_kernel::{launches, qkv_kernel};
+            let Some((model, prompt)) = kernel_test_model() else {
+                return;
+            };
+            let before = launches();
+            let (tokens, reference) =
+                qkv_kernel::with(false, || decode_logits_bits(&model, &prompt, None));
+            assert_eq!(launches(), before, "the q/k/v kernel ran while off");
+            let (_, with_kernel) =
+                qkv_kernel::with(true, || decode_logits_bits(&model, &prompt, Some(&tokens)));
+            assert_eq!(
+                launches() - before,
+                KERNEL_TEST_STEPS * model.num_layers(),
+                "the q/k/v kernel runs once a layer on every one-row pass, and only on those"
+            );
+            assert_same_logits("q/k/v kernel", &reference, &with_kernel);
         }
 
         fn parity_at(model: &NativeGemma4Model, prompt: &[u32]) {
