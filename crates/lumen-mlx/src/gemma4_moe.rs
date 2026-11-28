@@ -360,6 +360,24 @@ pub(crate) mod imp {
     // shape from a dynamic start (`num_experts - top_k`). Keeping the slice
     // out trims the fuse to 4 ops, which still saves 3 FFI dispatches per
     // layer (×30 layers per decode step).
+    lumen_flags::flag! {
+        /// Evaluate every Gemma 4 decode step stage by stage (embed, attention projections, norms
+        /// and RoPE, cache, SDPA, the two feed-forward branches, router, experts, epilogue, head)
+        /// and record each stage's build time, evaluation time and MLX's primitive and dispatch
+        /// counts. Costs a sync per stage; for diagnosis only (`examples/gemma4_profile.rs`).
+        pub(crate) stage_sync {
+            env: "LUMEN_GEMMA4_STAGE_SYNC",
+            default: false,
+            kind: Diagnostic,
+        }
+    }
+
+    /// Passes of at most this many rows are profiled as decode steps (an MTP verify block too).
+    const PROFILE_DECODE_ROWS: usize = 8;
+
+    use crate::stage_profile::mark as stage_mark;
+    pub use crate::stage_profile::{stage_report, stage_reset};
+
     fn gemma4_routing_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
         // args[0] = scores  (post-projection logits, [B, L, num_experts])
         // args[1] = indices ([B, L, top_k] — sliced from argpartition outside)
@@ -3982,6 +4000,7 @@ pub(crate) mod imp {
                 }
                 None => k_4d.clone(),
             };
+            stage_mark("q/k/v matmul", &[&q, &k_4d, &v_4d])?;
             if let Some(t0) = qkvo_start {
                 bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -4062,6 +4081,7 @@ pub(crate) mod imp {
                     .context("attn: rope_with_freqs(K)")?;
                 (q, k)
             };
+            stage_mark("q/k/v norms + rope", &[&q_rope, &k_rope, &v_t])?;
             if let Some(t0) = rope_start {
                 bump_gemma4_attn_rope_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -4811,6 +4831,7 @@ pub(crate) mod imp {
                     unreachable!("FullTurboquant handled in early return above")
                 }
             };
+            stage_mark("kv cache update", &[&k_full, &v_full])?;
             if let Some(t0) = cache_start {
                 bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -5077,6 +5098,7 @@ pub(crate) mod imp {
                 bump_gemma4_attn_sdpa_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
 
+            stage_mark("sdpa", &[&attn_out])?;
             // (8) Reshape back to [B, L, n_heads * head_dim] and apply o_proj.
             // Bucketed under qkvo since o_proj is one of the 4 projections.
             let oproj_start = if time_substages {
@@ -5089,6 +5111,7 @@ pub(crate) mod imp {
             let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
                 .context("attn: reshape output failed")?;
             let out = lw.attn.o_proj.apply(&attn_flat)?;
+            stage_mark("o_proj", &[&out])?;
             if let Some(t0) = oproj_start {
                 bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -5163,6 +5186,7 @@ pub(crate) mod imp {
                 .context("router: argpartition_axis failed")?;
             let start = num_experts - top_k;
             let indices = partitioned.index((Ellipsis, start..));
+            stage_mark("router norm + proj + top-k", &[&scores, &indices])?;
             Ok((scores, indices))
         }
 
@@ -5188,6 +5212,7 @@ pub(crate) mod imp {
             //      below runs the same 3 ops separately for A/B parity.
             if gemma4_router_fuse_enabled() {
                 let weights = gemma4_routing_fused_tail(&scores, &indices, &w.per_expert_scale)?;
+                stage_mark("router tail (softmax, scale)", &[&weights])?;
                 Ok((indices, weights))
             } else {
                 let top_logits = scores
@@ -5282,6 +5307,7 @@ pub(crate) mod imp {
                 Some(down) => down,
                 None => Self::experts_unfused(&x_for_qmm, &idx_for_qmm, w, do_sort)?,
             };
+            stage_mark("experts (gather_qmm x3 + geglu)", &[&down])?;
 
             // Unsort + reshape to [B, L, K, 1, hidden], squeeze axis -2.
             let recombined = if let Some(inv_order) = inv_order_opt {
@@ -5306,6 +5332,7 @@ pub(crate) mod imp {
                 .context("experts: weighted multiply failed")?;
             let summed = mlx_rs::ops::sum_axis(&weighted, -2, /* keep_dims */ false)
                 .context("experts: sum(axis=-2) failed")?;
+            stage_mark("experts combine", &[&summed])?;
             Ok(summed)
         }
 
@@ -5401,6 +5428,7 @@ pub(crate) mod imp {
             // (~325 ns/layer × 48 layers/step ≈ 15.6 μs/step saved).
             let residual: &Array = x;
             let h = rms_norm(x, &lw.input_layernorm, eps).context("layer: input_layernorm")?;
+            stage_mark("input norm", &[&h])?;
 
             let attn_start = if time_stages {
                 Some(Instant::now())
@@ -5425,6 +5453,7 @@ pub(crate) mod imp {
             let h = rms_norm(&h, &lw.post_attention_layernorm, eps)
                 .context("layer: post_attention_layernorm")?;
             let h = mlx_rs::ops::add(residual, &h).context("layer: +residual (attn)")?;
+            stage_mark("post-attn norm + residual", &[&h])?;
 
             // 2. Dual feed-forward (Dense MLP + MoE).
             // borrow current `h` for the post-FF residual add
@@ -5455,6 +5484,7 @@ pub(crate) mod imp {
             } else {
                 Self::dense_branch_unfused(&h, lw, eps)?
             };
+            stage_mark("dense branch (norms + mlp)", &[&h1])?;
             if let Some(t0) = dense_start {
                 if !skip_eval_barriers {
                     h1.eval().context("breakdown: eval after dense_mlp")?;
@@ -5568,6 +5598,7 @@ pub(crate) mod imp {
                 }
                 let h2 = rms_norm(&h, &lw.pre_feedforward_layernorm_2, eps)
                     .context("layer: pre_feedforward_layernorm_2")?;
+                stage_mark("moe pre norm", &[&h2])?;
                 let experts_start = if time_stages {
                     Some(Instant::now())
                 } else {
@@ -5620,6 +5651,7 @@ pub(crate) mod imp {
 
                 let h2 = rms_norm(&h, &lw.pre_feedforward_layernorm_2, eps)
                     .context("layer: pre_feedforward_layernorm_2")?;
+                stage_mark("moe pre norm", &[&h2])?;
                 let experts_start = if time_stages {
                     Some(Instant::now())
                 } else {
@@ -5641,6 +5673,7 @@ pub(crate) mod imp {
             } else {
                 h2
             };
+            stage_mark("moe post norm", &[&h2])?;
 
             // Epilogue: add(h1, h2) → rms_norm(post_ff) → +residual → ×layer_scalar.
             // Opt-in fuse path (LUMEN_GEMMA4_FUSE_LAYER_EPILOGUE=1) collapses
@@ -5663,6 +5696,7 @@ pub(crate) mod imp {
             } else {
                 Self::epilogue_unfused(&h1, &h2, residual, lw, eps)?
             };
+            stage_mark("epilogue", &[&h])?;
             Ok(h)
         }
 
@@ -6316,6 +6350,8 @@ pub(crate) mod imp {
             // (2) h *= sqrt(hidden_size) — Phase 1.5 P8: cached const_embed_scale.
             let h = mlx_rs::ops::multiply(&h, &self.const_embed_scale)
                 .context("forward: × sqrt(hidden_size)")?;
+            crate::stage_profile::begin(l as usize <= PROFILE_DECODE_ROWS && stage_sync::get());
+            stage_mark("embed", &[&h])?;
 
             // (2b) Vision splice. Upstream applies the embed scale to the text
             // embeddings and then `masked_scatter`s the image features over
@@ -6359,6 +6395,7 @@ pub(crate) mod imp {
             // (4) Final norm.
             let h =
                 rms_norm(&h, &self.final_norm, cfg.rms_norm_eps).context("forward: final_norm")?;
+            stage_mark("final norm", &[&h])?;
             dump_hidden(&h, "final_norm")?;
 
             // MTP capture hook — when the drafter is active and the MTP
@@ -6402,6 +6439,7 @@ pub(crate) mod imp {
 
             // (5+6) Tied lm_head + softcap.
             let logits = self.tied_lm_head_plus_softcap(&h_for_lm_head)?;
+            stage_mark("lm_head + softcap", &[&logits])?;
 
             dump_hidden(&logits, "logits")?;
             Ok(logits)

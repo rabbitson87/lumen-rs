@@ -23,6 +23,7 @@ value → on.
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
+| `LUMEN_GEMMA4_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::stage_sync` |
 | `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
 | `LUMEN_MEMORY_PLAN_RECLAIMABLE` | on | Behavior | `lumen_mlx::qwen4_exp::runner::plan_reclaimable` |
@@ -213,6 +214,15 @@ Run quantized-KV prefill (queries of more than one token) through
  bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
  at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
  `=0` restores the quantized matmuls.
+
+### `LUMEN_GEMMA4_STAGE_SYNC`
+
+*Diagnostic, default off.*
+
+Evaluate every Gemma 4 decode step stage by stage (embed, attention projections, norms
+ and RoPE, cache, SDPA, the two feed-forward branches, router, experts, epilogue, head)
+ and record each stage's build time, evaluation time and MLX's primitive and dispatch
+ counts. Costs a sync per stage; for diagnosis only (`examples/gemma4_profile.rs`).
 
 ### `LUMEN_JOINT_PREFILL`
 
